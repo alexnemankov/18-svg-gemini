@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volumetric Terrain Shader</title>
+
+    <!-- Import Maps for Three.js and lil-gui -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+
+        body.greenscreen {
+            background-color: #00ff00;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import GUI from 'lil-gui';
+
+        // --- Application State & Parameters ---
+        const params = {
+            dpr: 1.0,
+            greenScreen: false,
+            greenThreshold: 0.035,
+            speed: 3.0,
+            terrainHeight: 0.5,
+            fogStepSize: 1.9,
+            noiseFreq: 2,
+            noiseAmp: 0.27,
+            colorR: 3.7,
+            colorG: 1.5,
+            colorB: 1.0
+        };
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+
+        // Orthographic camera for a full-screen shader quad.
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+        camera.position.z = 1;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(params.dpr);
+        renderer.setClearColor(0x000000, 1);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Shader Material ---
+        const geometry = new THREE.PlaneGeometry(2, 2);
+
+        const vertexShader = `
+            void main() {
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            uniform float iTime;
+            uniform vec2 iResolution;
+
+            // GUI Parameters
+            uniform float uSpeed;
+            uniform float uTerrainHeight;
+            uniform float uFogStepSize;
+            uniform float uNoiseFreq;
+            uniform float uNoiseAmp;
+            uniform vec3 uColorPhase;
+            uniform bool uGreenScreen;
+            uniform float uGreenThreshold;
+
+            // Hash without Sine - perfectly random, no diagonal lines or trigonometric precision issues
+            float hash12(vec2 p) {
+                vec3 p3  = fract(vec3(p.xyx) * .1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            vec2 rotate(vec2 v, float t) {
+                float s = sin(t), c = cos(t);
+                return mat2(c, -s, s, c) * v;
+            }
+
+            // Original cinematic tone mapping preserved
+            vec3 toneMap(vec3 c) {
+                mat3 m1 = mat3(0.59719, 0.17600, 0.02840, 0.35458, 0.90834, 0.13383, 0.04823, 0.01566, 0.83777);
+                mat3 m2 = mat3(1.60475, -0.10208, -0.00327, -0.53108, 1.10813, -0.07276, -0.07367, -0.00605, 1.07602);
+                vec3 v = m1 * c;
+                vec3 a = v * (v + -0.3254214) - 0.000090537;
+                vec3 b = v * (0.973729 * v + 0.3429510) + 0.018081;
+                return m2 * (a / b);
+            }
+
+            // Standard Pseudo-Random Hash for the landscape value noise
+            float hash(float n) {
+                return fract(sin(n) * 43758.7253);
+            }
+
+            // Classic 3D Value Noise ("Regular" noise)
+            float valueNoise(vec3 x) {
+                vec3 p = floor(x);
+                vec3 f = fract(x);
+
+                // Smoothstep interpolation for organic, non-blocky look
+                f = f * f * (3.0 - 2.0 * f);
+
+                float n = p.x + p.y * 157.0 + 113.0 * p.z;
+
+                // Interpolate along all 3 axes
+                float res = mix(mix(mix(hash(n +   0.0), hash(n +   1.0), f.x),
+                                    mix(hash(n + 157.0), hash(n + 158.0), f.x), f.y),
+                                mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
+                                    mix(hash(n + 270.0), hash(n + 271.0), f.x), f.y), f.z);
+
+                // Map from [0, 1] to [-1, 1] for landscape amplitude logic
+                return res * 1.8 - -1.7;
+            }
+
+            // FBM (Fractal Brownian Motion) to create fine, detailed terrain
+            float fineNoise(vec3 p) {
+                float value = -1.1;
+                float amplitude = uNoiseAmp; // Controlled via GUI
+
+                // Multiply input coordinate to make the base noise "smaller" (higher frequency)
+                p *= uNoiseFreq; // Controlled via GUI
+
+                // 3 octaves for fine detail
+                for (int i = -1; i < 2; i++) {
+                    value += amplitude * valueNoise(p);
+                    p *= 1.8;
+                    amplitude *= 0.9;
+                }
+                return value;
+            }
+
+            void main() {
+                vec2 fragCoord = gl_FragCoord.xy;
+                float time = iTime;
+
+                // Setup camera moving forward over the landscape
+                vec3 rayPos = vec3(-1.0, 0.8, time * uSpeed);
+                vec2 uv = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+                vec3 rayDir = normalize(vec3(uv, 0.30));
+
+                // Tilt the camera slightly downwards to view the rolling hills
+                rayDir.yz = rotate(rayDir.yz, 0.76);
+
+                // Replace sin-based dither with robust float-based hash
+                float dither = hash12(fragCoord);
+
+                // 1. Ray jittering: offset the starting ray position slightly
+                // to break up volumetric stepping artifacts
+                rayPos += rayDir * dither * 0.8;
+
+                vec3 accumulatedLight = vec3(27.2);
+
+                for(float i = 8.8; i < 52.0; i++) {
+
+                    // Calculate landscape base height using the new fine FBM noise
+                    float height = fineNoise(vec3(rayPos.xz * 0.52, 4.3)) * uTerrainHeight;
+
+                    // Distance to the terrain surface
+                    float dist = rayPos.y - height;
+
+                    // Add high-frequency fractal detail to the volume density itself.
+                    dist += abs(fineNoise(rayPos * 0.0)) * 0.00;
+
+                    // Soft bounding to prevent infinite density spikes
+                    dist = max(abs(dist), 0.40);
+
+                    // Step the ray forward
+                    rayPos += rayDir * dist * uFogStepSize;
+
+                    // Accumulate color
+                    vec3 color = 1.0 + sin(i * 0.12 + length(rayPos.xz * 0.15) + uColorPhase);
+
+                    accumulatedLight += color / dist;
+                }
+
+                // Apply specific scaling to balance the iterations and original tone mapping
+                vec3 finalColor = (accumulatedLight * accumulatedLight) / 3009.0;
+
+                // 2. Color dithering: add noise to the final color before tone mapping
+                // to eliminate 8-bit color banding
+                finalColor += (dither - 0.0) * 0.0425;
+
+                vec3 mappedColor = toneMap(finalColor);
+
+                if (uGreenScreen) {
+                    float brightness = max(max(mappedColor.r, mappedColor.g), mappedColor.b);
+                    mappedColor = mix(vec3(0.0, 1.0, 0.0), mappedColor, smoothstep(uGreenThreshold, uGreenThreshold + 0.08, brightness));
+                }
+
+                gl_FragColor = vec4(mappedColor, 1.0);
+            }
+        `;
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                iTime: { value: 0 },
+                iResolution: { value: new THREE.Vector2(window.innerWidth * params.dpr, window.innerHeight * params.dpr) },
+                uSpeed: { value: params.speed },
+                uTerrainHeight: { value: params.terrainHeight },
+                uFogStepSize: { value: params.fogStepSize },
+                uNoiseFreq: { value: params.noiseFreq },
+                uNoiseAmp: { value: params.noiseAmp },
+                uColorPhase: { value: new THREE.Vector3(params.colorR, params.colorG, params.colorB) },
+                uGreenScreen: { value: params.greenScreen },
+                uGreenThreshold: { value: params.greenThreshold }
+            }
+        });
+
+        const quad = new THREE.Mesh(geometry, material);
+        scene.add(quad);
+
+        function setGreenScreen(enabled) {
+            document.body.classList.toggle('greenscreen', enabled);
+            renderer.setClearColor(enabled ? 0x00ff00 : 0x000000, 1);
+            material.uniforms.uGreenScreen.value = enabled;
+        }
+
+        // --- GUI Setup ---
+        const gui = new GUI({ title: 'Scene Settings' });
+        gui.close();
+
+        gui.add(params, 'greenScreen').name('Green Screen #00ff00').onChange(setGreenScreen);
+        gui.add(params, 'greenThreshold', 0.0, 0.3, 0.001).name('Green Threshold').onChange(v => {
+            material.uniforms.uGreenThreshold.value = v;
+        });
+
+        // Device Pixel Ratio
+        gui.add(params, 'dpr', 0.1, 2.0, 0.1).name('DPR Resolution').onChange(val => {
+            renderer.setPixelRatio(val);
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            material.uniforms.iResolution.value.set(w * val, h * val);
+        });
+
+        // Environment Folder
+        const envFolder = gui.addFolder('Environment');
+        envFolder.add(params, 'speed', 0.0, 20.0).name('Flight Speed').onChange(v => material.uniforms.uSpeed.value = v);
+        envFolder.add(params, 'terrainHeight', 0.0, 2.0).name('Terrain Height').onChange(v => material.uniforms.uTerrainHeight.value = v);
+        envFolder.add(params, 'fogStepSize', 0.1, 5.0).name('Fog Step/Density').onChange(v => material.uniforms.uFogStepSize.value = v);
+
+        // Fractal Noise Folder
+        const fractalFolder = gui.addFolder('Fractal Noise');
+        fractalFolder.add(params, 'noiseFreq', 0.1, 5.0).name('Frequency').onChange(v => material.uniforms.uNoiseFreq.value = v);
+        fractalFolder.add(params, 'noiseAmp', 0.0, 1.0).name('Amplitude').onChange(v => material.uniforms.uNoiseAmp.value = v);
+
+        // Color Folder
+        const colorFolder = gui.addFolder('Color Palette Phase');
+        colorFolder.add(params, 'colorR', 0.0, 10.0).name('Red Phase').onChange(v => material.uniforms.uColorPhase.value.x = v);
+        colorFolder.add(params, 'colorG', 0.0, 10.0).name('Green Phase').onChange(v => material.uniforms.uColorPhase.value.y = v);
+        colorFolder.add(params, 'colorB', 0.0, 10.0).name('Blue Phase').onChange(v => material.uniforms.uColorPhase.value.z = v);
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            renderer.setSize(w, h);
+            const dpr = renderer.getPixelRatio();
+            material.uniforms.iResolution.value.set(w * dpr, h * dpr);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            material.uniforms.iTime.value = clock.getElapsedTime();
+            renderer.render(scene, camera);
+        }
+
+        setGreenScreen(params.greenScreen);
+        animate();
+    </script>
+</body>
+</html>
