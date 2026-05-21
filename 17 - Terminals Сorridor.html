@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terminal Corridor Green Screen</title>
+    <!-- Include Three.js and lil-gui from trusted CDNs -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000000;
+            font-family: 'Courier New', monospace;
+        }
+
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+            overflow: hidden;
+            background-color: #000000;
+            cursor: grab;
+            touch-action: none;
+        }
+
+        #canvas-container.dragging {
+            cursor: grabbing;
+        }
+
+        #canvas-container canvas {
+            display: block;
+            transform-origin: 50% 50%;
+            will-change: transform;
+        }
+
+        /* Scanline Overlay for retro-CRT aesthetic */
+        #crt-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            background-size: 100% 4px, 6px 100%;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        .lil-gui.root {
+            z-index: 4;
+        }
+    </style>
+</head>
+<body>
+    <div id="crt-overlay"></div>
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const crtOverlay = document.getElementById('crt-overlay');
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            powerPreference: "high-performance"
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setClearColor(0x000000, 0);
+        container.appendChild(renderer.domElement);
+
+        // Orthographic pipeline to guarantee full screen rendering of raymarching quad.
+        const orthoScene = new THREE.Scene();
+        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+        // Virtual perspective camera used solely for generating camera matrices and ray math.
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.updateProjectionMatrix();
+
+        const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+        // --- PROCEDURAL CANVAS TEXTURE GENERATOR ---
+        function createProceduralTexture(drawFn, texWidth = 1024, texHeight = 1024) {
+            const canvas = document.createElement('canvas');
+            canvas.width = texWidth;
+            canvas.height = texHeight;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, texWidth, texHeight);
+            drawFn(ctx, texWidth, texHeight);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.minFilter = THREE.LinearMipmapLinearFilter;
+            texture.magFilter = THREE.LinearFilter;
+
+            if (maxAnisotropy > 0) {
+                texture.anisotropy = maxAnisotropy;
+            }
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        function drawTerminalLines(ctx, lines, x, y, lineHeight) {
+            let currentY = y;
+            for (const line of lines) {
+                ctx.fillStyle = line.highlight ? 'rgb(0, 255, 0)' : 'rgb(255, 0, 0)';
+                ctx.fillText(line.text, x, currentY);
+                currentY += lineHeight;
+            }
+        }
+
+        // Texture 1: Dynamic terminal status lists.
+        const tList = createProceduralTexture((ctx, w, h) => {
+            ctx.font = 'bold 22px Courier New, monospace';
+            ctx.textBaseline = 'top';
+
+            const lists = [
+                [
+                    { text: "+-- USER STATUS ----------------+", highlight: false },
+                    { text: "| HERO CLASS: ROGUE / NETRUNNER |", highlight: false },
+                    { text: "| LEVEL: 18  XP: 94820 / 100000 |", highlight: false },
+                    { text: "| HP: [||||||||||||||....] 78%  |", highlight: true },
+                    { text: "| MP: [||||||||..........] 45%  |", highlight: true },
+                    { text: "+-- STATS ----------------------+", highlight: false },
+                    { text: "| STR: 18  DEX: 22  INT: 15    |", highlight: false },
+                    { text: "| ARMOR: 45       EVD: 18%     |", highlight: false },
+                    { text: "+-- EQUIPPED -------------------+", highlight: false },
+                    { text: "| [HAND] Giantslayer (+3)      |", highlight: true },
+                    { text: "| [BODY] Ghost Leather Armor   |", highlight: false },
+                    { text: "| [RING] Ring of Protection    |", highlight: true }
+                ],
+                [
+                    { text: "+-- INVENTORY LOGS ----------------+", highlight: false },
+                    { text: "|  1 Amulet of magical breathing   |", highlight: true },
+                    { text: "| 40 Orcish arrows [EQUIPPED]      |", highlight: false },
+                    { text: "|    -> arrows slot active         |", highlight: true },
+                    { text: "| 25 Silver arrows                 |", highlight: false },
+                    { text: "|  5 Giantslayer (+3)              |", highlight: true },
+                    { text: "|  3 Mana Restoration Cells        |", highlight: true },
+                    { text: "|  1 Decryption Sub-Processor      |", highlight: false },
+                    { text: "|  2 Leather gloves                |", highlight: false },
+                    { text: "|  1 Potion of Healing             |", highlight: false }
+                ],
+                [
+                    { text: "+-- SYS_DIAGNOSTICS -------------+", highlight: false },
+                    { text: "| KERNEL: V.9.4.2 [STABLE]       |", highlight: false },
+                    { text: "| UPTIME: 942:12:04              |", highlight: false },
+                    { text: "| CPU_0: [||||||||  ] 82%        |", highlight: true },
+                    { text: "| MEM:   [||||      ] 41%        |", highlight: true },
+                    { text: "+-- SEC_PROTOCOLS ---------------+", highlight: false },
+                    { text: "| FIREWALL: ACTIVE (L4)          |", highlight: false },
+                    { text: "| THREAT_LVL: ELEVATED           |", highlight: true },
+                    { text: "| > daemon_sys_core.exe          |", highlight: false },
+                    { text: "| > auto_heal_trigger.bat        |", highlight: true }
+                ],
+                [
+                    { text: "+-- MISSION DIRECTIVE -------------+", highlight: false },
+                    { text: "| OBJ: INFILTRATE SECTOR_04        |", highlight: true },
+                    { text: "| TGT: ELDER WARLORD               |", highlight: true },
+                    { text: "| STATUS: IN PROGRESS...           |", highlight: false },
+                    { text: "| REWARD: 50,000 GP, MYTHIC ITEM   |", highlight: true },
+                    { text: "+-- LOCAL WAYPOINTS ---------------+", highlight: false },
+                    { text: "| [X] ENTRY_POINT_ALPHA            |", highlight: false },
+                    { text: "| [ ] LOCATE_SERVER_ROOM           |", highlight: true },
+                    { text: "| [ ] EXTRACT_DATA_DRIVE           |", highlight: false },
+                    { text: "| ORACLE: \"Watch your corners.\"    |", highlight: false }
+                ]
+            ];
+
+            const quadrants = [
+                { data: lists[0], x: 20, y: 20 },
+                { data: lists[1], x: w / 2 + 20, y: 20 },
+                { data: lists[2], x: 20, y: h / 2 + 20 },
+                { data: lists[3], x: w / 2 + 20, y: h / 2 + 20 }
+            ];
+
+            for (const quad of quadrants) {
+                drawTerminalLines(ctx, quad.data, quad.x, quad.y, 30);
+            }
+        });
+
+        // Texture 2: Source code blocks.
+        const tCode = createProceduralTexture((ctx, w, h) => {
+            ctx.font = '20px Courier New, monospace';
+            ctx.textBaseline = 'top';
+
+            const codeBlocks = [
+                [
+                    { text: "// MODULE: INVENTORY_SYSTEM_CORE", highlight: true },
+                    { text: "#include <iostream>", highlight: false },
+                    { text: "struct Player { string eq; int gold; };", highlight: false },
+                    { text: "void equipWeapon(Player &p, string w) {", highlight: false },
+                    { text: "    if (w == \"Giantslayer\") {", highlight: true },
+                    { text: "        p.attack += 15;", highlight: false },
+                    { text: "        p.eq = \"Giantslayer\";", highlight: true },
+                    { text: "    } else if (w == \"Trollsbane\") {", highlight: true },
+                    { text: "        p.attack += 12;", highlight: false },
+                    { text: "    }", highlight: false },
+                    { text: "}", highlight: false }
+                ],
+                [
+                    { text: "ADDR       HEX DUMP          ASM INSTRUCT", highlight: true },
+                    { text: "-----------------------------------------", highlight: false },
+                    { text: "0x00401A20  55               PUSH EBP", highlight: false },
+                    { text: "0x00401A21  89 E5            MOV EBP, ESP", highlight: false },
+                    { text: "0x00401A30  3D D8 04 00 00   CMP EAX, 0x4D8", highlight: true },
+                    { text: "0x00401A35  75 0F            JNE 0x00401A46", highlight: false },
+                    { text: "0x00401A3D  01 50 08         ADD [EAX+8], EDX", highlight: true },
+                    { text: "0x00401A55  C9               LEAVE", highlight: false },
+                    { text: "0x00401A56  C3               RET", highlight: false }
+                ],
+                [
+                    { text: "def calculate_trajectory(pos, velocity):", highlight: true },
+                    { text: "    g = 9.81", highlight: false },
+                    { text: "    time_of_flight = (2 * velocity.y) / g", highlight: false },
+                    { text: "    if time_of_flight < 0:", highlight: true },
+                    { text: "        return None", highlight: false },
+                    { text: "    dist = velocity.x * time_of_flight", highlight: false },
+                    { text: "    return dist", highlight: false },
+                    { text: "target_lock = acquire_target()", highlight: true },
+                    { text: "if target_lock.is_valid():", highlight: false },
+                    { text: "    fire_projectile(dist)", highlight: false }
+                ],
+                [
+                    { text: "{", highlight: false },
+                    { text: "  \"network_config\": {", highlight: false },
+                    { text: "    \"node_id\": \"ALFA_77\",", highlight: true },
+                    { text: "    \"latency_ms\": 12.4,", highlight: false },
+                    { text: "    \"encryption\": \"RSA-4096\",", highlight: true },
+                    { text: "    \"peers\": [\"192.168.1.104\", \"10.0.0.5\"],", highlight: false },
+                    { text: "    \"status\": \"ACTIVE\"", highlight: true },
+                    { text: "  },", highlight: false },
+                    { text: "  \"packets_sent\": 99402", highlight: true },
+                    { text: "}", highlight: false }
+                ]
+            ];
+
+            const quadrants = [
+                { data: codeBlocks[0], x: 20, y: 20 },
+                { data: codeBlocks[1], x: w / 2 + 20, y: 20 },
+                { data: codeBlocks[2], x: 20, y: h / 2 + 20 },
+                { data: codeBlocks[3], x: w / 2 + 20, y: h / 2 + 20 }
+            ];
+
+            for (const quad of quadrants) {
+                drawTerminalLines(ctx, quad.data, quad.x, quad.y, 28);
+            }
+        });
+
+        // Texture 3: 4x4 grid containing 16 distinct ASCII drawings.
+        const tASCII = createProceduralTexture((ctx, w, h) => {
+            ctx.font = 'bold 22px Courier New, monospace';
+            ctx.textBaseline = 'top';
+
+            const blocks = [
+                ["   .-------.   ", " .'  _   _  '. ", "/   (o) (o)   \\", "|      _      |", "|    \\___/    |", " '.       .'  ", " [SUBJECT_JANE]"],
+                [" [SYS_CALIB] ", " ___   ___  ", "/ _ \\ / _ \\ ", "| | | | | |", "| |_| | |_| |", "\\___(_)___/"],
+                [" +-----------+ ", " |           | ", " | [X]   [X] | ", " |    ___    | ", " +-----------+ ", " UNIT:RBT9000"],
+                ["      .---.      ", "    _/__~__\\_    ", "  (___________)  ", "    /  |  \\     ", " [AERIAL_ANOMALY]"],
+                [" /\\ [GIANTSLAYER]", "/  \\ ATK+15      ", "|::| STATUS: ON  ", "|==| DOUBLE DMG  ", "[__]             "],
+                ["=================", "  .---.   .---.  ", " | [O] |-| [O] | ", "  '---'   '---'  ", "================="],
+                ["[LINK:SEC_04]", "|==MAIN_BUS==*|", "| + FIREWALL OK", "| + DB MIRROR  ", "|=====*======|"],
+                ["+--CPU_CORE--+", "| LOAD 94%   |", "| TEMP 42 C  |", "| ALU CACHE  |", "+------------+"],
+                ["    |          ", "   / \\ TROLLS ", "  | * | BANE  ", "  |===| ACID  ", " //   \\\\ TOX "],
+                ["  _,-''-._   ", " / _  _  \\  ", "| (_)()(_) | ", "|  _.-'._  | ", "\\ '-...-' / ", "[AI_NEURAL]"],
+                ["   .---.   ", "  / ___ \\  ", " | |   | | ", " | |___| | ", " |_______| ", " FIREWALL "],
+                ["    ___    ", "  /`   `\\  ", "==| (o) |==", "  \\___//  ", "  / / \\ \\ ", " MALWARE "],
+                ["   /^^^\\  ", "  /  _  \\ ", " /  / \\  \\", "|  | O | |", "'--\\_//--'", "OVERSEER "],
+                ["+-------+", "| O   O |", "+-------+", "| O   O |", "+-------+", "MAINFRAME"],
+                ["root@sys:~#", "> ./exploit", "[+] CONNECT", "[+] CRACK  ", "[+] UID=0  ", "SYSTEM_PWN"],
+                [" / \\ / \\ ", "|   |   |", " \\ / \\ / ", "|   |   |", " \\ / \\ / ", "HIVE_SYNC"]
+            ];
+
+            const cellW = w / 4;
+            const cellH = h / 4;
+
+            for (let i = 0; i < 16; i++) {
+                const gridX = i % 4;
+                const gridY = Math.floor(i / 4);
+                const startX = gridX * cellW + 40;
+                let currentY = gridY * cellH + 40;
+
+                for (let lineIndex = 0; lineIndex < blocks[i].length; lineIndex++) {
+                    ctx.fillStyle = lineIndex % 2 === 0 ? 'rgb(0, 255, 0)' : 'rgb(255, 0, 0)';
+                    ctx.fillText(blocks[i][lineIndex], startX, currentY);
+                    currentY += 28;
+                }
+            }
+        }, 2048, 2048);
+
+        // --- RAYMARCHING SHADER MATERIAL ---
+        const raymarchMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                uCameraPos: { value: new THREE.Vector3() },
+                uCameraMatrixWorld: { value: new THREE.Matrix4() },
+                uProjectionMatrixInverse: { value: new THREE.Matrix4() },
+                uTime: { value: 0 },
+                tCode: { value: tCode },
+                tList: { value: tList },
+                tASCII: { value: tASCII },
+                uColorPrimary: { value: new THREE.Color('#00ff40') },
+                uColorHighlight: { value: new THREE.Color('#38cdff') },
+                uGlow: { value: 1.0 },
+                uFlickerSpeed: { value: 1.0 },
+                uFloorReflectivity: { value: 0.4 },
+                uFloorRoughness: { value: 0.08 },
+                uFloorGridIntensity: { value: 0.04 },
+                uFloorGridScale: { value: 0.15 },
+                uFloorGridThickness: { value: 0.04 },
+                uBackgroundColor: { value: new THREE.Color('#000000') }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uCameraPos;
+                uniform mat4 uCameraMatrixWorld;
+                uniform mat4 uProjectionMatrixInverse;
+                uniform float uTime;
+                uniform sampler2D tCode;
+                uniform sampler2D tList;
+                uniform sampler2D tASCII;
+                uniform vec3 uColorPrimary;
+                uniform vec3 uColorHighlight;
+                uniform float uGlow;
+                uniform float uFlickerSpeed;
+                uniform float uFloorReflectivity;
+                uniform float uFloorRoughness;
+                uniform float uFloorGridIntensity;
+                uniform float uFloorGridScale;
+                uniform float uFloorGridThickness;
+                uniform vec3 uBackgroundColor;
+
+                varying vec2 vUv;
+
+                #define MAX_STEPS 100
+                #define MAX_DIST 220.0
+                #define SURF_DIST 0.005
+
+                float hash12(vec2 p) {
+                    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+                    p3 += dot(p3, p3.yzx + 33.33);
+                    return fract((p3.x + p3.y) * p3.z);
+                }
+
+                float getDist(vec3 p) {
+                    float spacing = 40.0;
+                    float w = 8.0;
+                    vec2 q = fract(p.xz / spacing + 0.5) * spacing - spacing * 0.5;
+                    vec2 d = abs(q) - (spacing * 0.5 - w * 0.5);
+                    float walls = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+                    float floorDist = p.y + 4.0;
+                    float ceilDist = 12.0 - p.y;
+                    return min(walls, min(floorDist, ceilDist));
+                }
+
+                vec3 getNormal(vec3 p) {
+                    vec2 e = vec2(0.01, 0.0);
+                    return normalize(getDist(p) - vec3(
+                        getDist(p - e.xyy),
+                        getDist(p - e.yxy),
+                        getDist(p - e.yyx)
+                    ));
+                }
+
+                vec3 getWallTextureContent(vec2 wallUv, float sideSeed) {
+                    vec2 scaledUv = wallUv * 0.25;
+                    vec2 panelId = floor(scaledUv);
+                    float hPanel = hash12(panelId + sideSeed);
+
+                    if (hPanel < 0.25) return vec3(0.0);
+
+                    float style = hash12(panelId * 1.618 + sideSeed);
+                    vec2 localUv = fract(scaledUv);
+                    localUv = (localUv - 0.04) / 0.92;
+                    if (localUv.x < 0.0 || localUv.x > 1.0 || localUv.y < 0.0 || localUv.y > 1.0) {
+                        return vec3(0.0);
+                    }
+
+                    vec4 texCol = vec4(0.0);
+
+                    if (style < 0.35) {
+                        float baseIdx = floor(hash12(panelId * 5.12 + sideSeed) * 4.0);
+                        float offset = mod(panelId.x * 3.0 + panelId.y * 5.0, 4.0);
+                        float listIdx = mod(baseIdx + offset, 4.0);
+                        vec2 gridPos = vec2(mod(listIdx, 2.0), 1.0 - floor(listIdx / 2.0));
+                        texCol = texture2D(tList, (localUv + gridPos) / 2.0);
+                    } else if (style < 0.7) {
+                        float baseIdx = floor(hash12(panelId * 6.34 + sideSeed) * 4.0);
+                        float offset = mod(panelId.x * 2.0 + panelId.y * 7.0, 4.0);
+                        float codeIdx = mod(baseIdx + offset, 4.0);
+                        vec2 gridPos = vec2(mod(codeIdx, 2.0), 1.0 - floor(codeIdx / 2.0));
+                        texCol = texture2D(tCode, (localUv + gridPos) / 2.0);
+                    } else {
+                        float baseIdx = floor(hash12(panelId * 7.77 + sideSeed) * 16.0);
+                        float offset = mod(panelId.x * 7.0 + panelId.y * 11.0, 16.0);
+                        float artIdx = mod(baseIdx + offset, 16.0);
+                        vec2 gridPos = vec2(mod(artIdx, 4.0), 3.0 - floor(artIdx / 4.0));
+                        texCol = texture2D(tASCII, (localUv + gridPos) / 4.0);
+                    }
+
+                    vec3 col = uColorPrimary * texCol.r + uColorHighlight * texCol.g;
+                    float flicker = mix(0.92, 1.0, hash12(vec2(uTime * 18.0 * uFlickerSpeed, sideSeed)));
+                    float brightness = mix(0.45, 1.0, hash12(panelId + 99.0));
+                    return col * flicker * brightness;
+                }
+
+                vec3 calcWallColor(vec3 p, vec3 n) {
+                    vec2 wallUv;
+                    float sideSeed;
+
+                    if (abs(n.x) > 0.5) {
+                        float u = (n.x < 0.0) ? p.z : -p.z;
+                        wallUv = vec2(u, p.y);
+                        sideSeed = sign(n.x) * 1.5 + floor(p.x * 0.1);
+                    } else {
+                        float u = (n.z > 0.0) ? p.x : -p.x;
+                        wallUv = vec2(u, p.y);
+                        sideSeed = sign(n.z) * 2.5 + floor(p.z * 0.1);
+                    }
+
+                    vec3 col = getWallTextureContent(wallUv, sideSeed);
+                    col *= smoothstep(-4.0, -3.5, p.y) * smoothstep(12.0, 10.5, p.y);
+                    col += col * uGlow;
+                    return col;
+                }
+
+                void main() {
+                    vec2 ndc = vUv * 2.0 - 1.0;
+                    vec4 clipPos = vec4(ndc, -1.0, 1.0);
+                    vec4 viewPos = uProjectionMatrixInverse * clipPos;
+                    viewPos /= viewPos.w;
+                    viewPos.xyz = normalize(viewPos.xyz);
+                    vec4 worldDir = uCameraMatrixWorld * vec4(viewPos.xyz, 0.0);
+                    vec3 rd = normalize(worldDir.xyz);
+                    vec3 ro = uCameraPos;
+
+                    float d = 0.0;
+                    bool hit = false;
+                    for(int i = 0; i < MAX_STEPS; i++) {
+                        float dS = getDist(ro + rd * d);
+                        if(dS < SURF_DIST) {
+                            hit = true;
+                            break;
+                        }
+                        if(d > MAX_DIST) break;
+                        d += dS;
+                    }
+
+                    vec3 col = uBackgroundColor;
+
+                    if (hit && d < MAX_DIST) {
+                        vec3 p = ro + rd * d;
+                        vec3 n = getNormal(p);
+
+                        if (abs(n.y) < 0.5) {
+                            col = calcWallColor(p, n);
+                        } else if (n.y > 0.5) {
+                            float grid = smoothstep(uFloorGridThickness, 0.0, abs(fract(p.x * uFloorGridScale) - 0.5)) +
+                                         smoothstep(uFloorGridThickness, 0.0, abs(fract(p.z * uFloorGridScale) - 0.5));
+                            vec3 floorBase = uColorPrimary * grid * uFloorGridIntensity;
+
+                            vec3 ref_rd = reflect(rd, n);
+                            vec3 ref_ro = p + n * 0.1;
+                            float ref_d = 0.0;
+                            bool ref_hit = false;
+
+                            for(int j = 0; j < 50; j++) {
+                                float dS = getDist(ref_ro + ref_rd * ref_d);
+                                if(dS < SURF_DIST) {
+                                    ref_hit = true;
+                                    break;
+                                }
+                                if(ref_d > 120.0) break;
+                                ref_d += dS;
+                            }
+
+                            vec3 ref_col = vec3(0.0);
+                            if(ref_hit) {
+                                vec3 ref_p = ref_ro + ref_rd * ref_d;
+                                vec3 ref_n = getNormal(ref_p);
+                                if(abs(ref_n.y) < 0.5) {
+                                    ref_col = calcWallColor(ref_p, ref_n);
+                                    ref_col *= exp(-ref_d * uFloorRoughness);
+                                }
+                            }
+
+                            float fresnel = mix(0.15, 1.0, pow(1.0 - max(dot(n, -rd), 0.0), 3.0));
+                            col = floorBase + ref_col * uFloorReflectivity * fresnel;
+                        }
+
+                        vec2 uvCenter = vUv - 0.5;
+                        col *= smoothstep(0.8, 0.25, length(uvCenter));
+                    }
+
+                    gl_FragColor = vec4(col, 1.0);
+                }
+            `
+        });
+
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const quad = new THREE.Mesh(geometry, raymarchMaterial);
+        orthoScene.add(quad);
+
+        // --- CONTROLS CONFIG ---
+        const config = {
+            speed: 0.8,
+            greenScreen: false,
+            crtOverlay: true,
+            primaryColor: '#00ff40',
+            highlightColor: '#38cdff',
+            glowIntensity: 1.0,
+            flickerSpeed: 1.0,
+            floorReflectivity: 0.4,
+            floorRoughness: 0.08,
+            floorGridIntensity: 0.04,
+            floorGridScale: 0.15,
+            floorGridThickness: 0.04,
+            zoom: 1.0,
+            offsetX: 0,
+            offsetY: 0,
+            resetView: () => {
+                viewState.zoom = 1.0;
+                viewState.offsetX = 0;
+                viewState.offsetY = 0;
+                syncViewConfig();
+                updateCanvasTransform();
+                viewControllers.zoom.updateDisplay();
+                viewControllers.offsetX.updateDisplay();
+                viewControllers.offsetY.updateDisplay();
+            }
+        };
+
+        const viewState = {
+            zoom: config.zoom,
+            offsetX: config.offsetX,
+            offsetY: config.offsetY
+        };
+
+        function setGreenScreen(enabled) {
+            const color = enabled ? '#00ff00' : '#000000';
+            document.documentElement.style.backgroundColor = color;
+            document.body.style.backgroundColor = color;
+            container.style.backgroundColor = color;
+            raymarchMaterial.uniforms.uBackgroundColor.value.set(color);
+        }
+
+        function syncViewConfig() {
+            config.zoom = viewState.zoom;
+            config.offsetX = Math.round(viewState.offsetX);
+            config.offsetY = Math.round(viewState.offsetY);
+        }
+
+        function updateCanvasTransform() {
+            syncViewConfig();
+            renderer.domElement.style.transform = `translate(${viewState.offsetX}px, ${viewState.offsetY}px) scale(${viewState.zoom})`;
+        }
+
+        // --- LIL-GUI SETUP ---
+        const gui = new lil.GUI({ title: "Terminal Controls" });
+        gui.close();
+
+        gui.add(config, 'greenScreen').name("Green Screen #00ff00").onChange(setGreenScreen);
+        gui.add(config, 'crtOverlay').name("CRT Overlay").onChange(val => {
+            crtOverlay.style.display = val ? 'block' : 'none';
+        });
+        gui.add(config, 'speed', 0.0, 2.0, 0.1).name("Walk Speed");
+
+        const viewFolder = gui.addFolder("View Transform");
+        const viewControllers = {
+            zoom: viewFolder.add(config, 'zoom', 0.25, 4.0, 0.01).name("Zoom").onChange(val => {
+                viewState.zoom = val;
+                updateCanvasTransform();
+            }),
+            offsetX: viewFolder.add(config, 'offsetX', -2000, 2000, 1).name("Drag X").onChange(val => {
+                viewState.offsetX = val;
+                updateCanvasTransform();
+            }),
+            offsetY: viewFolder.add(config, 'offsetY', -2000, 2000, 1).name("Drag Y").onChange(val => {
+                viewState.offsetY = val;
+                updateCanvasTransform();
+            })
+        };
+        viewFolder.add(config, 'resetView').name("Reset View");
+
+        const colorFolder = gui.addFolder("Terminal Look");
+        colorFolder.addColor(config, 'primaryColor').name("Primary Color").onChange(val => {
+            raymarchMaterial.uniforms.uColorPrimary.value.set(val);
+        });
+        colorFolder.addColor(config, 'highlightColor').name("Highlight Color").onChange(val => {
+            raymarchMaterial.uniforms.uColorHighlight.value.set(val);
+        });
+        colorFolder.add(config, 'glowIntensity', 0.0, 1.0, 0.05).name("Glow Intensity").onChange(val => {
+            raymarchMaterial.uniforms.uGlow.value = val;
+        });
+        colorFolder.add(config, 'flickerSpeed', 0.0, 2.0, 0.1).name("Flicker Speed").onChange(val => {
+            raymarchMaterial.uniforms.uFlickerSpeed.value = val;
+        });
+
+        const floorFolder = gui.addFolder("Floor");
+        floorFolder.add(config, 'floorReflectivity', 0.0, 1.0, 0.05).name("Floor Reflection").onChange(val => {
+            raymarchMaterial.uniforms.uFloorReflectivity.value = val;
+        });
+        floorFolder.add(config, 'floorRoughness', 0.0, 0.3, 0.01).name("Floor Roughness").onChange(val => {
+            raymarchMaterial.uniforms.uFloorRoughness.value = val;
+        });
+        floorFolder.add(config, 'floorGridIntensity', 0.0, 0.5, 0.01).name("Grid Brightness").onChange(val => {
+            raymarchMaterial.uniforms.uFloorGridIntensity.value = val;
+        });
+        floorFolder.add(config, 'floorGridScale', 0.05, 0.5, 0.01).name("Grid Scale").onChange(val => {
+            raymarchMaterial.uniforms.uFloorGridScale.value = val;
+        });
+        floorFolder.add(config, 'floorGridThickness', 0.01, 0.2, 0.01).name("Grid Thickness").onChange(val => {
+            raymarchMaterial.uniforms.uFloorGridThickness.value = val;
+        });
+
+        raymarchMaterial.uniforms.uColorPrimary.value.set(config.primaryColor);
+        raymarchMaterial.uniforms.uColorHighlight.value.set(config.highlightColor);
+        setGreenScreen(config.greenScreen);
+        updateCanvasTransform();
+
+        // Wheel zoom. Zoom is applied as a canvas transform so the rendered object can be
+        // scaled for green-screen composition without changing the raymarching camera path.
+        container.addEventListener('wheel', event => {
+            event.preventDefault();
+            const previousZoom = viewState.zoom;
+            const zoomFactor = Math.exp(-event.deltaY * 0.001);
+            const nextZoom = THREE.MathUtils.clamp(previousZoom * zoomFactor, 0.25, 4.0);
+
+            const rect = renderer.domElement.getBoundingClientRect();
+            const pointerX = event.clientX - (rect.left + rect.width * 0.5);
+            const pointerY = event.clientY - (rect.top + rect.height * 0.5);
+            const zoomRatio = nextZoom / previousZoom;
+
+            viewState.offsetX -= pointerX * (zoomRatio - 1.0);
+            viewState.offsetY -= pointerY * (zoomRatio - 1.0);
+            viewState.zoom = nextZoom;
+
+            updateCanvasTransform();
+            viewControllers.zoom.updateDisplay();
+            viewControllers.offsetX.updateDisplay();
+            viewControllers.offsetY.updateDisplay();
+        }, { passive: false });
+
+        let isDragging = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let dragOriginX = 0;
+        let dragOriginY = 0;
+
+        container.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            isDragging = true;
+            dragStartX = event.clientX;
+            dragStartY = event.clientY;
+            dragOriginX = viewState.offsetX;
+            dragOriginY = viewState.offsetY;
+            container.classList.add('dragging');
+            container.setPointerCapture(event.pointerId);
+        });
+
+        container.addEventListener('pointermove', event => {
+            if (!isDragging) return;
+            viewState.offsetX = dragOriginX + event.clientX - dragStartX;
+            viewState.offsetY = dragOriginY + event.clientY - dragStartY;
+            updateCanvasTransform();
+            viewControllers.offsetX.updateDisplay();
+            viewControllers.offsetY.updateDisplay();
+        });
+
+        function endDrag(event) {
+            if (!isDragging) return;
+            isDragging = false;
+            container.classList.remove('dragging');
+            if (container.hasPointerCapture(event.pointerId)) {
+                container.releasePointerCapture(event.pointerId);
+            }
+        }
+
+        container.addEventListener('pointerup', endDrag);
+        container.addEventListener('pointercancel', endDrag);
+        container.addEventListener('lostpointercapture', () => {
+            isDragging = false;
+            container.classList.remove('dragging');
+        });
+
+        // --- RESIZE HANDLER ---
+        window.addEventListener('resize', () => {
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            renderer.setSize(width, height);
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            updateCanvasTransform();
+        });
+
+        // --- DETERMINISTIC SEEDED GRID PATH GENERATION ---
+        const gridSpacing = 40.0;
+        const gridPath = [[0, 0]];
+        let currentDir = [0, 1];
+
+        function pathHash(x) {
+            let t = x * 127.1;
+            return Math.sin(t) * 43758.5453123 % 1;
+        }
+
+        function getGridNode(index) {
+            while (gridPath.length <= index + 2) {
+                const prevNode = gridPath[gridPath.length - 1];
+                const lastDir = currentDir;
+                const r = Math.abs(pathHash(gridPath.length));
+                let nextDir = [...lastDir];
+
+                if (r < 0.15) {
+                    nextDir = [-lastDir[1], lastDir[0]];
+                } else if (r < 0.30) {
+                    nextDir = [lastDir[1], -lastDir[0]];
+                }
+
+                const nextNode = [prevNode[0] + nextDir[0], prevNode[1] + nextDir[1]];
+                gridPath.push(nextNode);
+                currentDir = nextDir;
+            }
+            return gridPath[index];
+        }
+
+        const posA = new THREE.Vector3();
+        const posB = new THREE.Vector3();
+        const posC = new THREE.Vector3();
+        const posPrev = new THREE.Vector3();
+        const dir1 = new THREE.Vector3();
+        const dir2 = new THREE.Vector3();
+        const dir0 = new THREE.Vector3();
+        const camPos = new THREE.Vector3();
+        const lookDir = new THREE.Vector3();
+        const lookTarget = new THREE.Vector3();
+        const pStart = new THREE.Vector3();
+        const pEnd = new THREE.Vector3();
+
+        function getSmoothAngle(directionA, directionB, u) {
+            const a1 = Math.atan2(directionA.x, directionA.z);
+            const a2 = Math.atan2(directionB.x, directionB.z);
+            let diff = a2 - a1;
+
+            while(diff < -Math.PI) diff += Math.PI * 2;
+            while(diff > Math.PI) diff -= Math.PI * 2;
+
+            const ease = u * u * u * (u * (u * 6.0 - 15.0) + 10.0);
+            return a1 + diff * ease;
+        }
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const elapsedTime = clock.getElapsedTime();
+            const time = elapsedTime * config.speed * 0.25;
+            const idx = Math.floor(time);
+            const f = time - idx;
+
+            const pA = getGridNode(idx);
+            const pB = getGridNode(idx + 1);
+            const pC = getGridNode(idx + 2);
+
+            posA.set(20.0 + pA[0] * gridSpacing, 0, 20.0 + pA[1] * gridSpacing);
+            posB.set(20.0 + pB[0] * gridSpacing, 0, 20.0 + pB[1] * gridSpacing);
+            posC.set(20.0 + pC[0] * gridSpacing, 0, 20.0 + pC[1] * gridSpacing);
+
+            const pPrev = idx > 0 ? getGridNode(idx - 1) : null;
+            if (pPrev) {
+                posPrev.set(20.0 + pPrev[0] * gridSpacing, 0, 20.0 + pPrev[1] * gridSpacing);
+                dir0.subVectors(posA, posPrev).normalize();
+            } else {
+                dir0.subVectors(posB, posA).normalize();
+            }
+
+            dir1.subVectors(posB, posA).normalize();
+            dir2.subVectors(posC, posB).normalize();
+
+            const turnSize = 0.30;
+
+            if (f > (1.0 - turnSize)) {
+                const u = (f - (1.0 - turnSize)) / (turnSize * 2.0);
+                pStart.copy(posB).addScaledVector(dir1, -turnSize * gridSpacing);
+                pEnd.copy(posB).addScaledVector(dir2, turnSize * gridSpacing);
+
+                const oneMinusU = 1.0 - u;
+                camPos.copy(pStart).multiplyScalar(oneMinusU * oneMinusU)
+                    .addScaledVector(posB, 2.0 * oneMinusU * u)
+                    .addScaledVector(pEnd, u * u);
+
+                const angle = getSmoothAngle(dir1, dir2, u);
+                lookDir.set(Math.sin(angle), 0, Math.cos(angle)).normalize();
+            } else if (f < turnSize) {
+                const u = (f + turnSize) / (turnSize * 2.0);
+                pStart.copy(posA).addScaledVector(dir0, -turnSize * gridSpacing);
+                pEnd.copy(posA).addScaledVector(dir1, turnSize * gridSpacing);
+
+                const oneMinusU = 1.0 - u;
+                camPos.copy(pStart).multiplyScalar(oneMinusU * oneMinusU)
+                    .addScaledVector(posA, 2.0 * oneMinusU * u)
+                    .addScaledVector(pEnd, u * u);
+
+                const angle = getSmoothAngle(dir0, dir1, u);
+                lookDir.set(Math.sin(angle), 0, Math.cos(angle)).normalize();
+            } else {
+                const tStraight = (f - turnSize) / (1.0 - turnSize * 2.0);
+                pStart.copy(posA).addScaledVector(dir1, turnSize * gridSpacing);
+                pEnd.copy(posB).addScaledVector(dir1, -turnSize * gridSpacing);
+                camPos.lerpVectors(pStart, pEnd, tStraight);
+                lookDir.copy(dir1);
+            }
+
+            camPos.y = Math.sin(time * Math.PI * 4.0) * 0.15;
+            lookTarget.addVectors(camPos, lookDir.multiplyScalar(15.0));
+            camera.position.copy(camPos);
+            camera.lookAt(lookTarget);
+            camera.updateMatrixWorld();
+            camera.updateProjectionMatrix();
+
+            raymarchMaterial.uniforms.uTime.value = elapsedTime;
+            raymarchMaterial.uniforms.uCameraPos.value.copy(camera.position);
+            raymarchMaterial.uniforms.uCameraMatrixWorld.value.copy(camera.matrixWorld);
+            raymarchMaterial.uniforms.uProjectionMatrixInverse.value.copy(camera.projectionMatrixInverse);
+
+            renderer.render(orthoScene, orthoCamera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
