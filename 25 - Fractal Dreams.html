@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Shader</title>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import GUI from 'lil-gui';
+
+        // --- Application State ---
+        const state = {
+            timeScale: 0.5,
+            isPlaying: true,
+            color1: '#007ecc', 
+            color2: '#00d5ff',
+            color3: '#ffaa00', 
+            dpr: 0.5, // Set DPR to 0.5 for better performance
+            fractalIterations: 6.0,
+            fractalAmplitude: 0.992,
+            fractalFrequency: 1.385,
+            twistSpeed: 0.266,
+            greenScreen: false,
+            zoom: 1.0,
+            offsetX: 0.0,
+            offsetY: 0.0
+        };
+
+        // --- Setup Scene, Camera, Renderer ---
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        container.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        // A simple orthographic camera for full-screen quad
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+        // --- Texture Generation ---
+
+        // 1. Generate 1024x1024 Noise Texture for iChannel0
+        const noiseSize = 1024;
+        const noiseData = new Uint8Array(noiseSize * noiseSize * 4);
+        for (let i = 0; i < noiseData.length; i++) {
+            noiseData[i] = Math.floor(Math.random() * 256);
+        }
+        const textureNoise = new THREE.DataTexture(noiseData, noiseSize, noiseSize, THREE.RGBAFormat);
+        textureNoise.wrapS = THREE.RepeatWrapping;
+        textureNoise.wrapT = THREE.RepeatWrapping;
+        textureNoise.minFilter = THREE.NearestFilter;
+        textureNoise.magFilter = THREE.NearestFilter;
+        textureNoise.needsUpdate = true;
+
+        // --- Shader Material ---
+
+        const vertexShader = `
+            out vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 iResolution;
+            uniform float iTime;
+            uniform int iFrame;
+            
+            uniform sampler2D iChannel0;
+            
+            // Custom colors from GUI
+            uniform vec3 uColor1;
+            uniform vec3 uColor2;
+            uniform vec3 uColor3;
+            
+            // Fractal parameters
+            uniform float uIterations;
+            uniform float uAmplitude;
+            uniform float uFrequency;
+            uniform float uTwistSpeed;
+
+            // Interactive parameters
+            uniform float uZoom;
+            uniform vec2 uOffset;
+            uniform float uGreenScreen;
+            
+            out vec4 fragColor;
+
+            // Configuration constants
+            #define GLOBAL_TIME iTime
+
+            // Rotation matrix generator
+            mat2 getRot(float angle) {
+                float s = sin(angle);
+                float c = cos(angle);
+                return mat2(c, s, -s, c);
+            }
+
+            // Smooth color interpolation based on depth and time
+            vec3 getCustomTone(float dist) {
+                // Create organic sine-based blending weights
+                float phase1 = 0.5 + 0.5 * sin(dist * 0.8 + GLOBAL_TIME * 0.5);
+                float phase2 = 0.5 + 0.5 * cos(dist * 1.2 - GLOBAL_TIME * 0.3);
+                
+                // Interpolate between the 3 custom colors
+                vec3 mixA = mix(uColor1, uColor2, phase1);
+                vec3 finalMix = mix(mixA, uColor3, phase2);
+                
+                // Slightly boost the intensity
+                return finalMix * finalMix * 1.2;
+            }
+
+            void mainImage(out vec4 outColor, in vec2 fragCoord) {
+                // Setup viewport coordinates
+                vec2 centeredUV = (2.0 * fragCoord.xy - iResolution.xy) / iResolution.y;
+                
+                // Apply navigation zoom and offset
+                vec2 transformedUV = (centeredUV - uOffset) / uZoom;
+
+                // Camera setup - static, no rotation
+                vec3 camPos = vec3(0.0, 0.0, 4.0);
+                vec3 rayDir = normalize(vec3(transformedUV, -1.5));
+                
+                vec3 finalColor = vec3(0.0);
+                
+                // Full screen wave volume bounds
+                float tNear = 0.0;
+                float tFar = 12.0;
+                
+                // Setup initial marching step with dither
+                ivec2 texFetchCoord1 = ivec2(fragCoord) + iFrame * 335;
+                float startDither = texelFetch(iChannel0, texFetchCoord1 & ivec2(1023), 0).a * 0.01;
+                
+                float currentDist = tNear + startDither;
+                float timeOffset = GLOBAL_TIME * 0.8;
+                
+                // Raymarching volume across the whole canvas
+                for(int stepId = 0; stepId < 80; stepId++) {
+                    if(currentDist >= tFar) break;
+                    
+                    vec3 probePos = camPos + rayDir * currentDist;
+                    
+                    // Domain twisting for organic wave shapes
+                    float twistTime = (currentDist + GLOBAL_TIME) * uTwistSpeed;
+                    mat2 twistRot = getRot(twistTime);
+                    probePos.xy *= twistRot;
+                    
+                    // Fractal noise accumulation 
+                    // Optimized and smoothed: driven by GUI parameters
+                    float scalePow = 1.0;
+                    for(int iter = 0; iter < 12; iter++) { // Max bound for unrolling
+                        if (float(iter) >= uIterations) break; // Dynamic break
+                        // Added soft displacement using uniforms
+                        probePos += uAmplitude * cos(probePos.yzx * scalePow + timeOffset) / scalePow;
+                        scalePow *= uFrequency; // Frequency multiplier step
+                    }
+                    
+                    // Density extraction adjusted for smoother wave layers
+                    float volDensity = 0.1 + abs(probePos.y) * 0.2;
+                    
+                    // Apply user custom colors
+                    finalColor += getCustomTone(currentDist) * 0.003 / volDensity;
+                    
+                    currentDist += volDensity * 0.35;
+                }
+                
+                // Post-processing and tone-mapping
+                finalColor = 1.0 - exp(-finalColor);
+                
+                // Gamma correction
+                finalColor = pow(finalColor, vec3(0.454545));
+                
+                // Film grain dither
+                ivec2 texFetchCoord2 = ivec2(fragCoord) + iFrame * 331;
+                vec3 grainNoise = texelFetch(iChannel0, texFetchCoord2 & ivec2(1023), 0).rgb;
+                
+                finalColor *= 255.0;
+                finalColor += 5.0 * (grainNoise - 0.5);
+                finalColor /= 255.0;
+                
+                // Apply greenscreen background (#00ff00) if active
+                vec3 finalColorCorrected = clamp(finalColor, 0.0, 1.0);
+                if (uGreenScreen > 0.5) {
+                    float glow = clamp(max(finalColorCorrected.r, max(finalColorCorrected.g, finalColorCorrected.b)), 0.0, 1.0);
+                    vec3 greenBg = vec3(0.0, 1.0, 0.0);
+                    finalColorCorrected = mix(greenBg, finalColorCorrected, glow);
+                }
+                
+                outColor = vec4(finalColorCorrected, 1.0);
+            }
+
+            void main() {
+                mainImage(fragColor, gl_FragCoord.xy);
+            }
+        `;
+
+        const uniforms = {
+            iTime: { value: 0.0 },
+            iResolution: { value: new THREE.Vector3(window.innerWidth * state.dpr, window.innerHeight * state.dpr, 1) },
+            iFrame: { value: 0 },
+            iChannel0: { value: textureNoise },
+            uColor1: { value: new THREE.Color(state.color1) },
+            uColor2: { value: new THREE.Color(state.color2) },
+            uColor3: { value: new THREE.Color(state.color3) },
+            uIterations: { value: state.fractalIterations },
+            uAmplitude: { value: state.fractalAmplitude },
+            uFrequency: { value: state.fractalFrequency },
+            uTwistSpeed: { value: state.twistSpeed },
+            uZoom: { value: state.zoom },
+            uOffset: { value: new THREE.Vector2(state.offsetX, state.offsetY) },
+            uGreenScreen: { value: state.greenScreen ? 1.0 : 0.0 }
+        };
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms,
+            // GLSL3 is required to use texelFetch and ivec2 in WebGL2
+            glslVersion: THREE.GLSL3 
+        });
+
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // --- GUI Setup ---
+        const gui = new GUI();
+        gui.title('Shader Controls');
+        gui.add(state, 'isPlaying').name('Play Animation');
+        gui.add(state, 'timeScale', 0.0, 3.0).name('Time Scale');
+        
+        // Add color controllers
+        gui.addColor(state, 'color1').name('Primary Color').onChange(v => uniforms.uColor1.value.set(v));
+        gui.addColor(state, 'color2').name('Secondary Color').onChange(v => uniforms.uColor2.value.set(v));
+        gui.addColor(state, 'color3').name('Accent Color').onChange(v => uniforms.uColor3.value.set(v));
+        
+        // Add fractal settings
+        const fractalFolder = gui.addFolder('Fractal Shape');
+        fractalFolder.add(state, 'fractalIterations', 1.0, 10.0, 1.0).name('Iterations').onChange(v => uniforms.uIterations.value = v);
+        fractalFolder.add(state, 'fractalAmplitude', 0.0, 2.0).name('Amplitude').onChange(v => uniforms.uAmplitude.value = v);
+        fractalFolder.add(state, 'fractalFrequency', 1.0, 2.0).name('Frequency').onChange(v => uniforms.uFrequency.value = v);
+        fractalFolder.add(state, 'twistSpeed', 0.0, 0.5).name('Twist Speed').onChange(v => uniforms.uTwistSpeed.value = v);
+        
+        // Add Green Screen toggle
+        gui.add(state, 'greenScreen').name('Green Screen').onChange(v => uniforms.uGreenScreen.value = v ? 1.0 : 0.0);
+
+        function updateResolution() {
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            renderer.setPixelRatio(state.dpr);
+            renderer.setSize(width, height);
+            uniforms.iResolution.value.set(width * state.dpr, height * state.dpr, 1);
+        }
+
+        gui.add(state, 'dpr', 0.25, 2.0, 0.25).name('Resolution (DPR)').onChange(updateResolution);
+        
+        // Collapse GUI by default
+        gui.close();
+
+        // --- Interaction Logic ---
+        let isDragging = false;
+        const lastMousePosition = { x: 0, y: 0 };
+        const domElement = renderer.domElement;
+
+        function onPointerDown(e) {
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            isDragging = true;
+            lastMousePosition.x = clientX;
+            lastMousePosition.y = clientY;
+        }
+
+        function onPointerMove(e) {
+            if (!isDragging) return;
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            
+            const dx = clientX - lastMousePosition.x;
+            const dy = clientY - lastMousePosition.y;
+            
+            // Adjust offset sensitive to current zoom
+            const factor = 0.003 / state.zoom;
+            state.offsetX += dx * factor;
+            state.offsetY -= dy * factor; // Flip Y for WebGL
+            
+            uniforms.uOffset.value.set(state.offsetX, state.offsetY);
+            
+            lastMousePosition.x = clientX;
+            lastMousePosition.y = clientY;
+        }
+
+        function onPointerUp() {
+            isDragging = false;
+        }
+
+        domElement.addEventListener('mousedown', onPointerDown);
+        window.addEventListener('mousemove', onPointerMove);
+        window.addEventListener('mouseup', onPointerUp);
+
+        domElement.addEventListener('touchstart', onPointerDown, { passive: true });
+        window.addEventListener('touchmove', onPointerMove, { passive: false });
+        window.addEventListener('touchend', onPointerUp);
+
+        // Wheel Event for Zoom
+        function onWheel(e) {
+            e.preventDefault();
+            const zoomFactor = 1.1;
+            if (e.deltaY < 0) {
+                state.zoom *= zoomFactor;
+            } else {
+                state.zoom /= zoomFactor;
+            }
+            state.zoom = Math.max(0.1, Math.min(25.0, state.zoom));
+            uniforms.uZoom.value = state.zoom;
+        }
+
+        domElement.addEventListener('wheel', onWheel, { passive: false });
+
+        // Double click to reset navigation
+        domElement.addEventListener('dblclick', () => {
+            state.zoom = 1.0;
+            state.offsetX = 0.0;
+            state.offsetY = 0.0;
+            uniforms.uZoom.value = 1.0;
+            uniforms.uOffset.value.set(0, 0);
+        });
+        
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        let frameCount = 0;
+        let accumulatedTime = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            
+            if (state.isPlaying) {
+                accumulatedTime += delta * state.timeScale;
+                frameCount++;
+            }
+
+            // Update uniforms
+            uniforms.iTime.value = accumulatedTime;
+            uniforms.iFrame.value = frameCount;
+
+            renderer.render(scene, camera);
+        }
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', updateResolution);
+        
+        // Initial resolution sync
+        updateResolution();
+
+        // Start loop
+        animate();
+    </script>
+</body>
+</html>
