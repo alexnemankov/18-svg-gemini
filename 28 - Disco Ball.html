@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Raymarched Disco Globe</title>
+    <!-- Three.js and lil-gui from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            touch-action: none; /* Prevent default touch actions like pull-to-refresh */
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            cursor: grab;
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+    </style>
+</head>
+<body>
+    <script>
+        // Setup Three.js Scene
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        
+        // --- POST-PROCESSING SETUP ---
+        // Using HalfFloatType to keep HDR values for bright light extraction
+        const renderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+            type: THREE.HalfFloatType, 
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter
+        });
+        const postScene = new THREE.Scene();
+        const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        // -----------------------------
+        
+        // Initial DPR is 1
+        let currentDPR = 1.0;
+        renderer.setPixelRatio(currentDPR);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Interaction state
+        let isDragging = false;
+        let prevMousePos = { x: 0, y: 0 };
+        let dragMode = 'rotate'; // 'rotate' or 'pan'
+        
+        // Rotation targets and velocities for inertia
+        let rot = { x: 0, y: 0.9 }; 
+        let rotVel = { x: 0, y: 0 };
+        
+        // Zoom state
+        let currentZoom = 0.5;
+        let targetZoom = 1.2;
+
+        // Globe translation state
+        const globeCenter = new THREE.Vector3(0, 0, 0);
+        const targetGlobeCenter = new THREE.Vector3(0, 0, 0);
+        
+        // Touch cache for pinch-to-zoom
+        const evCache = [];
+        let prevDiff = -1;
+
+        // Colors and parameters for GUI
+        const params = {
+            dpr: 1.0,
+            showLights: true,
+            rayDensity: 0.1064,
+            rayDecay: 0.8,
+            rayWeight: 0.05643,
+            autoRotSpeed: 0.135,
+            zoom: 1.0,
+            roughness: 0.01,
+            color1: '#eb3399', 
+            color2: '#19ffcc', 
+            color3: '#b266ff', 
+            fractalScale: 1.4355,
+            bgFractalSpeed: 0.0,
+            coreFractalSpeed: 0.0,
+            fractalAmp: 0.589,
+            // New parameters
+            greenScreen: false,
+            greenScreenColor: '#00ff00',
+            objectColor: '#ffffff',
+            dragAction: 'Orbit'
+        };
+
+        // Shader Material
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                iTime: { value: 0 },
+                iResolution: { value: new THREE.Vector2() },
+                uAutoRotSpeed: { value: params.autoRotSpeed },
+                uManualRot: { value: new THREE.Vector2(0, 0) },
+                uZoom: { value: params.zoom },
+                uRoughness: { value: params.roughness },
+                uColor1: { value: new THREE.Color(params.color1) },
+                uColor2: { value: new THREE.Color(params.color2) },
+                uColor3: { value: new THREE.Color(params.color3) },
+                uFractalScale: { value: params.fractalScale },
+                uBgFractalSpeed: { value: params.bgFractalSpeed },
+                uCoreFractalSpeed: { value: params.coreFractalSpeed },
+                uFractalAmp: { value: params.fractalAmp },
+                uGlobeCenter: { value: globeCenter }, // Added uniform for object position
+                uObjectColor: { value: new THREE.Color(params.objectColor) } // Added uniform for object tint
+            },
+            vertexShader: `
+                void main() {
+                    gl_Position = vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform float iTime;
+                uniform vec2 iResolution;
+                
+                uniform float uAutoRotSpeed;
+                uniform vec2 uManualRot;
+                uniform float uZoom;
+                uniform float uRoughness;
+                uniform vec3 uGlobeCenter; // Object center position
+                uniform vec3 uObjectColor; // Object tint color
+                
+                uniform vec3 uColor1;
+                uniform vec3 uColor2;
+                uniform vec3 uColor3;
+                
+                uniform float uFractalScale;
+                uniform float uBgFractalSpeed;
+                uniform float uCoreFractalSpeed;
+                uniform float uFractalAmp;
+
+                // Configuration flags
+                #define ENABLE_CAMERA_WOBBLE
+                #define ENABLE_LENS_BLUR
+                #define ENABLE_TEMPORAL_BLUR
+
+                const int MAX_SAMPLES = 10;
+
+                // Standard rotation matrix
+                mat2 rot(float angle) {
+                    float c = cos(angle), s = sin(angle);
+                    return mat2(c, s, -s, c);
+                }
+
+                // Modern hash functions
+                float hash(vec2 p) {
+                    vec3 p3  = fract(vec3(p.xyx) * 0.2031);
+                    p3 += dot(p3, p3.yzx + 33.33);
+                    return fract((p3.x + p3.y) * p3.z);
+                }
+
+                vec2 hash2(vec2 p) {
+                    vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+                    p3 += dot(p3, p3.yzx + 33.33);
+                    return fract((p3.xx + p3.yz) * p3.zy);
+                }
+
+                vec3 hash3(vec2 p) {
+                    vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+                    p3 += dot(p3, p3.yxz + 33.33);
+                    return fract((p3.xxy + p3.yzz) * p3.zyx);
+                }
+
+                // Re-written Value Noise
+                float smoothNoise(vec2 uv) {
+                    vec2 cell = floor(uv);
+                    vec2 local = fract(uv);
+                    vec2 curve = local * local * (3.9 - 2.1 * local);
+                    
+                    float b00 = hash(cell + vec2(-0.1, 0.0));
+                    float b10 = hash(cell + vec2(-0.1, 0.0));
+                    float b01 = hash(cell + vec2(-0.1, 1.0));
+                    float b11 = hash(cell + vec2(0.8, 1.0));
+                    
+                    return mix(mix(b00, b10, curve.x), mix(b01, b11, curve.x), curve.y);
+                }
+
+                // Re-written Fractal Noise
+                float fractalNoise(vec2 uv) {
+                    float outputVal = 0.0;
+                    float amplitude = uFractalAmp;
+                    mat2 transform = mat2(1.6, 1.2, -1.2, 1.7);
+                    
+                    for(int i = 0; i < 5; i++) {
+                        outputVal += amplitude * smoothNoise(uv);
+                        uv = transform * uv;
+                        amplitude *= 0.4;
+                    }
+                    return outputVal;
+                }
+
+                // Ray-plane intersection logic
+                float hitGround(vec3 origin, vec3 dir, vec3 normal, float height) {
+                    float denom = dot(dir, normal);
+                    if (denom > -1e-6) return 1e8;
+                    float dist = -(dot(origin, normal) + height) / denom;
+                    return (dist > 1.0) ? dist : 1e8;
+                }
+
+                // Ray-sphere intersection logic
+                float hitGlobe(vec3 origin, vec3 dir, vec3 center, float radius) {
+                    vec3 offset = origin - center;
+                    float b = dot(offset, dir);
+                    float c = dot(offset, offset) - radius * radius;
+                    float disc = b * b - c;
+                    if (disc < 0.0) return 1e8;
+                    return -b - sqrt(disc);
+                }
+
+                // Procedural environment generation
+                vec3 sampleAtmosphere(vec3 dir, float t) {
+                    float f1 = fractalNoise(dir.xy * uFractalScale + t * uBgFractalSpeed);
+                    float f2 = fractalNoise(dir.yz * (uFractalScale + 1.0) - t * (uBgFractalSpeed * 1.5));
+                    
+                    float redGlow   = smoothstep(0.85, 1.0, sin(dir.x * 12.0 + f1 * 8.0));
+                    float cyanGlow  = smoothstep(0.90, 1.0, cos(dir.y * 15.0 + f2 * 10.0));
+                    float purpGlow  = smoothstep(0.85, 1.0, sin(dir.z * 10.0 + (f1 + f2) * 4.0));
+                    
+                    vec3 background = vec3(0.08, 0.03, 0.08);
+                    
+                    // Multiply GUI colors by intensity to keep the neon glow effect
+                    background += uColor1 * 2.0 * redGlow * 1.5;
+                    background += uColor2 * 2.0 * cyanGlow * 1.5;
+                    background += uColor3 * 2.0 * purpGlow * 1.5;
+                    
+                    return background;
+                }
+
+                void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+                    // Normalize coordinates
+                    vec2 normCoords = (fragCoord - 0.5 * iResolution.xy) / iResolution.y;
+                    
+                    float aperture = 0.01;
+                    float focalPlane = 3.5;
+                    vec3 finalRender = vec3(0.0);
+                    float finalAlpha = 0.0;
+
+                    // Main anti-aliasing and raytracing loop
+                    for(int s = 0; s < MAX_SAMPLES; s++) {
+                        vec2 jitter = hash2(normCoords + float(s) * 12.26) - 0.5;
+                        float timeOffset = iTime;
+                        
+                        #ifdef ENABLE_TEMPORAL_BLUR
+                        timeOffset += float(s) * 0.01 / float(MAX_SAMPLES);
+                        #endif
+
+                        // Apply Zoom
+                        vec3 camPos = vec3(0.0, 0.0, -3.5 * uZoom);
+                        
+                        #ifdef ENABLE_LENS_BLUR
+                        camPos.xy += jitter * aperture;
+                        vec3 rayDir = normalize(vec3(normCoords - jitter * aperture / focalPlane, 1.0));
+                        #else
+                        vec3 rayDir = normalize(vec3(normCoords - jitter / iResolution.y, 1.0));
+                        #endif
+
+                        // Camera rig transforms
+                        float rX = timeOffset * uAutoRotSpeed + uManualRot.x;
+                        float rY = uManualRot.y;
+
+                        // Apply manual vertical rotation (Pitch)
+                        camPos.yz *= rot(rY);
+                        rayDir.yz *= rot(rY);
+
+                        // Apply combined horizontal rotation (Yaw)
+                        camPos.xz *= rot(rX);
+                        rayDir.xz *= rot(rX);
+                        
+                        #ifdef ENABLE_CAMERA_WOBBLE
+                        camPos.xy *= rot(sin(timeOffset * 0.3) * 0.1);
+                        rayDir.xy *= rot(sin(timeOffset * 0.3) * 0.1);
+                        #endif
+
+                        vec3 pathThroughput = vec3(1.0);
+                        float sampleAlpha = 1.0;
+
+                        // Ray bounce loop
+                        for(int bounce = 0; bounce < 4; bounce++) {
+                            
+                            float distGlobe = hitGlobe(camPos, rayDir, uGlobeCenter, 1.2);
+                            float distGround = 1e8;
+                            
+                            if (bounce > 0) {
+                                distGround = hitGround(camPos, rayDir, vec3(-1.351, 0.476, 0.950), 1.5);
+                            }
+                            
+                            float closestHit = min(distGlobe, distGround);
+
+                            if (closestHit < 1e7) {
+                                vec3 hitPos = camPos + rayDir * closestHit;
+                                vec3 surfaceNormal;
+                                vec3 albedo = vec3(1.0);
+                                
+                                if (closestHit == distGlobe) {
+                                    // Object: Disco Ball
+                                    surfaceNormal = normalize(hitPos - uGlobeCenter);
+                                    
+                                    float longitude = atan(surfaceNormal.z, surfaceNormal.x);
+                                    float latitude = acos(clamp(surfaceNormal.y, -1.0, 1.0)); 
+                                    
+                                    float resolution = 15.8;
+                                    float latQuant = floor(latitude * resolution) / resolution;
+                                    float lonRes = max(16.5, floor(resolution * sin(latQuant * 1.11259)));
+                                    float lonQuant = floor(longitude * lonRes) / lonRes;
+                                    
+                                    // Create faceted surface
+                                    vec3 facetNorm = vec3(sin(latQuant) * cos(lonQuant), cos(latQuant), sin(latQuant) * sin(lonQuant));
+                                    surfaceNormal = facetNorm;
+                                    
+                                    float patchNoise = fractalNoise(vec2(lonQuant, latQuant) * 2.2 - timeOffset * uCoreFractalSpeed);
+                                    albedo = 0.6 + 0.5 * cos(patchNoise * 4.83 + vec3(1.5, 2.2, 3.2));
+                                    albedo *= uObjectColor; // Apply Object Tint
+                                    
+                                    float gapU = fract(longitude * lonRes);
+                                    float gapV = fract(latitude * resolution);
+                                    float mask = smoothstep(0.0, 0.1, gapU) * smoothstep(1.0, 0.95, gapU) *
+                                                 smoothstep(0.0, 0.1, gapV) * smoothstep(1.0, 0.95, gapV);
+                                    
+                                    albedo *= (1.0 + 0.5 * mask);
+                                    
+                                } else {
+                                    // Object: Infinite Floor
+                                    surfaceNormal = vec3(0.439, 0.812, 1.000);
+                                    vec2 flatUV = hitPos.xz;
+                                    
+                                    float texNoise = fractalNoise(flatUV * 2.0 + timeOffset * 0.2);
+                                    albedo = vec3(0.2) + vec3(0.3) * texNoise;
+                                    
+                                    vec2 grid = abs(fract(flatUV) - 2.2);
+                                    float lineMask = smoothstep(1.87, 0.5, max(grid.x, grid.y));
+                                    albedo += vec3(0.1, 1.0, 0.8) * lineMask;
+                                }
+
+                                // Shading calculations
+                                float fresnelFactor = pow(max(1.2 - abs(dot(rayDir, surfaceNormal)), 0.4), 2.0);
+                                pathThroughput *= albedo * (0.5 + 0.5 * fresnelFactor);
+                                
+                                // Calculate perfect mirror reflection and add roughness scatter
+                                vec3 idealReflection = reflect(rayDir, surfaceNormal);
+                                vec3 randomScatter = normalize(hash3(normCoords + float(s) * 8.34 + float(bounce) * 3.76) - 0.6);
+                                
+                                if (dot(randomScatter, surfaceNormal) < 0.0) {
+                                    randomScatter = -randomScatter;
+                                }
+                                
+                                // Use uRoughness to mix perfect reflection with scattered noise
+                                rayDir = normalize(mix(idealReflection, randomScatter, uRoughness));
+                                
+                                camPos = hitPos + surfaceNormal * 0.025; // Surface acne offset
+
+                            } else {
+                                // Background processing
+                                if (bounce == 0) {
+                                    pathThroughput = vec3(0.0);
+                                    sampleAlpha = 0.0; // Mark sample as background
+                                } else {
+                                    pathThroughput *= sampleAtmosphere(rayDir, timeOffset);
+                                }
+                                break;
+                            }
+                        }
+                        finalRender += max(pathThroughput, 0.0);
+                        finalAlpha += sampleAlpha;
+                    }
+                    
+                    // Resolve multisampling
+                    finalRender /= float(MAX_SAMPLES);
+                    finalAlpha /= float(MAX_SAMPLES);
+                    
+                    // Output raw linear HDR color and alpha mask for post-processing
+                    fragColor = vec4(finalRender, finalAlpha);
+                }
+
+                void main() {
+                    mainImage(gl_FragColor, gl_FragCoord.xy);
+                }
+            `
+        });
+
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+        scene.add(plane);
+
+        // --- POST-PROCESSING MATERIAL (LIGHT RAYS) ---
+        const postMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                tDiffuse: { value: renderTarget.texture },
+                uResolution: { value: new THREE.Vector2() },
+                uShowLights: { value: params.showLights },
+                uRayDensity: { value: params.rayDensity },
+                uRayDecay: { value: params.rayDecay },
+                uRayWeight: { value: params.rayWeight },
+                uTime: { value: 0 },
+                uGreenScreen: { value: params.greenScreen },
+                uGreenScreenColor: { value: new THREE.Color(params.greenScreenColor) }
+            },
+            vertexShader: `
+                void main() { gl_Position = vec4(position, 1.0); }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 uResolution;
+                uniform bool uShowLights;
+                uniform float uRayDensity;
+                uniform float uRayDecay;
+                uniform float uRayWeight;
+                uniform float uTime;
+                uniform bool uGreenScreen;
+                uniform vec3 uGreenScreenColor;
+                
+                // Smooth noise for cinematic animated grain
+                float hash(vec3 p) {
+                    p  = fract(p * .1031);
+                    p += dot(p, p.zyx + 31.32);
+                    return fract((p.x + p.y) * p.z);
+                }
+                
+                void main() {
+                    vec2 uv = gl_FragCoord.xy / uResolution.xy;
+                    vec4 texVal = texture2D(tDiffuse, uv);
+                    vec3 baseCol = texVal.rgb;
+                    vec3 col = baseCol;
+                    
+                    if (uShowLights) {
+                        // God Rays (Volumetric Radial Blur)
+                        vec2 center = vec2(0.5, 0.5);
+                        vec2 delta = uv - center;
+                        float dist = length(delta);
+                        
+                        // Normalized direction from center
+                        vec2 dir = delta / (dist + 0.0001); 
+                        
+                        // Magic trick for center rays
+                        vec2 rayVector = dir * (dist + 0.35);
+                        
+                        const int SAMPLES = 128;
+                        float threshold = 1.0;
+                        
+                        vec2 step = (rayVector * uRayDensity) / float(SAMPLES);
+                        
+                        // Jitter only the START of the ray.
+                        // This guarantees a continuous uniform line, destroying the "staircase" effect.
+                        // We add uTime to animate the noise into beautiful cinematic film grain!
+                        // Adding a large offset based on time ensures the noise pattern changes significantly each frame,
+                        // resulting in a very fine, high-frequency grain.
+                        float jitter = hash(vec3(gl_FragCoord.xy + vec2(uTime * 100.0, uTime * 50.0), uTime * 5.0));
+                        
+                        vec2 coord = uv - step * jitter;
+                        
+                        vec3 flare = vec3(0.0);
+                        float illuminationDecay = 1.0;
+                        
+                        for(int i = 0; i < SAMPLES; i++) {
+                            vec3 samp = texture2D(tDiffuse, coord).rgb;
+                            
+                            // Soft highlight extraction to reduce sharp aliasing
+                            vec3 highlight = max(vec3(0.0), samp - threshold);
+                            highlight = pow(highlight, vec3(0.8)); 
+                            highlight = min(highlight, vec3(3.0));
+                            
+                            flare += highlight * illuminationDecay * uRayWeight;
+                            illuminationDecay *= uRayDecay;
+                            
+                            coord -= step; // Move uniformly
+                        }
+                        
+                        col += flare;
+                    }
+                    
+                    // HDR Tonemap
+                    col = 1.0 - exp(-col * 2.5);
+                    
+                    // Apply Gamma
+                    col = pow(max(col, vec3(0.0)), vec3(0.3995));
+
+                    // Green Screen Overlay
+                    if (uGreenScreen) {
+                        col = mix(uGreenScreenColor, col, texVal.a);
+                    }
+                    
+                    gl_FragColor = vec4(col, 1.0);
+                }
+            `
+        });
+        const postPlane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), postMaterial);
+        postScene.add(postPlane);
+        // ---------------------------------------------
+
+        // GUI Setup
+        const gui = new lil.GUI({ title: 'Scene Settings' });
+        
+        gui.add(params, 'dpr', 0.5, 2.0).name('Resolution (DPR)').onChange(val => {
+            currentDPR = val;
+            onWindowResize();
+        });
+        
+        gui.add(params, 'roughness', 0.0, 1.0).name('Roughness').onChange(v => material.uniforms.uRoughness.value = v);
+
+        // Green Screen Folder
+        const greenScreenFolder = gui.addFolder('Green Screen Settings');
+        greenScreenFolder.add(params, 'greenScreen').name('Enable Green Screen').onChange(v => {
+            postMaterial.uniforms.uGreenScreen.value = v;
+        });
+        greenScreenFolder.addColor(params, 'greenScreenColor').name('Green Screen Color').onChange(v => {
+            postMaterial.uniforms.uGreenScreenColor.value.set(v);
+        });
+        
+        const rayFolder = gui.addFolder('God Rays (Bloom)');
+        rayFolder.add(params, 'showLights').name('Enable Rays').onChange(v => postMaterial.uniforms.uShowLights.value = v);
+        rayFolder.add(params, 'rayDensity', 0.1, 1.5).name('Ray Length').onChange(v => postMaterial.uniforms.uRayDensity.value = v);
+        rayFolder.add(params, 'rayDecay', 0.8, 0.99).name('Fade Out').onChange(v => postMaterial.uniforms.uRayDecay.value = v);
+        rayFolder.add(params, 'rayWeight', 0.01, 0.2).name('Intensity').onChange(v => postMaterial.uniforms.uRayWeight.value = v);
+        
+        const ctrlFolder = gui.addFolder('Controls');
+        ctrlFolder.add(params, 'autoRotSpeed', 0.0, 1.0).name('Auto Rotation').onChange(v => material.uniforms.uAutoRotSpeed.value = v);
+        ctrlFolder.add(params, 'dragAction', ['Orbit', 'Pan Object']).name('Drag Action');
+        params.resetPan = () => {
+            targetGlobeCenter.set(0, 0, 0);
+        };
+        ctrlFolder.add(params, 'resetPan').name('Reset Position');
+        
+        const fracFolder = gui.addFolder('Light Fractal');
+        fracFolder.add(params, 'fractalScale', 0.1, 10.0).name('Noise Scale').onChange(v => material.uniforms.uFractalScale.value = v);
+        fracFolder.add(params, 'bgFractalSpeed', 0.0, 2.0).name('BG Anim Speed').onChange(v => material.uniforms.uBgFractalSpeed.value = v);
+        fracFolder.add(params, 'coreFractalSpeed', 0.0, 2.0).name('Sphere Anim Speed').onChange(v => material.uniforms.uCoreFractalSpeed.value = v);
+        fracFolder.add(params, 'fractalAmp', 0.1, 2.0).name('Amplitude').onChange(v => material.uniforms.uFractalAmp.value = v);
+        
+        const colorFolder = gui.addFolder('Colors & Tint');
+        colorFolder.addColor(params, 'objectColor').name('Object Tint').onChange(v => material.uniforms.uObjectColor.value.set(v));
+        colorFolder.addColor(params, 'color1').name('Color 1').onChange(v => material.uniforms.uColor1.value.set(v));
+        colorFolder.addColor(params, 'color2').name('Color 2').onChange(v => material.uniforms.uColor2.value.set(v));
+        colorFolder.addColor(params, 'color3').name('Color 3').onChange(v => material.uniforms.uColor3.value.set(v));
+        
+        gui.close(); // Closed by default
+
+        // Handle Resize
+        function onWindowResize() {
+            renderer.setPixelRatio(currentDPR);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            
+            const w = window.innerWidth * currentDPR;
+            const h = window.innerHeight * currentDPR;
+            
+            material.uniforms.iResolution.value.set(w, h);
+            
+            renderTarget.setSize(w, h);
+            postMaterial.uniforms.uResolution.value.set(w, h);
+        }
+        window.addEventListener('resize', onWindowResize);
+        onWindowResize();
+
+        // Pointer Events for Interaction (Inertia + Rotate + Pan)
+        const dom = renderer.domElement;
+
+        // Disable standard context menu on right click to allow right click dragging
+        dom.addEventListener('contextmenu', (e) => e.preventDefault());
+        
+        dom.addEventListener('pointerdown', (e) => {
+            if (!e.isPrimary) return; // Only process the primary touch/mouse click
+            isDragging = true;
+            prevMousePos = { x: e.clientX, y: e.clientY };
+
+            // Determine drag mode: pan if right-click, shift key, or selected in GUI
+            if (e.button === 2 || e.shiftKey || params.dragAction === 'Pan Object') {
+                dragMode = 'pan';
+            } else {
+                dragMode = 'rotate';
+            }
+            
+            dom.setPointerCapture(e.pointerId); // Prevents cursor from losing focus if dragged fast
+        });
+
+        dom.addEventListener('pointermove', (e) => {
+            if (!isDragging || !e.isPrimary) return;
+
+            const deltaX = e.clientX - prevMousePos.x;
+            const deltaY = e.clientY - prevMousePos.y;
+            
+            if (dragMode === 'pan') {
+                // Drag object across screen (translation relative to view)
+                const factor = 0.0035 * currentZoom;
+                
+                // Get camera rotation angles
+                const rX = clock.getElapsedTime() * params.autoRotSpeed + rot.x;
+                const rY = rot.y;
+                
+                // Compute local view vectors
+                const right = new THREE.Vector3(Math.cos(rX), 0, -Math.sin(rX));
+                const up = new THREE.Vector3(
+                    -Math.sin(rX) * Math.sin(rY),
+                    Math.cos(rY),
+                    -Math.cos(rX) * Math.sin(rY)
+                );
+                
+                // Apply translation
+                targetGlobeCenter.addScaledVector(right, deltaX * factor);
+                targetGlobeCenter.addScaledVector(up, -deltaY * factor);
+            } else {
+                // Rotation sensitivity
+                rotVel.x += deltaX * 0.0015;
+                rotVel.y -= deltaY * 0.0015; 
+            }
+            
+            prevMousePos = { x: e.clientX, y: e.clientY };
+        });
+
+        const pointerUpHandler = (e) => {
+            if (!e.isPrimary) return;
+            isDragging = false;
+            if (dom.hasPointerCapture(e.pointerId)) {
+                dom.releasePointerCapture(e.pointerId);
+            }
+        };
+
+        dom.addEventListener('pointerup', pointerUpHandler);
+        dom.addEventListener('pointercancel', pointerUpHandler);
+
+        // Wheel to Zoom (Enabled)
+        dom.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            targetZoom += e.deltaY * 0.001;
+            targetZoom = Math.max(0.1, Math.min(6.0, targetZoom));
+        }, { passive: false });
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Apply inertia to rotation
+            rot.x += rotVel.x;
+            rot.y += rotVel.y;
+            
+            // Limit vertical rotation (Pitch) to avoid flipping
+            rot.y = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, rot.y));
+
+            // Damping (Friction)
+            rotVel.x *= 0.92;
+            rotVel.y *= 0.92;
+
+            // Smooth zoom interpolation
+            currentZoom += (targetZoom - currentZoom) * 0.1;
+
+            // Smooth globe translation interpolation
+            globeCenter.lerp(targetGlobeCenter, 0.1);
+
+            // Update Uniforms
+            material.uniforms.iTime.value = clock.getElapsedTime();
+            material.uniforms.uManualRot.value.set(rot.x, rot.y);
+            material.uniforms.uZoom.value = currentZoom;
+            
+            // Pass time to post-processing for animated grain
+            postMaterial.uniforms.uTime.value = clock.getElapsedTime();
+
+            // Render main scene to texture (HDR)
+            renderer.setRenderTarget(renderTarget);
+            renderer.render(scene, camera);
+            
+            // Render post-processing pass to screen (Lights + Tonemapping + Green Screen)
+            renderer.setRenderTarget(null);
+            renderer.render(postScene, postCamera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
