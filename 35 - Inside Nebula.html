@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volumetric Nebula</title>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #020108;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            user-select: none;
+            transition: background-color 0.3s ease;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+        canvas {
+            display: block;
+            cursor: grab;
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+        /* Custom styles for premium lil-gui look */
+        .lil-gui {
+            --background-color: rgba(15, 10, 25, 0.85);
+            --text-color: #f1f0f5;
+            --title-background-color: rgba(5, 2, 10, 0.95);
+            --widget-color: rgba(50, 40, 70, 0.6);
+            --hover-color: rgba(80, 60, 110, 0.8);
+            --focus-color: #e666b3;
+            --number-color: #e666b3;
+            --string-color: #00ffcc;
+            font-family: inherit;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 35px rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        /* Floating Instructions Overlay */
+        #instructions {
+            position: absolute;
+            bottom: 25px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(241, 240, 245, 0.7);
+            background: rgba(15, 10, 25, 0.75);
+            padding: 10px 24px;
+            border-radius: 30px;
+            font-size: 13px;
+            pointer-events: none;
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            letter-spacing: 0.5px;
+            text-align: center;
+            box-shadow: 0 4px 25px rgba(0, 0, 0, 0.4);
+            transition: opacity 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div id="instructions">Left-click & Drag nebula to move | Wheel to zoom | Right-click & Drag to rotate</div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import GUI from 'lil-gui';
+
+        // --- ROBUST 3D NOISE FOR RAYMARCHING ---
+        // Using highly optimized Value Noise to ensure compilation across all GPUs
+        const noiseChunk = `
+            // Fast 3D Hash
+            float hash(vec3 p) {
+                p = fract(p * 0.3183099 + 0.1);
+                p *= 17.0;
+                return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+            }
+
+            // 3D Value Noise
+            float noise(in vec3 x) {
+                vec3 i = floor(x);
+                vec3 f = fract(x);
+                f = f * f * (3.0 - 2.0 * f);
+                
+                return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                               mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                           mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                               mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+            }
+
+            // Fractal Brownian Motion (Standard Clouds)
+            float fbm(vec3 p) {
+                float f = 0.0;
+                float amp = 0.5;
+                for(int i = 0; i < 4; i++) { // INCREASED: 4 octaves for sharper details
+                    f += amp * noise(p);
+                    p *= 2.2;
+                    amp *= 0.5;
+                }
+                return f;
+            }
+
+            // Ridge Noise (For sharp, fibrous plasma tendrils)
+            float ridge(vec3 p) {
+                float f = 0.0;
+                float amp = 0.5;
+                for(int i = 0; i < 4; i++) { // INCREASED: 4 octaves for sharper details
+                    float n = noise(p);
+                    n = 1.0 - abs(n * 2.0 - 1.0); // Create sharp peaks
+                    f += amp * n;
+                    p *= 2.2;
+                    amp *= 0.5;
+                }
+                return f;
+            }
+
+            // Vein Noise (For thin, web-like glowing structures)
+            float veinNoise(vec3 p) {
+                float f = 0.0;
+                float amp = 0.5;
+                for(int i = 0; i < 3; i++) {
+                    float n = noise(p);
+                    n = 1.0 - abs(n * 2.0 - 1.0); // Ridge base
+                    n = pow(n, 5.0); // Extremely sharp power curve to make thin veins
+                    f += amp * n;
+                    p *= 2.5;
+                    amp *= 0.4;
+                }
+                return f;
+            }
+        `;
+
+        // --- VOLUMETRIC RAYMARCHING SHADERS ---
+
+        const volumeVertexShader = `
+            varying vec3 vWorldPosition;
+            void main() {
+                // Get the world position of the bounding box
+                vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                vWorldPosition = worldPos.xyz;
+                gl_Position = projectionMatrix * viewMatrix * worldPos;
+            }
+        `;
+
+        const volumeFragmentShader = `
+            ${noiseChunk}
+            
+            varying vec3 vWorldPosition;
+            
+            uniform vec3 uColorCore;
+            uniform vec3 uColorMid;
+            uniform vec3 uColorOuter;
+            uniform float uTime;
+            uniform float uRidgeTime;
+            uniform float uVeinTime;
+            uniform float uDensityMult;
+            uniform float uStructure;
+
+            // Box Intersection function (AABB)
+            vec2 hitBox(vec3 ro, vec3 rd, vec3 extents) {
+                vec3 t0 = (-extents - ro) / rd;
+                vec3 t1 = (extents - ro) / rd;
+                vec3 tmin = min(t0, t1);
+                vec3 tmax = max(t0, t1);
+                float tnear = max(max(tmin.x, tmin.y), tmin.z);
+                float tfar = min(min(tmax.x, tmax.y), tmax.z);
+                return vec2(tnear, tfar);
+            }
+
+            void main() {
+                // Ray setup
+                vec3 ro = cameraPosition;
+                vec3 rd = normalize(vWorldPosition - cameraPosition);
+                
+                // Intersect with a bounding box of size 10x10x10 (extents = 5.0)
+                vec2 hit = hitBox(ro, rd, vec3(5.0));
+                
+                // If ray misses box or box is behind camera, discard
+                if(hit.x > hit.y || hit.y < 0.0) discard;
+                
+                // Start raymarching at the entry point or camera pos (if inside)
+                float stepSize = 0.3; // OPTIMIZED: Larger step size for performance
+                
+                // Start without dithering
+                float t = max(hit.x, 0.0);
+                
+                float tmax = min(hit.y, 15.0); 
+                
+                vec4 sum = vec4(0.0);  // Accumulated color and alpha
+                
+                // Raymarching loop
+                for(int i = 0; i < 32; i++) { // OPTIMIZED: Reduced max steps from 40 to 32
+                    if(t >= tmax || sum.a >= 0.95) break;
+                    
+                    vec3 p = ro + rd * t;
+                    float r = length(p); // Distance from center
+                    
+                    // Optimization: Only compute dense noise inside a sphere
+                    if(r < 4.8) {
+                        // Animate coordinates for main gas/plasma
+                        vec3 q = p - vec3(0.0, uTime * 0.15, uTime * 0.05);
+                        q *= uStructure * 3.0; // Scale structure (multiplier added to keep details sharp with low slider value)
+                        
+                        // Animate coordinates for ridges (the fast boiling plasma)
+                        vec3 qRidge = p - vec3(0.0, uRidgeTime * 0.15, uRidgeTime * 0.05);
+                        qRidge *= uStructure * 3.0;
+
+                        // Animate coordinates independently for veins
+                        vec3 qVein = p - vec3(0.0, uVeinTime * 0.15, uVeinTime * 0.05);
+                        qVein *= uStructure * 3.0;
+
+                        // Combine smooth clouds and sharp ridges
+                        float n1 = fbm(q);
+                        float n2 = ridge(qRidge * 1.5 + n1 * 0.5);
+                        
+                        // New semi-transparent Vein layer using its own time scale
+                        float veins = veinNoise(qVein * 2.0 - vec3(uVeinTime * 0.1));
+                        
+                        // Spherical falloff so edges fade to black seamlessly
+                        float falloff = smoothstep(4.5, 0.5, r);
+                        
+                        // Base density with sharper contrast
+                        float density = (n1 * 0.6 + n2 * 0.4) * falloff;
+                        // Carve out holes for more complex structure
+                        density -= fbm(q * 2.5) * 0.4; 
+                        
+                        density = max(density, 0.0) * uDensityMult;
+                        
+                        if(density > 0.01) {
+                            // Map colors based on distance and density
+                            vec3 c = mix(uColorOuter, uColorMid, smoothstep(4.5, 1.5, r));
+                            
+                            // Core brightness
+                            float coreGlow = smoothstep(2.5, 0.0, r) * (density * 1.0);
+                            c = mix(c, uColorCore, coreGlow);
+                            
+                            // Add cyan/blue highlights inside dense plasma folds
+                            c = mix(c, vec3(0.0, 0.8, 1.0), smoothstep(0.6, 1.0, n2) * 0.4);
+                            
+                            // Add glowing veins (Bright pinkish-blue webs)
+                            vec3 veinColor = mix(uColorMid, vec3(0.5, 0.9, 1.0), n1);
+                            c += veinColor * veins * 2.5 * falloff;
+                            
+                            // Fake self-shadowing (darken less dense areas)
+                            c *= mix(0.1, 1.0, n1); // Darker shadows for higher contrast
+                            
+                            // Accumulate with premultiplied alpha blending
+                            // Multiply by 1.2 to compensate for the larger step size
+                            vec4 src = vec4(c * density * 1.2, density * 0.15 * 1.2); 
+                            sum += src * (1.0 - sum.a);
+                        }
+                    }
+                    t += stepSize;
+                }
+                
+                // Final output
+                gl_FragColor = sum;
+            }
+        `;
+
+        // --- PARTICLE SHADERS ---
+        const particleVertexShader = `
+            attribute float size;
+            varying vec3 vColor;
+            void main() {
+                vColor = color;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                
+                // MIN SIZE CLAMP: Prevents particles from becoming sub-pixel and flickering
+                float pSize = size * (10.0 / -mvPosition.z);
+                gl_PointSize = max(pSize, 1.0); 
+                
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const particleFragmentShader = `
+            varying vec3 vColor;
+            void main() {
+                float d = distance(gl_PointCoord, vec2(0.5));
+                if (d > 0.5) discard; // Discard pixels outside the circle
+                
+                float alpha = smoothstep(0.5, 0.1, d); // Soft edges for the star
+                
+                // BOOST COLOR: Ensures they are above bloom threshold to prevent bloom flickering
+                gl_FragColor = vec4(vColor * 1.5, alpha);
+            }
+        `;
+
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        // Clear background so renderer can be transparent
+        scene.background = null;
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 3.2); // MOVED CLOSER TO NEBULA (Was 4.5)
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        // OPTIMIZED: Dynamic pixel ratio for large monitors. Default to 0.75 to save GPU.
+        renderer.setPixelRatio(0.75);
+        // CHANGED: ACESFilmic handles bright colors much better without blowing out to pure white
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 7.5;
+        controls.minDistance = 2.0; // ALLOW CLOSER ZOOM
+        controls.maxDistance = 15;
+
+        // --- POST PROCESSING (BLOOM) ---
+        const renderScene = new RenderPass(scene, camera);
+        
+        // REDUCED GLOW: Applied from screenshot settings
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.48, 0.4, 0.4); // UPDATED GLOW INTENSITY
+        
+        const composer = new EffectComposer(renderer);
+        composer.setPixelRatio(0.75); // Match renderer pixel ratio
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- OBJECTS ---
+        const group = new THREE.Group();
+        scene.add(group);
+
+        // 1. VOLUMETRIC NEBULA (Raymarched inside a Box)
+        // We use a BackSide box. The fragment shader raymarches from the camera *into* the box.
+        const volumeGeo = new THREE.BoxGeometry(10, 10, 10);
+        
+        const volumeUniforms = {
+            uTime: { value: 0 },
+            uRidgeTime: { value: 0 },
+            uVeinTime: { value: 0 },
+            uDensityMult: { value: 0.5 }, // UPDATED from screenshot
+            uStructure: { value: 0.1406 },   // UPDATED from screenshot
+            uColorCore: { value: new THREE.Color('#ffe6f2') }, 
+            uColorMid: { value: new THREE.Color('#2a70b2') },  // UPDATED from screenshot
+            uColorOuter: { value: new THREE.Color('#ffffff') } // UPDATED from screenshot
+        };
+
+        const volumeMaterial = new THREE.ShaderMaterial({
+            vertexShader: volumeVertexShader,
+            fragmentShader: volumeFragmentShader,
+            uniforms: volumeUniforms,
+            transparent: true,
+            side: THREE.BackSide, // Important for camera to go inside!
+            depthWrite: false
+        });
+
+        const nebulaVolume = new THREE.Mesh(volumeGeo, volumeMaterial);
+        group.add(nebulaVolume);
+
+        // 2. PARTICLES (Stars) - Minimal and elegant
+        const particleCount = 600; // REDUCED particle count
+        const particleGeo = new THREE.BufferGeometry();
+        const pPositions = new Float32Array(particleCount * 3);
+        const pColors = new Float32Array(particleCount * 3);
+        const pSizes = new Float32Array(particleCount);
+
+        const colorPalettes = [
+            new THREE.Color('#ffffff'), // White
+            new THREE.Color('#2a70b2'), // Light Pink (blueish)
+            new THREE.Color('#4da6ff')  // Light Blue
+        ];
+
+        for(let i = 0; i < particleCount; i++) {
+            // Distribute stars in a cluster around the core
+            const r = 0.5 + Math.random() * 8.0;
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos((Math.random() * 2) - 1);
+
+            pPositions[i*3] = r * Math.sin(phi) * Math.cos(theta);
+            pPositions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+            pPositions[i*3+2] = r * Math.cos(phi);
+
+            // Random color from palette
+            const color = colorPalettes[Math.floor(Math.random() * colorPalettes.length)];
+            pColors[i*3] = color.r;
+            pColors[i*3+1] = color.g;
+            pColors[i*3+2] = color.b;
+            
+            // Randomize particle sizes (INCREASED base size to prevent aliasing/flickering)
+            pSizes[i] = Math.random() * 1.0 + 0.2;
+        }
+
+        particleGeo.setAttribute('position', new THREE.BufferAttribute(pPositions, 3));
+        particleGeo.setAttribute('color', new THREE.BufferAttribute(pColors, 3));
+        particleGeo.setAttribute('size', new THREE.BufferAttribute(pSizes, 1));
+
+        // Use ShaderMaterial to make particles perfectly round and soft
+        const particleMaterial = new THREE.ShaderMaterial({
+            vertexShader: particleVertexShader,
+            fragmentShader: particleFragmentShader,
+            transparent: true,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particles = new THREE.Points(particleGeo, particleMaterial);
+        group.add(particles);
+
+        // Add invisible helper sphere for dragging the group
+        const dragHelperGeo = new THREE.SphereGeometry(6.0, 32, 32);
+        const dragHelperMat = new THREE.MeshBasicMaterial({
+            visible: false,
+            depthWrite: false
+        });
+        const dragHelper = new THREE.Mesh(dragHelperGeo, dragHelperMat);
+        group.add(dragHelper);
+
+        // --- GUI SETTINGS ---
+        const gui = new GUI({ title: 'Settings' });
+        gui.close(); // Collapse the settings panel by default
+        
+        const settings = {
+            density: volumeUniforms.uDensityMult.value,
+            structure: volumeUniforms.uStructure.value,
+            colorCore: '#' + volumeUniforms.uColorCore.value.getHexString(),
+            colorMid: '#' + volumeUniforms.uColorMid.value.getHexString(),
+            colorOuter: '#' + volumeUniforms.uColorOuter.value.getHexString(),
+            bloomStrength: bloomPass.strength,
+            autoRotate: controls.autoRotate,
+            cameraSpeed: controls.autoRotateSpeed, // Camera speed setting
+            animationSpeed: 1.0, // Shader animation speed
+            ridgeAnimSpeed: 0.3, // Plasma Ridges animation speed
+            veinsAnimSpeed: 1.0, // Veins animation speed
+            resolutionScale: 0.75, // Resolution scale for performance
+            greenScreen: false, // Green screen background override
+            bgColor: '#020108', // Default space background color
+            resetPosition: () => {
+                group.position.set(0, 0, 0);
+                controls.target.set(0, 0, 0);
+                camera.position.set(0, 0, 3.2);
+                controls.update();
+            }
+        };
+
+        const bgFolder = gui.addFolder('Background Settings');
+        bgFolder.add(settings, 'greenScreen').name('Green Screen (#00ff00)').onChange(updateBackground);
+        bgFolder.addColor(settings, 'bgColor').name('Custom BG Color').onChange(updateBackground);
+        bgFolder.open();
+
+        const perfFolder = gui.addFolder('Performance');
+        perfFolder.add(settings, 'resolutionScale', 0.1, 1.5).name('Resolution Scale').onChange(v => {
+            renderer.setPixelRatio(v);
+            composer.setPixelRatio(v);
+        });
+
+        const volFolder = gui.addFolder('Nebula Structure');
+        volFolder.add(settings, 'density', 0.5, 0.8).name('Gas Density').onChange(v => volumeUniforms.uDensityMult.value = v);
+        volFolder.add(settings, 'structure', 0.1, 2.0).name('Noise Scale').onChange(v => volumeUniforms.uStructure.value = v);
+        
+        const colorFolder = gui.addFolder('Colors');
+        colorFolder.addColor(settings, 'colorCore').name('Core Color').onChange(v => volumeUniforms.uColorCore.value.set(v));
+        colorFolder.addColor(settings, 'colorMid').name('Plasma Color').onChange(v => volumeUniforms.uColorMid.value.set(v));
+        colorFolder.addColor(settings, 'colorOuter').name('Fringe Color').onChange(v => volumeUniforms.uColorOuter.value.set(v));
+        
+        const postFolder = gui.addFolder('Post Processing');
+        postFolder.add(settings, 'bloomStrength', 0.0, 4.0).name('Glow Intensity').onChange(v => bloomPass.strength = v);
+
+        const motionFolder = gui.addFolder('Animation & Interaction');
+        motionFolder.add(settings, 'autoRotate').name('Camera Rotation').onChange(v => controls.autoRotate = v);
+        motionFolder.add(settings, 'cameraSpeed', 0.0, 15.0).name('Rotation Speed').onChange(v => controls.autoRotateSpeed = v);
+        motionFolder.add(settings, 'animationSpeed', 0.0, 4.0).name('Gas Anim Speed'); 
+        motionFolder.add(settings, 'ridgeAnimSpeed', 0.0, 4.0).name('Plasma Anim Speed'); // Ridge shader speed slider
+        motionFolder.add(settings, 'veinsAnimSpeed', 0.0, 4.0).name('Veins Anim Speed'); // Veins shader speed slider
+        motionFolder.add(settings, 'resetPosition').name('Reset Position/Zoom');
+        motionFolder.open();
+
+        function updateBackground() {
+            const activeColor = settings.greenScreen ? '#00ff00' : settings.bgColor;
+            document.body.style.backgroundColor = activeColor;
+        }
+
+        // Initialize background
+        updateBackground();
+
+        // --- Direct Object Dragging Logic ---
+        const dragPlane = new THREE.Plane();
+        const dragStartPoint = new THREE.Vector3();
+        const dragCurrentPoint = new THREE.Vector3();
+        const dragStartPosition = new THREE.Vector3();
+        const dragStartTarget = new THREE.Vector3();
+        const dragStartCameraPos = new THREE.Vector3();
+        const pointer = new THREE.Vector2();
+        const raycaster = new THREE.Raycaster();
+        const planeNormal = new THREE.Vector3();
+        let isDraggingGroup = false;
+
+        function updatePointer(event) {
+            pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
+            pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function setDragPlane() {
+            camera.getWorldDirection(planeNormal);
+            dragPlane.setFromNormalAndCoplanarPoint(planeNormal, group.position);
+        }
+
+        renderer.domElement.addEventListener('pointerdown', (event) => {
+            // Drag only with left click (button 0), and ignore click if on GUI
+            if (event.button !== 0 || event.target.closest('.lil-gui')) return;
+
+            updatePointer(event);
+            raycaster.setFromCamera(pointer, camera);
+            
+            // Raycast against the invisible drag helper sphere
+            const intersects = raycaster.intersectObject(dragHelper);
+
+            if (!intersects.length) return;
+
+            isDraggingGroup = true;
+            controls.enabled = false; // Disable OrbitControls while dragging
+            setDragPlane();
+            raycaster.ray.intersectPlane(dragPlane, dragStartPoint);
+            dragStartPosition.copy(group.position);
+            dragStartTarget.copy(controls.target);
+            dragStartCameraPos.copy(camera.position);
+            renderer.domElement.setPointerCapture(event.pointerId);
+        });
+
+        renderer.domElement.addEventListener('pointermove', (event) => {
+            if (!isDraggingGroup) return;
+
+            updatePointer(event);
+            raycaster.setFromCamera(pointer, camera);
+
+            if (raycaster.ray.intersectPlane(dragPlane, dragCurrentPoint)) {
+                // Apply drag delta to the group position, camera, and controls target
+                const delta = dragCurrentPoint.clone().sub(dragStartPoint);
+                group.position.copy(dragStartPosition).add(delta);
+                controls.target.copy(dragStartTarget).add(delta);
+                camera.position.copy(dragStartCameraPos).add(delta);
+            }
+        });
+
+        function endDrag(event) {
+            if (!isDraggingGroup) return;
+
+            isDraggingGroup = false;
+            controls.enabled = true; // Re-enable OrbitControls
+            renderer.domElement.releasePointerCapture(event.pointerId);
+        }
+
+        renderer.domElement.addEventListener('pointerup', endDrag);
+        renderer.domElement.addEventListener('pointercancel', endDrag);
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+        let shaderTime = 0; // Use accumulated time to prevent jumping when speed changes
+        let ridgeShaderTime = 0; // Independent time accumulator for boiling ridges
+        let veinShaderTime = 0; // Independent time accumulator for veins
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            shaderTime += delta * settings.animationSpeed;
+            ridgeShaderTime += delta * settings.ridgeAnimSpeed;
+            veinShaderTime += delta * settings.veinsAnimSpeed;
+
+            // Pass time to volume shader
+            volumeUniforms.uTime.value = shaderTime;
+            volumeUniforms.uRidgeTime.value = ridgeShaderTime;
+            volumeUniforms.uVeinTime.value = veinShaderTime;
+
+            // Very slow rotation for the stars, synced with animation speed
+            particles.rotation.y += delta * 0.02 * settings.animationSpeed;
+
+            controls.update();
+
+            // Render via composer
+            composer.render();
+        }
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
