@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volumetric Raymarching</title>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #000; 
+        }
+        canvas { 
+            display: block; 
+        }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import GUI from 'lil-gui';
+
+        // 1. Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+        camera.position.z = 1;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // 2. Configuration parameters
+        const params = {
+            dpr: 0.4,
+            speed: 0.254,
+            baseDensity: 0.1,
+            glowStrength: 0.0078,
+            colorBoost: 1.8,
+            greenscreen: false,
+            colorScheme: 'Rainbow',
+            color1: '#ff0000',
+            color2: '#0000ff',
+            zoom: 1.0,
+            offsetX: 0.0,
+            offsetY: 0.0
+        };
+
+        // Apply initial DPR
+        renderer.setPixelRatio(window.devicePixelRatio * params.dpr);
+
+        // Helper function to update shader resolution based on current DPR
+        function updateShaderResolution() {
+            if (!material) return;
+            const pixelRatio = renderer.getPixelRatio();
+            material.uniforms.uResolution.value.set(
+                window.innerWidth * pixelRatio,
+                window.innerHeight * pixelRatio
+            );
+        }
+
+        // 3. Setup lil-gui settings panel
+        const gui = new GUI({ title: 'Scene Settings' });
+        
+        gui.add(params, 'dpr', 0.1, 2.0, 0.1).name('DPR (Resolution)').onChange((value) => {
+            renderer.setPixelRatio(window.devicePixelRatio * value);
+            updateShaderResolution();
+        });
+        gui.add(params, 'speed', 0.0, 2.0).name('Animation Speed');
+        gui.add(params, 'baseDensity', 0.0, 0.5).name('Base Density');
+        gui.add(params, 'glowStrength', 0.0, 0.1).name('Core Glow');
+        gui.add(params, 'colorBoost', 0.5, 3.0).name('Color Boost');
+        
+        // Background & Greenscreen option
+        gui.add(params, 'greenscreen').name('Greenscreen').onChange((value) => {
+            document.body.style.backgroundColor = value ? '#00ff00' : '#000000';
+        });
+
+        // Color scheme and custom color controllers
+        const schemeMapping = {
+            'Rainbow': 0,
+            'Fire': 1,
+            'Ocean': 2,
+            'Cyberpunk': 3,
+            'Forest': 4,
+            'Custom': 5
+        };
+        const schemes = Object.keys(schemeMapping);
+        
+        const schemeController = gui.add(params, 'colorScheme', schemes).name('Color Scheme');
+        const color1Controller = gui.addColor(params, 'color1').name('Color 1');
+        const color2Controller = gui.addColor(params, 'color2').name('Color 2');
+
+        function updateColorPickerVisibility() {
+            if (params.colorScheme === 'Custom') {
+                color1Controller.show();
+                color2Controller.show();
+            } else {
+                color1Controller.hide();
+                color2Controller.hide();
+            }
+        }
+        
+        schemeController.onChange(updateColorPickerVisibility);
+        updateColorPickerVisibility();
+
+        // Control controllers for viewing zoom/offsets
+        const transformFolder = gui.addFolder('Controls');
+        transformFolder.add(params, 'zoom', 0.1, 10.0, 0.1).name('Zoom').listen();
+        transformFolder.add(params, 'offsetX', -2.0, 2.0, 0.01).name('Offset X').listen();
+        transformFolder.add(params, 'offsetY', -2.0, 2.0, 0.01).name('Offset Y').listen();
+        transformFolder.close();
+        
+        // Close GUI by default
+        gui.close();
+
+        // 4. Advanced GLSL Shader
+        const fragmentShader = `
+            uniform vec2 uResolution;
+            uniform float uTime;
+            uniform float uSpeed;
+            uniform float uBaseDensity;
+            uniform float uGlowStrength;
+            uniform float uColorBoost;
+            uniform float uZoom;
+            uniform vec2 uOffset;
+            uniform vec3 uBgColor;
+            uniform int uColorScheme;
+            uniform vec3 uColor1;
+            uniform vec3 uColor2;
+
+            #define STEPS 45
+            #define STEP_SIZE 0.11
+            #define MAX_DIST 5.0
+            #define PI 3.14159265359
+
+            // 2D Rotation matrix
+            mat2 rot(float a) {
+                float s = sin(a), c = cos(a);
+                return mat2(c, -s, s, c);
+            }
+
+            // Compact 3D hash
+            float hash(vec3 p) {
+                p = fract(p * vec3(17.1, 31.7, 47.9));
+                p += dot(p, p.yzx + 19.19);
+                return fract((p.x + p.y) * p.z);
+            }
+
+            // 3D Value Noise
+            float noise(vec3 p) {
+                vec3 i = floor(p);
+                vec3 f = fract(p);
+                
+                // Smooth interpolation
+                f = f * f * (3.0 - 2.0 * f);
+                
+                return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                               mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                           mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                               mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+            }
+
+            // Fractal Brownian Motion (fBM)
+            float fbm(vec3 p) {
+                float v = uBaseDensity; 
+                float a = 0.5;
+                
+                // Rotation matrix to break up grid patterns
+                mat3 m = mat3(
+                    0.8, -0.6, 0.0,
+                    0.6, 0.8, 0.0,
+                    0.0, 0.0, 1.0
+                ); 
+                
+                for (int i = 0; i < 4; i++) {
+                    v += a * noise(p);
+                    p = m * p * 2.0 + vec3(12.3);
+                    a *= 0.5;
+                }
+                return v;
+            }
+
+            // Interleaved Gradient Noise for ray dithering
+            float ign(vec2 p) {
+                vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+                return fract(magic.z * fract(dot(p, magic.xy)));
+            }
+
+            void main() {
+                // Normalize coordinates (-1 to 1) based on physical pixels
+                vec2 uv = (gl_FragCoord.xy - 0.5 * uResolution.xy) / uResolution.y;
+                
+                // Apply Zoom and Offset to UV coordinates
+                uv = (uv - uOffset) / uZoom;
+                
+                vec3 ro = vec3(0.0, 0.0, -3.5);
+                vec3 rd = normalize(vec3(uv, 1.0));
+                
+                vec4 col = vec4(0.0);
+                
+                // Apply dithering to the starting point to hide step artifacts
+                float dither = ign(gl_FragCoord.xy);
+                float t = dither * STEP_SIZE;
+                
+                // Volumetric raymarching loop
+                for (int i = 0; i < STEPS; i++) {
+                    vec3 p = ro + rd * t;
+                    
+                    // Rotate space
+                    p.xz *= rot(uTime * uSpeed * 0.4);
+                    p.xy *= rot(uTime * uSpeed * 0.2);
+                    
+                    float r = length(p);
+                    
+                    if (r > MAX_DIST) {
+                        t += STEP_SIZE;
+                        continue;
+                    }
+                    
+                    vec3 dir = p / (r + 0.0001);
+                    
+                    float beamNoise = fbm(dir * 3.0 + uTime * uSpeed);
+                    float spatialNoise = fbm(p * 2.0 - uTime * uSpeed * 0.5);
+                    
+                    float n = beamNoise * 0.6 + spatialNoise * 0.4;
+                    
+                    // Density calculation
+                    float density = smoothstep(0.4, 0.7, n);
+                    density *= smoothstep(0.05, 0.3, r);
+                    density *= exp(-r * 1.5); 
+                    
+                    if (density > 0.01) {
+                        // Normalize the angle to prevent wrapping seams
+                        float angleXZ = atan(dir.x, dir.z) / (2.0 * PI);
+                        
+                        // Generate seamless hue
+                        float hue = angleXZ * 1.0 + dir.y * 0.4 + r * 0.4 - uTime * 0.3 + n * 0.5;
+                        
+                        // Procedural color scheme selection
+                        vec3 rayCol;
+                        if (uColorScheme == 0) {
+                            // Rainbow
+                            rayCol = 0.5 + 0.5 * cos(2.0 * PI * (hue + vec3(0.0, 0.33, 0.67)));
+                        } else if (uColorScheme == 1) {
+                            // Fire
+                            float tCol = 0.5 + 0.5 * cos(2.0 * PI * hue);
+                            rayCol = mix(vec3(1.0, 0.1, 0.0), vec3(1.0, 0.8, 0.0), tCol);
+                        } else if (uColorScheme == 2) {
+                            // Ocean
+                            float tCol = 0.5 + 0.5 * cos(2.0 * PI * hue);
+                            rayCol = mix(vec3(0.0, 0.05, 0.5), vec3(0.0, 0.9, 0.8), tCol);
+                        } else if (uColorScheme == 3) {
+                            // Cyberpunk
+                            float tCol = 0.5 + 0.5 * cos(2.0 * PI * hue);
+                            rayCol = mix(vec3(0.9, 0.0, 0.6), vec3(0.0, 0.8, 0.9), tCol);
+                        } else if (uColorScheme == 4) {
+                            // Forest
+                            float tCol = 0.5 + 0.5 * cos(2.0 * PI * hue);
+                            rayCol = mix(vec3(0.0, 0.5, 0.1), vec3(0.8, 0.9, 0.1), tCol);
+                        } else {
+                            // Custom
+                            float tCol = 0.5 + 0.5 * cos(2.0 * PI * hue);
+                            rayCol = mix(uColor1, uColor2, tCol);
+                        }
+                        
+                        // Boost color brightness
+                        rayCol *= uColorBoost;
+                        
+                        // Alpha compositing
+                        float alpha = density * 0.15; 
+                        vec4 src = vec4(rayCol * alpha, alpha);
+                        
+                        col += src * (1.0 - col.a);
+                    }
+                    
+                    // Early exit optimization
+                    if (col.a > 0.99) break;
+                    
+                    t += STEP_SIZE;
+                }
+                
+                // Dynamic glowing core
+                float coreGlow = uGlowStrength / (length(uv) * length(uv) + 0.01);
+                
+                vec3 coreColor;
+                float coreHue = uTime * 0.25;
+                if (uColorScheme == 0) {
+                    coreColor = 0.5 + 0.5 * cos(2.0 * PI * (coreHue + vec3(0.0, 0.33, 0.67)));
+                } else if (uColorScheme == 1) {
+                    float tCol = 0.5 + 0.5 * cos(2.0 * PI * coreHue);
+                    coreColor = mix(vec3(1.0, 0.1, 0.0), vec3(1.0, 0.8, 0.0), tCol);
+                } else if (uColorScheme == 2) {
+                    float tCol = 0.5 + 0.5 * cos(2.0 * PI * coreHue);
+                    coreColor = mix(vec3(0.0, 0.05, 0.5), vec3(0.0, 0.9, 0.8), tCol);
+                } else if (uColorScheme == 3) {
+                    float tCol = 0.5 + 0.5 * cos(2.0 * PI * coreHue);
+                    coreColor = mix(vec3(0.9, 0.0, 0.6), vec3(0.0, 0.8, 0.9), tCol);
+                } else if (uColorScheme == 4) {
+                    float tCol = 0.5 + 0.5 * cos(2.0 * PI * coreHue);
+                    coreColor = mix(vec3(0.0, 0.5, 0.1), vec3(0.8, 0.9, 0.1), tCol);
+                } else {
+                    float tCol = 0.5 + 0.5 * cos(2.0 * PI * coreHue);
+                    coreColor = mix(uColor1, uColor2, tCol);
+                }
+
+                // Blend volumetric and core glow over background color (black or greenscreen)
+                vec3 finalColor = col.rgb + (coreColor * coreGlow + uBgColor) * (1.0 - col.a);
+                
+                // Gamma correction
+                finalColor = pow(finalColor, vec3(1.0 / 2.2));
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        // Calculate initial resolution considering DPR
+        const initialPixelRatio = renderer.getPixelRatio();
+        
+        // 5. Create fullscreen quad with ShaderMaterial
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const material = new THREE.ShaderMaterial({
+            fragmentShader: fragmentShader,
+            uniforms: {
+                uResolution: { 
+                    value: new THREE.Vector2(
+                        window.innerWidth * initialPixelRatio, 
+                        window.innerHeight * initialPixelRatio
+                    ) 
+                },
+                uTime: { value: 0.0 },
+                uSpeed: { value: params.speed },
+                uBaseDensity: { value: params.baseDensity },
+                uGlowStrength: { value: params.glowStrength },
+                uColorBoost: { value: params.colorBoost },
+                uZoom: { value: params.zoom },
+                uOffset: { value: new THREE.Vector2(params.offsetX, params.offsetY) },
+                uBgColor: { value: new THREE.Color(0, 0, 0) },
+                uColorScheme: { value: 0 },
+                uColor1: { value: new THREE.Color(params.color1) },
+                uColor2: { value: new THREE.Color(params.color2) }
+            }
+        });
+
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // 6. Handle window resize dynamically
+        window.addEventListener('resize', () => {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            updateShaderResolution(); // Update with correct DPR scaling
+        });
+
+        // Interaction: Zoom & Drag
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+
+        // Prevent browser context menu on canvas to allow smooth dragging with any click
+        window.addEventListener('contextmenu', (e) => {
+            if (!gui.domElement.contains(e.target)) {
+                e.preventDefault();
+            }
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            if (gui.domElement.contains(e.target)) return;
+            isDragging = true;
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const deltaX = e.clientX - previousMousePosition.x;
+            const deltaY = e.clientY - previousMousePosition.y;
+
+            // Convert screen drag to UV coordinates relative to innerHeight
+            params.offsetX += deltaX / window.innerHeight;
+            params.offsetY -= deltaY / window.innerHeight;
+
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        window.addEventListener('mouseleave', () => {
+            isDragging = false;
+        });
+
+        window.addEventListener('wheel', (e) => {
+            if (gui.domElement.contains(e.target)) return;
+            e.preventDefault();
+            const factor = 1.1;
+            if (e.deltaY < 0) {
+                params.zoom *= factor;
+            } else {
+                params.zoom /= factor;
+            }
+            // Constraint zoom to reasonable limits
+            params.zoom = Math.max(0.1, Math.min(params.zoom, 20.0));
+        }, { passive: false });
+
+        // Touch Interaction Support for Mobile
+        window.addEventListener('touchstart', (e) => {
+            if (gui.domElement.contains(e.target)) return;
+            if (e.touches.length === 1) {
+                isDragging = true;
+                previousMousePosition = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            }
+        }, { passive: true });
+
+        window.addEventListener('touchmove', (e) => {
+            if (!isDragging) return;
+            if (e.touches.length === 1) {
+                const deltaX = e.touches[0].clientX - previousMousePosition.x;
+                const deltaY = e.touches[0].clientY - previousMousePosition.y;
+
+                params.offsetX += deltaX / window.innerHeight;
+                params.offsetY -= deltaY / window.innerHeight;
+
+                previousMousePosition = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            }
+        }, { passive: true });
+
+        window.addEventListener('touchend', () => {
+            isDragging = false;
+        });
+
+        // 7. Main animation loop
+        const clock = new THREE.Clock();
+        
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Update uniforms strictly from params
+            material.uniforms.uTime.value = clock.getElapsedTime();
+            material.uniforms.uSpeed.value = params.speed;
+            material.uniforms.uBaseDensity.value = params.baseDensity;
+            material.uniforms.uGlowStrength.value = params.glowStrength;
+            material.uniforms.uColorBoost.value = params.colorBoost;
+            material.uniforms.uZoom.value = params.zoom;
+            material.uniforms.uOffset.value.set(params.offsetX, params.offsetY);
+            
+            // Set background color
+            if (params.greenscreen) {
+                material.uniforms.uBgColor.value.set(0.0, 1.0, 0.0);
+            } else {
+                material.uniforms.uBgColor.value.set(0.0, 0.0, 0.0);
+            }
+
+            // Set color schemes and custom colors
+            material.uniforms.uColorScheme.value = schemeMapping[params.colorScheme];
+            material.uniforms.uColor1.value.set(params.color1);
+            material.uniforms.uColor2.value.set(params.color2);
+
+            renderer.render(scene, camera);
+        }
+        
+        animate();
+    </script>
+</body>
+</html>
