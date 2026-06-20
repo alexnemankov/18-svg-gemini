@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tactical Holographic Terrain Map</title>
+    <style>
+      :root {
+        --bg-color: #0b0e14;
+        --accent-color: #b0e3ff;
+        --hud-text: #b0e3ff;
+        --font-stack: "Courier New", Courier, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        user-select: none;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: var(--bg-color);
+        font-family: var(--font-stack);
+      }
+
+      #webgl-container {
+        width: 100%;
+        height: 100%;
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 1;
+      }
+
+      /* HUD Styling */
+      .hud-element {
+        position: absolute;
+        z-index: 10;
+        pointer-events: none;
+        color: var(--hud-text);
+        opacity: 0.65;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        transition: opacity 0.3s ease;
+        text-shadow: 0 0 8px rgba(176, 227, 255, 0.4);
+      }
+
+      #hud-bottom-left {
+        bottom: 24px;
+        left: 24px;
+        font-size: 11px;
+        line-height: 1.8;
+      }
+
+      #hud-top-right {
+        top: 24px;
+        right: 290px; /* offset to avoid overlapping the lil-gui */
+        font-size: 10px;
+        text-align: right;
+      }
+
+      /* GUI custom position & design */
+      .lil-gui {
+        --background-color: rgba(11, 14, 20, 0.85) !important;
+        --text-color: #b0e3ff !important;
+        --title-background-color: rgba(20, 30, 48, 0.9) !important;
+        --widget-color: rgba(61, 171, 195, 0.2) !important;
+        --hover-color: rgba(61, 171, 195, 0.4) !important;
+        --focus-color: rgba(176, 227, 255, 0.5) !important;
+        font-family: var(--font-stack) !important;
+        font-size: 11px !important;
+        border: 1px solid rgba(176, 227, 255, 0.2) !important;
+        border-radius: 4px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        transition:
+          opacity 0.3s ease,
+          pointer-events 0.3s ease;
+      }
+
+      /* Class to trigger UI hiding */
+      .ui-hidden {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    </style>
+
+    <!-- Import maps polyfill -->
+    <script
+      async
+      src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"
+    ></script>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.148.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.148.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="webgl-container"></div>
+
+    <!-- HUD Layout -->
+    <div id="hud-bottom-left" class="hud-element">
+      <div>TERRAIN SURVEILLANCE SYSTEM v2.4</div>
+      <div id="hud-coords">GRID REF: 52°N 017°E</div>
+      <div id="hud-altitude">ALTITUDE: --.-m</div>
+      <div id="hud-lock-status" style="color: #ffaa64">
+        TARGET LOCK: SCANNING...
+      </div>
+      <div>STATUS: TRACKING ACTIVE</div>
+    </div>
+
+    <div id="hud-top-right" class="hud-element">
+      [G] GREENSCREEN &nbsp;&nbsp; [H] HIDE UI &nbsp;&nbsp; [R] RESET CAM
+    </div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+      import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+      import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm";
+
+      // -------------------------------------------------------------------------
+      // COLOR PALETTE CONSTANTS
+      // -------------------------------------------------------------------------
+      const COLOR_BG = "#0b0e14";
+      const COLOR_LOW_TERRAIN = "#4e6594";
+      const COLOR_HIGH_CREST = "#b0e3ff";
+      const COLOR_TACTICAL = "#ffaa64";
+      const COLOR_SECONDARY_GRID = "#3dabc3";
+      const COLOR_GREENSCREEN = "#00ff00";
+
+      // -------------------------------------------------------------------------
+      // APP STATE & CONFIG
+      // -------------------------------------------------------------------------
+      const state = {
+        // GUI controlled
+        pointDensity: 110000,
+        heightMultiplier: 1.15,
+        waveSpeed: 0.6,
+        scanSpeed: 1.2,
+        showPath: true,
+        bloomStrength: 1.5,
+        bloomRadius: 0.75,
+
+        // State internals
+        isGreenscreen: false,
+        isUIHidden: false,
+        droneT: 0.0,
+        lastUserInteraction: 0,
+        cameraLerpTarget: null,
+        cameraLerpFrameCount: 0,
+      };
+
+      // -------------------------------------------------------------------------
+      // SCENE SETUP
+      // -------------------------------------------------------------------------
+      const container = document.getElementById("webgl-container");
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(COLOR_BG);
+      scene.fog = new THREE.FogExp2(COLOR_BG, 0.016);
+
+      // Camera Configuration
+      const camera = new THREE.PerspectiveCamera(
+        50,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        500,
+      );
+      const initialCamPos = new THREE.Vector3(-30, 42, 55);
+      const initialCamTarget = new THREE.Vector3(5, 8, 0);
+      camera.position.copy(initialCamPos);
+
+      // Renderer Config
+      const renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        alpha: false,
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.toneMapping = THREE.NoToneMapping; // Emissive design
+      container.appendChild(renderer.domElement);
+
+      // Minimal Ambient Light to prevent total black clipping
+      const ambientLight = new THREE.AmbientLight(
+        new THREE.Color(COLOR_BG),
+        0.05,
+      );
+      scene.add(ambientLight);
+
+      // OrbitControls
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.04;
+      controls.minDistance = 20;
+      controls.maxDistance = 100;
+      controls.minPolarAngle = Math.PI / 4;
+      controls.maxPolarAngle = Math.PI / 2 - 0.05;
+      controls.target.copy(initialCamTarget);
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.15;
+
+      // Tracking user interaction to pause/resume auto-rotation
+      const triggerInteractionPause = () => {
+        controls.autoRotate = false;
+        state.lastUserInteraction = performance.now();
+      };
+      renderer.domElement.addEventListener(
+        "pointerdown",
+        triggerInteractionPause,
+      );
+
+      // -------------------------------------------------------------------------
+      // SHADERS & UNIFORMS FOR TERRAIN
+      // -------------------------------------------------------------------------
+      const clock = new THREE.Clock();
+
+      const terrainUniforms = {
+        uTime: { value: 0 },
+        uHeightScale: { value: 1.15 },
+        uColorLow: { value: new THREE.Color(COLOR_LOW_TERRAIN) },
+        uColorHigh: { value: new THREE.Color(COLOR_HIGH_CREST) },
+      };
+
+      // Shared Height calculation logic (simplex FBM 4-octave-like with sine/cosine)
+      const glslHeightFunction = `
+      // Simplex-noise / FBM via sin/cos octaves
+      float getHeight(vec2 p) {
+        float h = 0.0;
+        float freq = 0.07;
+        float amp = 11.5;
+        
+        // 4 Octaves of sine/cosine fractal noise
+        for(int i = 0; i < 4; i++) {
+          h += (sin(p.x * freq + float(i)*1.6) * cos(p.y * freq + float(i)*2.4)) * amp;
+          freq *= 2.15;
+          amp *= 0.46;
+        }
+        return h;
+      }
+    `;
+
+      // -------------------------------------------------------------------------
+      // LAYER A — CONTOUR LINE SEGMENTS & FILAMENT DRAPE
+      // -------------------------------------------------------------------------
+      const terrainSize = 120;
+      const terrainSegments = 220; // High resolution grid for perfect wireframe drape
+
+      // Grid Generation for LineSegments
+      const gridGeometry = new THREE.BufferGeometry();
+      const vertices = [];
+      const step = terrainSize / terrainSegments;
+      const halfSize = terrainSize / 2;
+
+      for (let i = 0; i <= terrainSegments; i++) {
+        const z = -halfSize + i * step;
+        for (let j = 0; j < terrainSegments; j++) {
+          const x1 = -halfSize + j * step;
+          const x2 = -halfSize + (j + 1) * step;
+          vertices.push(x1, 0, z, x2, 0, z);
+        }
+      }
+      for (let j = 0; j <= terrainSegments; j++) {
+        const x = -halfSize + j * step;
+        for (let i = 0; i < terrainSegments; i++) {
+          const z1 = -halfSize + i * step;
+          const z2 = -halfSize + (i + 1) * step;
+          vertices.push(x, 0, z1, x, 0, z2);
+        }
+      }
+      gridGeometry.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(vertices, 3),
+      );
+
+      const contourMaterial = new THREE.ShaderMaterial({
+        uniforms: terrainUniforms,
+        vertexShader: `
+        uniform float uTime;
+        uniform float uHeightScale;
+        varying float vHeight;
+        varying vec3 vWorldPos;
+        
+        ${glslHeightFunction}
+
+        void main() {
+          vec3 pos = position;
+          
+          // Base procedural height
+          float h = getHeight(pos.xz);
+          pos.y = h * uHeightScale;
+
+          // Undulating holographic pulse along Y
+          float pulse = sin(uTime * 0.25 + pos.x * 0.25) * 0.35;
+          pos.y += pulse;
+
+          vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+          gl_Position = projectionMatrix * mvPosition;
+          
+          vHeight = h;
+          vWorldPos = (modelMatrix * vec4(pos, 1.0)).xyz;
+        }
+      `,
+        fragmentShader: `
+        uniform vec3 uColorLow;
+        uniform vec3 uColorHigh;
+        varying float vHeight;
+        varying vec3 vWorldPos;
+
+        void main() {
+          // Derivative-based isoline width calculation for screen-space uniformity
+          // Creates stunning topo curves conforming perfectly to 3D terrain shape
+          float level = vHeight * 0.65;
+          float fractLevel = fract(level);
+          float df = fwidth(level);
+          float isoline = smoothstep(1.8 * df, 0.4 * df, min(fractLevel, 1.0 - fractLevel));
+
+          // Compute a peaks wireframe mask (draping mesh on ridges like the reference image)
+          float peakMask = smoothstep(2.5, 9.5, vHeight);
+
+          // Topo contour isolines dominant in valleys; full filament drape wireframe on peaks
+          float finalOpacity = mix(isoline * 0.8, 1.0, peakMask);
+
+          if (finalOpacity < 0.04) discard;
+
+          // Color interpolation
+          float normalizedHeight = clamp((vHeight + 10.0) / 25.0, 0.0, 1.0);
+          vec3 baseColor = mix(uColorLow, uColorHigh, normalizedHeight);
+
+          // Add a dynamic electrical pulse glow
+          float pulseWave = sin(vWorldPos.y * 0.4 - uColorLow.x * 2.0) * 0.2 + 0.8;
+          vec3 col = baseColor * pulseWave;
+          
+          // Holographic depth fade
+          float dist = length(vWorldPos - cameraPosition);
+          float fogFactor = clamp((130.0 - dist) / 130.0, 0.1, 1.0);
+          
+          gl_FragColor = vec4(col * fogFactor, finalOpacity * 0.9 * fogFactor);
+        }
+      `,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      const terrainContours = new THREE.LineSegments(
+        gridGeometry,
+        contourMaterial,
+      );
+      scene.add(terrainContours);
+
+      // -------------------------------------------------------------------------
+      // LAYER B — PEAK PARTICLE CLOUD (Points)
+      // -------------------------------------------------------------------------
+      let peakParticles;
+
+      function generatePeakParticles(count) {
+        if (peakParticles) {
+          scene.remove(peakParticles);
+          peakParticles.geometry.dispose();
+        }
+
+        const pGeom = new THREE.BufferGeometry();
+        const pPositions = new Float32Array(count * 3);
+
+        for (let i = 0; i < count; i++) {
+          // Distribute uniformly over the terrain boundary plane
+          const px = (Math.random() - 0.5) * terrainSize;
+          const pz = (Math.random() - 0.5) * terrainSize;
+          pPositions[i * 3] = px;
+          pPositions[i * 3 + 1] = 0; // Calculated dynamically in vertex shader
+          pPositions[i * 3 + 2] = pz;
+        }
+
+        pGeom.setAttribute(
+          "position",
+          new THREE.BufferAttribute(pPositions, 3),
+        );
+
+        const particleMaterial = new THREE.ShaderMaterial({
+          uniforms: terrainUniforms,
+          vertexShader: `
+          uniform float uTime;
+          uniform float uHeightScale;
+          varying float vHeight;
+          varying float vDiscard;
+          varying vec3 vWorldPos;
+
+          ${glslHeightFunction}
+
+          void main() {
+            vec3 pos = position;
+            float h = getHeight(pos.xz);
+            pos.y = h * uHeightScale;
+
+            // Only render where vertex Y would be > 6.0 in base metrics
+            if (pos.y < 6.0) {
+              vDiscard = 1.0;
+            } else {
+              vDiscard = 0.0;
+            }
+
+            // High crest peaks custom unique jitter
+            pos.y += sin(uTime * 1.5 + pos.x * 2.1) * 0.08;
+
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            
+            // Adjust point size by distance for realism
+            gl_PointSize = (50.0 / -mvPosition.z) * 0.12; 
+            
+            vHeight = h;
+            vWorldPos = (modelMatrix * vec4(pos, 1.0)).xyz;
+          }
+        `,
+          fragmentShader: `
+          uniform vec3 uColorHigh;
+          varying float vHeight;
+          varying float vDiscard;
+          varying vec3 vWorldPos;
+
+          void main() {
+            if (vDiscard > 0.5) discard;
+
+            // Soft circular particle shape
+            vec2 circ = gl_PointCoord - vec2(0.5);
+            if (dot(circ, circ) > 0.25) discard;
+
+            // Distance fading based on crest height
+            float alpha = smoothstep(6.0, 14.0, vHeight);
+
+            // Camera range fade out
+            float dist = length(vWorldPos - cameraPosition);
+            float cameraFade = clamp((110.0 - dist) / 110.0, 0.0, 1.0);
+
+            gl_FragColor = vec4(uColorHigh, alpha * cameraFade * 0.95);
+          }
+        `,
+          transparent: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        });
+
+        peakParticles = new THREE.Points(pGeom, particleMaterial);
+        scene.add(peakParticles);
+      }
+
+      generatePeakParticles(state.pointDensity);
+
+      // -------------------------------------------------------------------------
+      // LAYER C — VALLEY BASE GRID
+      // -------------------------------------------------------------------------
+      const baseGridSize = 120;
+      const baseGridSegments = 80;
+      const baseGridGeom = new THREE.BufferGeometry();
+      const baseGridVertices = [];
+      const baseGridStep = baseGridSize / baseGridSegments;
+      const baseGridHalf = baseGridSize / 2;
+
+      for (let i = 0; i <= baseGridSegments; i++) {
+        const z = -baseGridHalf + i * baseGridStep;
+        for (let j = 0; j < baseGridSegments; j++) {
+          const x1 = -baseGridHalf + j * baseGridStep;
+          const x2 = -baseGridHalf + (j + 1) * baseGridStep;
+          baseGridVertices.push(x1, 0.0, z, x2, 0.0, z);
+        }
+      }
+      for (let j = 0; j <= baseGridSegments; j++) {
+        const x = -baseGridHalf + j * baseGridStep;
+        for (let i = 0; i < baseGridSegments; i++) {
+          const z1 = -baseGridHalf + i * baseGridStep;
+          const z2 = -baseGridHalf + (i + 1) * baseGridStep;
+          baseGridVertices.push(x, 0.0, z1, x, 0.0, z2);
+        }
+      }
+      baseGridGeom.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(baseGridVertices, 3),
+      );
+
+      const baseGridMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(COLOR_SECONDARY_GRID),
+        transparent: true,
+        opacity: 0.12,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      const valleyBaseGrid = new THREE.LineSegments(baseGridGeom, baseGridMat);
+      scene.add(valleyBaseGrid);
+
+      // -------------------------------------------------------------------------
+      // TERRAIN SAMPLE FUNCTION (For exact Raycast/Math altitude evaluation)
+      // -------------------------------------------------------------------------
+      function sampleTerrainHeight(x, z) {
+        let h = 0.0;
+        let freq = 0.07;
+        let amp = 11.5;
+
+        for (let i = 0; i < 4; i++) {
+          h +=
+            Math.sin(x * freq + i * 1.6) * Math.cos(z * freq + i * 2.4) * amp;
+          freq *= 2.15;
+          amp *= 0.46;
+        }
+        return h * state.heightMultiplier;
+      }
+
+      // -------------------------------------------------------------------------
+      // SLEEK FIXED-WING TACTICAL DRONE ASSET (UAV)
+      // -------------------------------------------------------------------------
+      const droneGroup = new THREE.Group();
+      scene.add(droneGroup);
+
+      const droneColor = new THREE.Color(COLOR_TACTICAL);
+      const droneMaterial = new THREE.MeshBasicMaterial({
+        color: droneColor,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      // Sleek aerodynamic fuselage
+      const bodyGeom = new THREE.CylinderGeometry(0.18, 0.05, 2.2, 10);
+      bodyGeom.rotateX(Math.PI / 2); // align forward
+      const bodyMesh = new THREE.Mesh(bodyGeom, droneMaterial);
+      droneGroup.add(bodyMesh);
+
+      // Highly swept triangular wings (like stealth drone in reference image)
+      const wingGeom = new THREE.BoxGeometry(4.2, 0.02, 0.7);
+      const posAttr = wingGeom.attributes.position;
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = posAttr.getX(i);
+        const z = posAttr.getZ(i);
+        if (Math.abs(x) > 0.1) {
+          // Sweep wing vertices backward
+          posAttr.setZ(i, z + Math.abs(x) * 0.4);
+        }
+      }
+      posAttr.needsUpdate = true;
+      const wingMesh = new THREE.Mesh(wingGeom, droneMaterial);
+      wingMesh.position.set(0, 0, -0.15);
+      droneGroup.add(wingMesh);
+
+      // Horizontal tail stabilizers
+      const tailHGeom = new THREE.BoxGeometry(1.3, 0.01, 0.35);
+      const tailH = new THREE.Mesh(tailHGeom, droneMaterial);
+      tailH.position.set(0, 0, 0.85);
+      droneGroup.add(tailH);
+
+      // Vertical tail stabilizer
+      const tailVGeom = new THREE.BoxGeometry(0.01, 0.6, 0.35);
+      const tailV = new THREE.Mesh(tailVGeom, droneMaterial);
+      tailV.position.set(0, 0.3, 0.85);
+      droneGroup.add(tailV);
+
+      // Rear engine thruster nozzle (pulsing tactical light)
+      const thrusterGeom = new THREE.ConeGeometry(0.08, 0.2, 8);
+      thrusterGeom.rotateX(-Math.PI / 2);
+      const thrusterMat = new THREE.MeshBasicMaterial({
+        color: droneColor,
+        transparent: true,
+        opacity: 1.0,
+        blending: THREE.AdditiveBlending,
+      });
+      const thrusterMesh = new THREE.Mesh(thrusterGeom, thrusterMat);
+      thrusterMesh.position.set(0, 0, 1.1);
+      droneGroup.add(thrusterMesh);
+
+      // Drone initial position
+      droneGroup.position.set(-15, 18, -5);
+
+      // -------------------------------------------------------------------------
+      // DRONE VECTOR PATH
+      // -------------------------------------------------------------------------
+      const waypoints = [
+        new THREE.Vector3(-30, 18, -25),
+        new THREE.Vector3(-15, 22, 10),
+        new THREE.Vector3(15, 17, -20),
+        new THREE.Vector3(35, 20, -5),
+        new THREE.Vector3(10, 16, 25),
+        new THREE.Vector3(-10, 19, -5),
+      ];
+
+      const dronePath = new THREE.CatmullRomCurve3(waypoints, true);
+
+      const pathSamples = dronePath.getSpacedPoints(200);
+      const pathVertices = [];
+      const pathUvs = [];
+
+      for (let i = 0; i < pathSamples.length - 1; i++) {
+        const p1 = pathSamples[i];
+        const p2 = pathSamples[i + 1];
+        pathVertices.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+        pathUvs.push(i / pathSamples.length, (i + 1) / pathSamples.length);
+      }
+
+      const pathGeometry = new THREE.BufferGeometry();
+      pathGeometry.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(pathVertices, 3),
+      );
+      pathGeometry.setAttribute(
+        "uv",
+        new THREE.Float32BufferAttribute(pathUvs, 1),
+      );
+
+      const pathUniforms = {
+        uTime: { value: 0.0 },
+        uColor: { value: droneColor },
+      };
+
+      const pathMaterial = new THREE.ShaderMaterial({
+        uniforms: pathUniforms,
+        vertexShader: `
+        varying float vUv;
+        void main() {
+          vUv = uv.x;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+        fragmentShader: `
+        uniform float uTime;
+        uniform vec3 uColor;
+        varying float vUv;
+
+        void main() {
+          // Tactical animated dashed path vector
+          if (fract(vUv * 24.0 - uTime * 0.7) > 0.5) {
+            discard;
+          }
+          gl_FragColor = vec4(uColor, 0.95);
+        }
+      `,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      const flightPathLine = new THREE.LineSegments(pathGeometry, pathMaterial);
+      scene.add(flightPathLine);
+
+      // -------------------------------------------------------------------------
+      // RADAR SCANNING ARRAY (Projected on Terrain beneath Drone)
+      // -------------------------------------------------------------------------
+      const radarGroup = new THREE.Group();
+      scene.add(radarGroup);
+
+      const ringRadii = [3, 6, 9];
+      const ringMeshes = [];
+      const ringMaterial = new THREE.MeshBasicMaterial({
+        color: droneColor,
+        transparent: true,
+        opacity: 0.35,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      ringRadii.forEach((radius) => {
+        const ringGeom = new THREE.RingGeometry(radius - 0.1, radius + 0.1, 32);
+        ringGeom.rotateX(Math.PI / 2);
+        const ringMesh = new THREE.Mesh(ringGeom, ringMaterial);
+        radarGroup.add(ringMesh);
+        ringMeshes.push(ringMesh);
+      });
+
+      const sweepGeom = new THREE.TorusGeometry(4.5, 0.03, 2, 128);
+      sweepGeom.rotateX(Math.PI / 2);
+      const sweepMaterial = new THREE.MeshBasicMaterial({
+        color: droneColor,
+        transparent: true,
+        opacity: 0.6,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const sweepArc = new THREE.Line(sweepGeom, sweepMaterial);
+      radarGroup.add(sweepArc);
+
+      // -------------------------------------------------------------------------
+      // TACTICAL TARGET NODES & GROUND PINS
+      // -------------------------------------------------------------------------
+      // Creates high-tech target flags and vertical axis markers like the reference image
+      const targetsData = [
+        { id: "ALPHA_01", x: 20, z: -20 },
+        { id: "BRAVO_02", x: -25, z: 12 },
+        { id: "CHARLIE_03", x: 10, z: 18 },
+      ];
+
+      const targetNodes = [];
+      const targetMats = new THREE.MeshBasicMaterial({
+        color: droneColor,
+        transparent: true,
+        opacity: 0.85,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      targetsData.forEach((target) => {
+        const group = new THREE.Group();
+
+        // Compute elevation dynamically
+        const targetY = sampleTerrainHeight(target.x, target.z);
+
+        // Vertical targeting alignment line (3D pin)
+        const pinLength = 7.0;
+        const pinGeom = new THREE.CylinderGeometry(0.03, 0.03, pinLength, 4);
+        const pinMesh = new THREE.Mesh(pinGeom, targetMats);
+        pinMesh.position.set(0, pinLength / 2, 0);
+        group.add(pinMesh);
+
+        // Diamond pointer flag at the top of the pin
+        const diamondGeom = new THREE.OctahedronGeometry(0.5, 0);
+        const diamondMesh = new THREE.Mesh(diamondGeom, targetMats);
+        diamondMesh.position.set(0, pinLength, 0);
+        group.add(diamondMesh);
+
+        // Flat target indicator ring on the terrain surface
+        const flatRingGeom = new THREE.RingGeometry(1.2, 1.4, 16);
+        flatRingGeom.rotateX(Math.PI / 2);
+        const flatRingMesh = new THREE.Mesh(flatRingGeom, targetMats);
+        flatRingMesh.position.set(0, 0.05, 0);
+        group.add(flatRingMesh);
+
+        // Store positions and add to scene
+        group.position.set(target.x, targetY, target.z);
+        scene.add(group);
+
+        targetNodes.push({
+          id: target.id,
+          mesh: group,
+          topPos: new THREE.Vector3(target.x, targetY + pinLength, target.z),
+          basePos: new THREE.Vector3(target.x, targetY, target.z),
+          diamond: diamondMesh,
+        });
+      });
+
+      // -------------------------------------------------------------------------
+      // DYNAMIC SATELLITE ACTIVE LOCK VECTOR (Dashed targeting beam)
+      // -------------------------------------------------------------------------
+      const activeLockVectorGeom = new THREE.BufferGeometry();
+      // Dynamic updates require 2 points (6 floats)
+      activeLockVectorGeom.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(6), 3),
+      );
+
+      // Custom shader to create an active, scrolling lock laser
+      const activeLockMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: droneColor },
+        },
+        vertexShader: `
+        varying float vDist;
+        void main() {
+          vDist = uv.x; // Set coordinate mapping via vertex index representation
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+        fragmentShader: `
+        uniform float uTime;
+        uniform vec3 uColor;
+        varying float vDist;
+        void main() {
+          // Dynamic tracking dashes
+          if (fract(vDist * 18.0 - uTime * 3.5) > 0.4) discard;
+          gl_FragColor = vec4(uColor, 0.85);
+        }
+      `,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+
+      const activeLockLine = new THREE.Line(
+        activeLockVectorGeom,
+        activeLockMat,
+      );
+      scene.add(activeLockLine);
+
+      // -------------------------------------------------------------------------
+      // POST-PROCESSING PIPELINE (EffectComposer)
+      // -------------------------------------------------------------------------
+      const renderPass = new RenderPass(scene, camera);
+      const bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        state.bloomStrength,
+        state.bloomRadius,
+        0.15, // threshold
+      );
+
+      const composer = new EffectComposer(renderer);
+      composer.addPass(renderPass);
+      composer.addPass(bloomPass);
+
+      // -------------------------------------------------------------------------
+      // LIL-GUI SETUP
+      // -------------------------------------------------------------------------
+      const gui = new GUI({ title: "TERRAIN CONTROLLER", width: 260 });
+
+      gui.domElement.style.position = "absolute";
+      gui.domElement.style.top = "50px";
+      gui.domElement.style.right = "24px";
+      gui.domElement.style.zIndex = "20";
+
+      const fTerrain = gui.addFolder("TERRAIN MATRIX");
+      fTerrain
+        .add(state, "pointDensity", 10000, 300000, 5000)
+        .name("Point Density")
+        .onChange((val) => {
+          generatePeakParticles(val);
+        });
+      fTerrain
+        .add(state, "heightMultiplier", 0.5, 2.5, 0.1)
+        .name("Height Multiplier")
+        .onChange((val) => {
+          terrainUniforms.uHeightScale.value = val;
+        });
+      fTerrain.add(state, "waveSpeed", 0.1, 3.0, 0.1).name("Wave Speed");
+      fTerrain.open();
+
+      const fTactical = gui.addFolder("TACTICAL ASSETS");
+      fTactical.add(state, "scanSpeed", 0.1, 4.0, 0.1).name("Scan Speed");
+      fTactical
+        .add(state, "showPath")
+        .name("Show Path")
+        .onChange((val) => {
+          flightPathLine.visible = val;
+        });
+      fTactical.open();
+
+      const fPost = gui.addFolder("POST PROCESSING");
+      fPost
+        .add(state, "bloomStrength", 0.0, 3.0, 0.05)
+        .name("Bloom Strength")
+        .onChange((val) => {
+          bloomPass.strength = val;
+        });
+      fPost
+        .add(state, "bloomRadius", 0.0, 1.5, 0.05)
+        .name("Bloom Radius")
+        .onChange((val) => {
+          bloomPass.radius = val;
+        });
+      fPost.close();
+
+      // -------------------------------------------------------------------------
+      // HOTKEY ACTIONS & CONTROLS INTERPOLATION
+      // -------------------------------------------------------------------------
+      function initCameraLerp(targetPos, targetTarget) {
+        state.cameraLerpTarget = {
+          startPos: camera.position.clone(),
+          endPos: targetPos.clone(),
+          startTarget: controls.target.clone(),
+          endTarget: targetTarget.clone(),
+        };
+        state.cameraLerpFrameCount = 0;
+      }
+
+      window.addEventListener("keydown", (e) => {
+        const key = e.key.toUpperCase();
+
+        // G — Greenscreen toggle
+        if (key === "G") {
+          state.isGreenscreen = !state.isGreenscreen;
+          if (state.isGreenscreen) {
+            scene.background = new THREE.Color(COLOR_GREENSCREEN);
+            scene.fog.color = new THREE.Color(COLOR_GREENSCREEN);
+            bloomPass.threshold = 0.35; // suppress green bleed-through
+          } else {
+            scene.background = new THREE.Color(COLOR_BG);
+            scene.fog.color = new THREE.Color(COLOR_BG);
+            bloomPass.threshold = 0.15;
+          }
+        }
+
+        // H — Hide UI Toggle
+        if (key === "H") {
+          state.isUIHidden = !state.isUIHidden;
+          const hudElements = document.querySelectorAll(".hud-element");
+          hudElements.forEach((el) => {
+            if (state.isUIHidden) {
+              el.classList.add("ui-hidden");
+            } else {
+              el.classList.remove("ui-hidden");
+            }
+          });
+
+          if (state.isUIHidden) {
+            gui.domElement.classList.add("ui-hidden");
+          } else {
+            gui.domElement.classList.remove("ui-hidden");
+          }
+        }
+
+        // R — Reset Camera position
+        if (key === "R") {
+          initCameraLerp(initialCamPos, initialCamTarget);
+        }
+      });
+
+      // -------------------------------------------------------------------------
+      // RESIZE HANDLER
+      // -------------------------------------------------------------------------
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        composer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // -------------------------------------------------------------------------
+      // MAIN RENDERING LOOP
+      // -------------------------------------------------------------------------
+      const hudAltitudeElement = document.getElementById("hud-altitude");
+      const hudCoordsElement = document.getElementById("hud-coords");
+      const hudLockStatusElement = document.getElementById("hud-lock-status");
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        const delta = clock.getDelta();
+
+        // Update Uniforms
+        const uTimeIncrement = delta * state.waveSpeed;
+        terrainUniforms.uTime.value += uTimeIncrement;
+        pathUniforms.uTime.value += uTimeIncrement;
+        activeLockMat.uniforms.uTime.value += uTimeIncrement;
+
+        // Drone Movement Cycle along curve
+        state.droneT += 0.00018 * state.scanSpeed;
+        if (state.droneT > 1.0) state.droneT -= 1.0;
+
+        const currentPos = dronePath.getPointAt(state.droneT);
+        droneGroup.position.copy(currentPos);
+
+        // Drone look-at direction
+        const lookTarget = dronePath.getPointAt((state.droneT + 0.002) % 1.0);
+        droneGroup.lookAt(lookTarget);
+
+        // Micro thruster scale pulse
+        thrusterMesh.scale.set(
+          1.0,
+          1.0,
+          Math.sin(terrainUniforms.uTime.value * 25.0) * 0.25 + 1.0,
+        );
+
+        // Evaluate procedural dynamic terrain height directly at the drone's position
+        const computedTerrainY = sampleTerrainHeight(
+          currentPos.x,
+          currentPos.z,
+        );
+
+        // Update projected radar location under drone
+        radarGroup.position.set(
+          currentPos.x,
+          computedTerrainY + 0.35,
+          currentPos.z,
+        );
+
+        // Rings pulsing (breathing animation)
+        ringMeshes.forEach((mesh, index) => {
+          const pulse =
+            Math.sin(terrainUniforms.uTime.value * 2.0 + index * 1.2) * 0.15 +
+            1.0;
+          mesh.scale.set(pulse, pulse, pulse);
+        });
+
+        // Rotate sweep scan circle
+        sweepArc.rotation.y += 0.015 * state.scanSpeed;
+
+        // Update Target Node Heights (ensures they stick to terrain even if scaled via GUI)
+        targetNodes.forEach((node) => {
+          const currentY = sampleTerrainHeight(node.basePos.x, node.basePos.z);
+          node.mesh.position.y = currentY;
+          node.topPos.y = currentY + 7.0; // pin height
+          node.diamond.rotation.y += 0.012 * state.scanSpeed;
+        });
+
+        // Find Closest Target for active satellite radar vector lock
+        let closestTarget = null;
+        let minDist = Infinity;
+        targetNodes.forEach((node) => {
+          const d = currentPos.distanceTo(node.topPos);
+          if (d < minDist) {
+            minDist = d;
+            closestTarget = node;
+          }
+        });
+
+        // Update targeting laser vector beam between drone nose & target flag
+        if (closestTarget) {
+          const points = [];
+          // Start target vector from drone position
+          points.push(currentPos.x, currentPos.y - 0.2, currentPos.z);
+          // Direct lock onto top of the target flag
+          points.push(
+            closestTarget.topPos.x,
+            closestTarget.topPos.y,
+            closestTarget.topPos.z,
+          );
+
+          activeLockVectorGeom.setAttribute(
+            "position",
+            new THREE.Float32BufferAttribute(points, 3),
+          );
+          activeLockVectorGeom.setAttribute(
+            "uv",
+            new THREE.Float32BufferAttribute([0, 1], 1),
+          ); // mapping for scrolling dash shader
+          activeLockVectorGeom.attributes.position.needsUpdate = true;
+          activeLockVectorGeom.attributes.uv.needsUpdate = true;
+
+          // Dynamic HUD terminal telemetry lock
+          hudLockStatusElement.textContent = `TARGET LOCK: ${closestTarget.id}`;
+        } else {
+          hudLockStatusElement.textContent = `TARGET LOCK: SCANNING...`;
+        }
+
+        // Live HUD altitude & tracking coordinate calculations
+        const droneAltitudeAboveTerrain = currentPos.y - computedTerrainY;
+        hudAltitudeElement.textContent = `ALTITUDE: ${droneAltitudeAboveTerrain.toFixed(1)}M`;
+        hudCoordsElement.textContent = `GRID REF: X:${currentPos.x.toFixed(2)} Z:${currentPos.z.toFixed(2)}`;
+
+        // Cinematic camera re-enable calculation
+        if (!controls.autoRotate) {
+          const elapsedSinceInteraction =
+            performance.now() - state.lastUserInteraction;
+          if (elapsedSinceInteraction > 2000) {
+            controls.autoRotate = true;
+          }
+        }
+
+        // Camera Reset Interpolation (GSAP-style manual lerp over 60 frames)
+        if (state.cameraLerpTarget) {
+          state.cameraLerpFrameCount++;
+          const t = state.cameraLerpFrameCount / 60;
+          const ease = t * t * (3 - 2 * t);
+
+          camera.position.lerpVectors(
+            state.cameraLerpTarget.startPos,
+            state.cameraLerpTarget.endPos,
+            ease,
+          );
+          controls.target.lerpVectors(
+            state.cameraLerpTarget.startTarget,
+            state.cameraLerpTarget.endTarget,
+            ease,
+          );
+
+          if (state.cameraLerpFrameCount >= 60) {
+            camera.position.copy(state.cameraLerpTarget.endPos);
+            controls.target.copy(state.cameraLerpTarget.endTarget);
+            state.cameraLerpTarget = null;
+          }
+        }
+
+        // Update Render Output
+        controls.update();
+        composer.render();
+      }
+
+      animate();
+    </script>
+  </body>
+</html>
