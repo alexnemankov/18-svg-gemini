@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>104 - Raymarching Landscape Customizer</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #000;
+      user-select: none;
+    }
+    #container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="container" touch-action="none"></div>
+
+  <!-- ThreeJS library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/88/three.min.js"></script>
+
+  <!-- Vertex Shader -->
+  <script id="vertexShader" type="x-shader/x-vertex">
+    void main() {
+        gl_Position = vec4( position, 1.0 );
+    }
+  </script>
+
+  <!-- Fragment Shader -->
+  <script id="fragmentShader" type="x-shader/x-fragment">
+    uniform vec2 u_resolution;
+    uniform float u_time;
+    uniform vec2 u_mouse;
+    uniform sampler2D u_noise;
+    uniform sampler2D u_map_colour;
+    uniform sampler2D u_map_normal;
+    uniform sampler2D u_map_disp;
+    uniform sampler2D u_map_roughness;
+  
+    // Custom controls uniforms
+    uniform float u_zoom;
+    uniform vec2 u_offset;
+    uniform bool u_greenscreen;
+    uniform vec3 u_color;
+    uniform vec3 u_bgColor;
+    uniform vec3 u_movement;
+
+    const int octaves = 2;
+    const float seed = 43758.5453123;
+    const float seed2 = 73156.8473192;
+    // Epsilon value
+    const float eps = 0.005;
+  
+    const vec3 ambientLight = 0.99 * vec3(1.0, 1.0, 1.0);
+    const vec3 light1Pos = vec3(10., 5.0, -25.0);
+    const vec3 light1Intensity = vec3(0.35);
+    const vec3 light2Pos = vec3(-20., -25.0, 85.0);
+    const vec3 light2Intensity = vec3(0.2);
+  
+    // Gloable variables for the raymarching algorithm.
+    const int maxIterations = 1024;
+    const int maxIterationsShad = 16;
+    const float stepScale = .1;
+    const float stopThreshold = 0.001;
+  
+    mat4 rotationMatrix(vec3 axis, float angle)
+    {
+        axis = normalize(axis);
+        float s = sin(angle);
+        float c = cos(angle);
+        float oc = 1.0 - c;
+
+        return mat4(oc * axis.x * axis.x + c,           oc * axis.x * axis.y - axis.z * s,  oc * axis.z * axis.x + axis.y * s,  0.0,
+                    oc * axis.x * axis.y + axis.z * s,  oc * axis.y * axis.y + c,           oc * axis.y * axis.z - axis.x * s,  0.0,
+                    oc * axis.z * axis.x - axis.y * s,  oc * axis.y * axis.z + axis.x * s,  oc * axis.z * axis.z + c,           0.0,
+                    0.0,                                0.0,                                0.0,                                1.0);
+    }
+  
+    float length2( vec2 p )
+    {
+      return sqrt( p.x*p.x + p.y*p.y );
+    }
+
+    float length6( vec2 p )
+    {
+      p = p*p*p; p = p*p;
+      return pow( p.x + p.y, 1.0/6.0 );
+    }
+
+    float length8( vec2 p )
+    {
+      p = p*p; p = p*p; p = p*p;
+      return pow( p.x + p.y, 1.0/8.0 );
+    }
+  
+    // smooth min
+    // reference: http://iquilezles.org/www/articles/smin/smin.htm
+    float smin(float a, float b, float k) {
+        float res = exp(-k*a) + exp(-k*b);
+        return -log(res)/k;
+    }
+  
+    vec3 random3( vec3 p ) {
+        return fract(sin(vec3(dot(p,vec3(127.1,311.7,319.8)),dot(p,vec3(269.5,183.3, 415.2)),dot(p,vec3(362.9,201.5,134.7))))*43758.5453);
+    }
+    vec2 random2( vec2 p ) {
+        return fract(sin(vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))))*43758.5453);
+    }
+  
+    // The world!
+    float world_sdf(in vec3 p) {
+      float world = 10.;
+      // Apply offset to shift landscape
+      world = -p.z + 1. + texture2D(u_map_disp, (p.xy + u_offset)*.3).x*.2;
+      return world;
+    }
+  
+    // Fuck yeah, normals!
+    vec3 calculate_normal(in vec3 p)
+    {
+      float gradient_x = world_sdf(vec3(p.x + eps, p.y, p.z)) - world_sdf(vec3(p.x - eps, p.y, p.z));
+      float gradient_y = world_sdf(vec3(p.x, p.y + eps, p.z)) - world_sdf(vec3(p.x, p.y - eps, p.z));
+      float gradient_z = world_sdf(vec3(p.x, p.y, p.z  + eps)) - world_sdf(vec3(p.x, p.y, p.z - eps));
+      
+      vec3 normal = vec3(gradient_x, gradient_y, gradient_z);
+
+      return normalize(normal);
+    }
+
+    // Raymarching.
+    float rayMarching( vec3 origin, vec3 dir, float start, float end, inout float field ) {
+      float sceneDist = 1e4;
+      float rayDepth = start;
+      for ( int i = 0; i < maxIterations; i++ ) {
+        sceneDist = world_sdf( origin + dir * rayDepth ); // Distance from the point along the ray to the nearest surface point in the scene.
+
+        if (( sceneDist < stopThreshold ) || (rayDepth >= end)) {        
+          break;
+        }
+        // We haven't hit anything, so increase the depth by a scaled factor of the minimum scene distance.
+        rayDepth += sceneDist * stepScale;
+      }
+    
+      if ( sceneDist >= stopThreshold ) rayDepth = end;
+      else rayDepth += sceneDist;
+        
+      // We've used up our maximum iterations. Return the maximum distance.
+      return rayDepth;
+    }
+
+    // Shadows
+    // Reference at: http://www.iquilezles.org/www/articles/rmshadows/rmshadows.htm
+    float softShadow(vec3 ro, vec3 lightPos, float start, float k){
+        vec3 rd = lightPos - ro;
+        float end = length(rd);
+
+        float shade = 1.0;
+
+        float dist = start;
+        float stepDist = start;
+
+        for (int i=0; i<maxIterationsShad; i++){
+            float h = world_sdf(ro + rd*dist);
+            shade = min(shade, k*h/dist);
+            
+            dist += min(h, stepDist*2.); // The best of both worlds... I think. 
+            
+            if (h<0.001 || dist > end) break; 
+        }
+
+        return min(max(shade, 0.) + 0.3, 1.0); 
+    }
+
+    // Based on original by IQ - optimized to remove a divide
+    float calculateAO(vec3 p, vec3 n)
+    {
+       const float AO_SAMPLES = 5.0;
+       float r = 0.0;
+       float w = 1.0;
+       for (float i=1.0; i<=AO_SAMPLES; i++)
+       {
+          float d0 = i * 0.15; // 1.0/AO_SAMPLES
+          r += w * (d0 - world_sdf(p + n * d0));
+          w *= 0.5;
+       }
+       return 1.0-clamp(r,0.0,1.0);
+    }
+  
+    // Lighting.
+    vec3 lighting( vec3 sp, vec3 camPos, int reflectionPass, float dist, float field, vec3 rd, vec3 activeBgColor) {
+      // Start with black.
+      vec3 sceneColor = vec3(0.0);
+
+      // Multiply by u_color to tint the terrain
+      vec3 objColor = texture2D(u_map_colour, (sp.xy + u_offset)*.3).rgb * u_color * (.6 + sin(u_time)*.3);
+
+      // Obtain the surface normal at the scene position "sp."
+      vec3 surfNormal = calculate_normal(sp);
+
+      // lp - Light position. Keeping it in the vacinity of the camera, but away from the objects in the scene.
+      vec3 lp = vec3(0., 1.0, 0.0) + u_movement;
+      // ld - Light direction.
+      vec3 ld = lp-sp;
+      // lcolor - Light color.
+      vec3 lcolor = vec3(1., .8, .7);
+      
+      // Light falloff (attenuation).
+      float len = length( ld ); // Distance from the light to the surface point.
+      ld /= len; // Normalizing the light-to-surface, aka light-direction, vector.
+      
+      float sceneLen = length(camPos - sp); // Distance of the camera to the surface point
+      float sceneAtten = min( 1.0 / ( 0.015*sceneLen*sceneLen ), 1.0 ); // Keeps things between 0 and 1.   
+
+      // Obtain the reflected vector at the scene position "sp."
+      vec3 ref = reflect(-ld, surfNormal);
+      
+      float ao = 1.0; // Ambient occlusion.
+
+      float ambient = .5; //The object's ambient property.
+      float specularPower = 1.-(texture2D(u_map_roughness, (sp.xy + u_offset)*.3).x); // The power of the specularity. Higher numbers can give the object a harder, shinier look.
+      specularPower *= specularPower*specularPower*10000.;
+      float diffuse = max( 0.0, dot(surfNormal, ld) ); //The object's diffuse value.
+      float specular = max( 0.0, dot( ref, normalize(camPos-sp)) ); //The object's specular value.
+      specular = pow(specular, specularPower); // Ramping up the specular value to the specular power for a bit of shininess.
+      	
+      // Bringing all the lighting components togethr to color the screen pixel.
+      sceneColor += (objColor*(diffuse*0.8+ambient)+specular*0.1)*lcolor*1.3;
+      sceneColor = mix(sceneColor, activeBgColor, 1.-sceneAtten*sceneAtten); // fog
+      
+      return sceneColor;
+    }
+
+    void main() {
+      // Setting up our screen coordinates.
+      vec2 aspect = vec2(u_resolution.x/u_resolution.y, 1.0);
+      vec2 uv = (2.0*gl_FragCoord.xy/u_resolution.xy - 1.0)*aspect;
+      
+      // Determine active background color
+      vec3 activeBgColor = u_greenscreen ? vec3(0.0, 1.0, 0.0) : u_bgColor;
+      
+      // movement
+      vec3 movement = u_movement;
+      
+      // The sin in here is to make it look like a walk.
+      vec3 lookAt = vec3(0., 1., 1.);  // This is the point you look towards.
+      vec3 camera_position = vec3(u_mouse.x, 0., -1.0); // This is the point you look from.
+      
+      lookAt += movement;
+      camera_position += movement;
+      
+      vec3 forward = normalize(lookAt-camera_position); // Forward vector.
+      vec3 right = normalize(vec3(forward.z, 0., -forward.x )); // Right vector.
+      vec3 up = normalize(cross(forward,right)); // Up vector.
+
+      // FOV - Field of view, controlled by interactive zoom
+      float FOV = 0.6 * u_zoom;
+
+      // ro - Ray origin.
+      vec3 ro = camera_position; 
+      // rd - Ray direction.
+      vec3 rd = normalize(forward + FOV*uv.x*right + FOV*uv.y*up);
+      
+      // Ray marching.
+      const float clipNear = 0.0;
+      const float clipFar = 16.0;
+      float field = 0.;
+      float dist = rayMarching(ro, rd, clipNear, clipFar, field );
+      if ( dist >= clipFar ) {
+        gl_FragColor = vec4(activeBgColor, 1.0);
+        return;
+      }
+
+      // sp - Surface position. If we've made it this far, we've hit something.
+      vec3 sp = ro + rd*dist;
+
+      // Light the pixel that corresponds to the surface position.
+      vec3 sceneColor = lighting( sp, camera_position, 0, dist, field, rd, activeBgColor);
+
+      // Clamping the lit pixel, then put it on the screen.
+      gl_FragColor = vec4(clamp(sceneColor, 0.0, 1.0), 1.0);
+    }
+  </script>
+
+  <!-- Application logic using ES modules to import lil-gui -->
+  <script type="module">
+    import { GUI } from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+    // --- State and settings ---
+    const params = {
+      greenscreen: false,
+      zoom: 1.0,
+      offsetX: 0.0,
+      offsetY: 0.0,
+      dpr: window.devicePixelRatio || 1.0,
+      colorScheme: 'Molten Lava',
+      colorBg: '#000000',
+      colorFg: '#ff4d1a',
+      animationMode: 'Lava Flow',
+      speed: 1.0
+    };
+
+    // 5 Popular and Original Preset Color Schemes
+    const colorSchemes = {
+      'Molten Lava': {
+        colorBg: '#000000',
+        colorFg: '#ff4d1a'
+      },
+      'Toxic Sludge': {
+        colorBg: '#051a05',
+        colorFg: '#1aff33'
+      },
+      'Cyberpunk Neon': {
+        colorBg: '#0a001a',
+        colorFg: '#e61ad9'
+      },
+      'Frozen Ice': {
+        colorBg: '#000a1f',
+        colorFg: '#3399ff'
+      },
+      'Golden Dust': {
+        colorBg: '#1a1000',
+        colorFg: '#ffcc33'
+      }
+    };
+
+    let container;
+    let camera, scene, renderer;
+    let uniforms;
+
+    // Helper to generate Canvas textures for offline fallback
+    function createFallbackTexture(type) {
+      const size = 256;
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      
+      if (type === 'noise') {
+        const imgData = ctx.createImageData(size, size);
+        for (let i = 0; i < imgData.data.length; i += 4) {
+          const val = Math.floor(Math.random() * 255);
+          imgData.data[i] = val;
+          imgData.data[i + 1] = val;
+          imgData.data[i + 2] = val;
+          imgData.data[i + 3] = 255;
+        }
+        ctx.putImageData(imgData, 0, 0);
+      } else if (type === 'map_colour') {
+        const grad = ctx.createRadialGradient(size/2, size/2, 10, size/2, size/2, size);
+        grad.addColorStop(0, '#ff5500');
+        grad.addColorStop(0.5, '#aa1100');
+        grad.addColorStop(1, '#110000');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, size, size);
+        
+        ctx.fillStyle = '#ffcc00';
+        for (let i = 0; i < 15; i++) {
+          ctx.beginPath();
+          ctx.arc(Math.random() * size, Math.random() * size, Math.random() * 15 + 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (type === 'map_normal') {
+        ctx.fillStyle = '#8080ff';
+        ctx.fillRect(0, 0, size, size);
+      } else if (type === 'map_roughness') {
+        ctx.fillStyle = '#808080';
+        ctx.fillRect(0, 0, size, size);
+      } else if (type === 'map_disp') {
+        const imgData = ctx.createImageData(size, size);
+        for (let y = 0; y < size; y++) {
+          for (let x = 0; x < size; x++) {
+            const idx = (y * size + x) * 4;
+            const val = Math.floor((Math.sin(x * 0.08) + Math.cos(y * 0.08) + 2.0) * 0.25 * 255);
+            imgData.data[idx] = val;
+            imgData.data[idx + 1] = val;
+            imgData.data[idx + 2] = val;
+            imgData.data[idx + 3] = 255;
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+      }
+      
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.minFilter = THREE.LinearFilter;
+      return texture;
+    }
+
+    let loader = new THREE.TextureLoader();
+    let textures = {
+      noise: {
+        url: 'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/noise.png',
+        loaded: false
+      },
+      map_colour: {
+        url: 'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/Lava_001_COLOR.png',
+        loaded: false
+      },
+      map_normal: {
+        url: 'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/Lava_001_NRM.png',
+        loaded: false
+      },
+      map_roughness: {
+        url: 'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/Lava_001_OCC.png',
+        loaded: false
+      },
+      map_disp: {
+        url: 'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/Lava_001_DISP.png',
+        loaded: false
+      }
+    };
+
+    loader.setCrossOrigin("anonymous");
+    let loadtex = () => {
+      let allLoaded = true;
+      for(let i in textures) {
+        let tex = textures[i];
+        if(tex.loaded === false) {
+          allLoaded = false;
+          loader.load(tex.url, (texture) => {
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.minFilter = THREE.LinearFilter;
+            tex.texture = texture;
+            tex.loaded = true;
+            loadtex();
+          }, undefined, () => {
+            console.warn("Failed to load texture " + i + ", using Canvas fallback.");
+            tex.texture = createFallbackTexture(i);
+            tex.loaded = true;
+            loadtex();
+          });
+          break;
+        }
+      }
+      if(allLoaded === true) {
+        init();
+        animate();
+      }
+    }
+    loadtex();
+
+    function init() {
+      container = document.getElementById( 'container' );
+
+      camera = new THREE.Camera();
+      camera.position.z = 1;
+
+      scene = new THREE.Scene();
+
+      var geometry = new THREE.PlaneBufferGeometry( 2, 2 );
+
+      uniforms = {
+        u_time: { type: "f", value: 1.0 },
+        u_resolution: { type: "v2", value: new THREE.Vector2() },
+        u_mouse: { type: "v2", value: new THREE.Vector2() },
+        u_zoom: { type: "f", value: params.zoom },
+        u_offset: { type: "v2", value: new THREE.Vector2(params.offsetX, params.offsetY) },
+        u_greenscreen: { type: "b", value: params.greenscreen },
+        u_color: { type: "c", value: new THREE.Color(params.colorFg) },
+        u_bgColor: { type: "c", value: new THREE.Color(params.colorBg) },
+        u_movement: { type: "v3", value: new THREE.Vector3() }
+      };
+      
+      for(let i in textures) {
+        uniforms['u_'+i] = { type: "t", value: textures[i].texture }
+      }
+
+      var material = new THREE.ShaderMaterial( {
+        uniforms: uniforms,
+        vertexShader: document.getElementById( 'vertexShader' ).textContent,
+        fragmentShader: document.getElementById( 'fragmentShader' ).textContent
+      } );
+      material.extensions.derivatives = true;
+
+      var mesh = new THREE.Mesh( geometry, material );
+      scene.add( mesh );
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio( params.dpr );
+      container.appendChild( renderer.domElement );
+
+      onWindowResize();
+      window.addEventListener( 'resize', onWindowResize, false );
+
+      // Drag controls state variables
+      let isDragging = false;
+      let previousMousePosition = { x: 0, y: 0 };
+
+      window.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.lil-gui')) return;
+        isDragging = true;
+        previousMousePosition = { x: e.clientX, y: e.clientY };
+      });
+
+      window.addEventListener('pointermove', (e) => {
+        let ratio = window.innerHeight / window.innerWidth;
+        uniforms.u_mouse.value.x = (e.pageX - window.innerWidth / 2) / window.innerWidth / ratio;
+        uniforms.u_mouse.value.y = (e.pageY - window.innerHeight / 2) / window.innerHeight * -1;
+        
+        if (isDragging) {
+          const deltaX = e.clientX - previousMousePosition.x;
+          const deltaY = e.clientY - previousMousePosition.y;
+          
+          // Drag sensitivity scales with zoom parameter
+          const dragSensitivity = 0.003 * params.zoom;
+          params.offsetX -= deltaX * dragSensitivity;
+          params.offsetY += deltaY * dragSensitivity;
+          
+          offsetXController.updateDisplay();
+          offsetYController.updateDisplay();
+          
+          previousMousePosition = { x: e.clientX, y: e.clientY };
+        }
+        e.preventDefault();
+      });
+
+      window.addEventListener('pointerup', () => {
+        isDragging = false;
+      });
+
+      // Mouse wheel event for zoom factor
+      window.addEventListener('wheel', (e) => {
+        if (e.target.closest('.lil-gui')) return;
+        
+        const zoomFactor = 1.08;
+        if (e.deltaY < 0) {
+          params.zoom /= zoomFactor;
+        } else {
+          params.zoom *= zoomFactor;
+        }
+        params.zoom = Math.max(0.1, Math.min(10.0, params.zoom));
+        zoomController.updateDisplay();
+      }, { passive: true });
+
+      // Setup lil-gui settings panel
+      const gui = new GUI({ title: 'Shader Settings' });
+
+      // Folder 1: General settings
+      const folderSettings = gui.addFolder('General');
+      folderSettings.add(params, 'greenscreen').name('Greenscreen Bg').onChange(v => {
+        uniforms.u_greenscreen.value = v;
+      });
+      folderSettings.add(params, 'dpr', 0.5, 2.5, 0.1).name('Pixel Ratio (DPR)').onChange(v => {
+        renderer.setPixelRatio(v);
+        onWindowResize();
+      });
+
+      // Folder 2: Zoom & Position
+      const folderPosition = gui.addFolder('Zoom & Pan');
+      const zoomController = folderPosition.add(params, 'zoom', 0.1, 10.0, 0.01).name('Zoom Factor');
+      const offsetXController = folderPosition.add(params, 'offsetX', -10.0, 10.0, 0.01).name('Offset X');
+      const offsetYController = folderPosition.add(params, 'offsetY', -10.0, 10.0, 0.01).name('Offset Y');
+
+      // Folder 3: Colors
+      const folderColors = gui.addFolder('Colors');
+      folderColors.add(params, 'colorScheme', Object.keys(colorSchemes)).name('Color Preset').onChange(applyPresetScheme);
+      
+      const controllerBg = folderColors.addColor(params, 'colorBg').name('Background').onChange(v => {
+        uniforms.u_bgColor.value.set(v);
+      });
+      const controllerFg = folderColors.addColor(params, 'colorFg').name('Terrain Color').onChange(v => {
+        uniforms.u_color.value.set(v);
+      });
+
+      // Folder 4: Animations
+      const folderAnimations = gui.addFolder('Animations');
+      folderAnimations.add(params, 'animationMode', [
+        'Lava Flow',
+        'Earthquake Tremor',
+        'Orbiting Flyover',
+        'Hyperspace Pulse',
+        'Calm Drift'
+      ]).name('Preset Animation');
+      folderAnimations.add(params, 'speed', 0.0, 3.0, 0.1).name('Animation Speed');
+
+      function applyPresetScheme(schemeName) {
+        const scheme = colorSchemes[schemeName];
+        if (scheme) {
+          params.colorBg = scheme.colorBg;
+          params.colorFg = scheme.colorFg;
+
+          uniforms.u_bgColor.value.set(params.colorBg);
+          uniforms.u_color.value.set(params.colorFg);
+
+          controllerBg.setValue(params.colorBg);
+          controllerFg.setValue(params.colorFg);
+        }
+      }
+
+      // Hide / Show UI with H key
+      let guiVisible = true;
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'h' || e.key === 'H') {
+          guiVisible = !guiVisible;
+          if (guiVisible) {
+            gui.show();
+          } else {
+            gui.hide();
+          }
+        }
+      });
+    }
+
+    function onWindowResize( event ) {
+      renderer.setSize( window.innerWidth, window.innerHeight );
+      uniforms.u_resolution.value.x = renderer.domElement.width;
+      uniforms.u_resolution.value.y = renderer.domElement.height;
+    }
+
+    function animate(delta) {
+      requestAnimationFrame( animate );
+      render(delta);
+    }
+
+    // CCapture Setup for video capturing (safe optional integration)
+    let capturer = null;
+    if (typeof CCapture !== 'undefined') {
+      capturer = new CCapture({ 
+        verbose: true, 
+        framerate: 60,
+        quality: 90,
+        format: 'webm',
+        workersPath: 'js/'
+      });
+    }
+    let capturing = false;
+
+    window.isCapturing = function(val) {
+      if (typeof CCapture === 'undefined' || !capturer) return;
+      if(val === false && capturing === true) {
+        capturer.stop();
+        capturer.save();
+      } else if(val === true && capturing === false) {
+        capturer.start();
+      }
+      capturing = val;
+    }
+    window.toggleCapture = function() {
+      window.isCapturing(!capturing);
+    }
+
+    window.addEventListener('keyup', function(e) { if(e.keyCode == 68) window.toggleCapture(); });
+
+    function render(delta) {
+      // Use performance.now() to compute consistent time increments scaled by animation speed
+      let time = performance.now() * 0.001 * params.speed;
+      uniforms.u_time.value = time;
+      
+      // Synchronize slider changes to uniforms
+      uniforms.u_zoom.value = params.zoom;
+      uniforms.u_offset.value.set(params.offsetX, params.offsetY);
+      
+      // Calculate infinite procedural animation paths
+      let movement = new THREE.Vector3(0, 0, 0);
+      switch (params.animationMode) {
+        case 'Lava Flow':
+          movement.set(1.0, time * 0.3, 0.0);
+          break;
+        case 'Earthquake Tremor':
+          movement.set(1.0 + Math.sin(time * 25.0) * 0.05, time * 0.25, Math.cos(time * 20.0) * 0.03);
+          break;
+        case 'Orbiting Flyover':
+          movement.set(
+            1.0 + Math.cos(time * 0.6) * 1.2,
+            time * 0.2 + Math.sin(time * 0.6) * 1.2,
+            Math.sin(time * 0.3) * 0.2
+          );
+          break;
+        case 'Hyperspace Pulse':
+          movement.set(1.0, time * 0.5 + Math.sin(time * 1.5) * 0.4, Math.cos(time * 1.5) * 0.2);
+          break;
+        case 'Calm Drift':
+          movement.set(time * 0.08, time * 0.08, 0.0);
+          break;
+      }
+      uniforms.u_movement.value.copy(movement);
+
+      renderer.render( scene, camera );
+      
+      if(capturing && capturer) {
+        capturer.capture( renderer.domElement );
+      }
+    }
+  </script>
+</body>
+</html>

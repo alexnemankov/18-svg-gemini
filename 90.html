@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPGPU Infinite Particle Storm</title>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #111111;
+      font-family: sans-serif;
+    }
+    #container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      touch-action: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    canvas:active {
+      cursor: grabbing;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+</head>
+<body>
+
+<div id="container" touch-action="none"></div>
+
+<script id="vertexShaderParticle" type="x-shader/x-vertex">
+  uniform vec2 u_resolution;
+  uniform vec2 u_mouse;
+  uniform float u_time;
+  uniform sampler2D u_noise;
+  attribute vec2 reference;
+  uniform sampler2D texturePosition;
+  uniform float u_pointSize;
+  varying float v_op;
+
+  float random(vec2 st) {
+    return fract(sin(dot(st, vec2(12.9898, 78.233))) * 43758.5453123);
+  }
+
+  void main() {
+    vec3 position = texture2D(texturePosition, reference).xyz;
+    position *= 3.;
+    vec3 transformed = vec3( position );
+    vec4 mvpos = modelViewMatrix * vec4( transformed, 1.0 );
+    gl_PointSize = random(reference) * 50. * (1. / length(mvpos.xyz) * 5.51) * u_pointSize;
+    v_op = 1. / length(position) * 8.;
+    gl_Position = projectionMatrix * mvpos;
+  }
+</script>
+
+<script id="fragmentShaderParticle" type="x-shader/x-fragment">
+  uniform vec2 u_resolution;
+  uniform vec2 u_mouse;
+  uniform float u_time;
+  uniform sampler2D u_noise;
+  uniform vec3 u_colorCore;
+  uniform vec3 u_colorInner;
+  uniform vec3 u_colorOuter;
+  varying float v_op;
+
+  void main() {
+    vec2 uv = gl_PointCoord.xy - .5;
+    float l = length(uv);
+    vec3 colour = mix(u_colorOuter, u_colorInner, smoothstep(.5, -.1, l));
+    colour = mix(u_colorCore, colour, smoothstep(3., 0.5, v_op));
+    gl_FragColor = vec4(colour, 1. - l * 2.);
+  }
+</script>
+
+<script id="fragmentShaderVelocity" type="x-shader/x-fragment">
+  uniform vec2 u_resolution;
+  uniform vec2 u_mouse;
+  uniform float u_time;
+  uniform float u_mousex;
+  
+  // otaviogood's noise from https://www.shadertoy.com/view/ld2SzK
+  const float nudge = 0.739513;	// size of perpendicular vector
+  float normalizer = 1.0 / sqrt(1.0 + nudge*nudge);	// pythagorean theorem on that perpendicular to maintain scale
+  float SpiralNoiseC(vec3 p)
+  {
+      float n = 0.0;	// noise amount
+      float iter = 1.0;
+      for (int i = 0; i < 8; i++)
+      {
+          n += -abs(sin(p.y*iter) + cos(p.x*iter)) / iter;	// abs for a ridged look
+          p.xy += vec2(p.y, -p.x) * nudge;
+          p.xy *= normalizer;
+          p.xz += vec2(p.z, -p.x) * nudge;
+          p.xz *= normalizer;
+          iter *= 1.733733;
+      }
+      return n;
+  }
+
+  void main() {
+    vec2 uv = gl_FragCoord.xy / resolution.xy;
+    vec3 position = texture2D(v_samplerPosition, uv).xyz;
+    vec3 velocity = texture2D(v_samplerVelocity, uv).xyz;
+    vec3 acceleration = vec3(0.);
+    
+    float l = length(position);
+    vec3 spherical = vec3(1./l, atan(position.y, position.x), acos(position.z / l));
+    float n = SpiralNoiseC(spherical * 6. + u_time);
+    n = SpiralNoiseC(vec3(l, spherical.y * 6. + u_time * 5., spherical.z));
+    
+    spherical.z += (1. / n-.5)*length(velocity);
+    spherical.y += n;
+    
+    float a =  n * .1 + smoothstep(5., 40., l) * 20.;
+    a += smoothstep(20., 0., l) * .3;
+    a -= smoothstep(30., 41., l) * 21.;
+    
+    acceleration.x = spherical.x * sin(spherical.z) * cos(spherical.y) * a;
+    acceleration.y = spherical.x * sin(spherical.z) * sin(spherical.y) * a;
+    acceleration.z = spherical.x * cos(spherical.z) * a;
+    
+    vec3 vel = velocity * .98 + acceleration * .3;
+    if(length(vel) > 5.) {
+      vel = normalize(vel) * 5.;
+    }
+    
+    gl_FragColor = vec4(vel, 1.0);
+  }
+</script>
+
+<script id="fragmentShaderPosition" type="x-shader/x-fragment">
+  uniform float delta;
+  uniform float u_time;
+  uniform sampler2D v_samplerPosition_orig;
+  uniform sampler2D u_noise;
+
+  vec3 hash3(vec2 p)
+  {
+    vec3 o = texture2D( u_noise, (p+0.5)/256.0, -100.0 ).xyz;
+    return o;
+  }
+
+  void main() {
+    vec2 uv = gl_FragCoord.xy / resolution.xy;
+    vec3 position_original = texture2D(v_samplerPosition_orig, uv).xyz;
+    vec3 position = texture2D(v_samplerPosition, uv).xyz;
+    vec3 velocity = texture2D(v_samplerVelocity, uv).xyz;
+    
+    vec3 pos = position + velocity * delta;
+    
+    vec3 hash = hash3(position_original.xy * position_original.zx * 20.);
+    
+    if(length(pos) > 40.) {
+      pos = position_original;
+    }
+
+    gl_FragColor = vec4(pos, 1.0);
+  }
+</script>
+
+<script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+  import GUI from 'lil-gui';
+
+  const texturesize = 1024;
+  const particles = texturesize * texturesize;
+
+  let container;
+  let camera, scene, renderer, controls;
+  let cloud_obj;
+  let uniforms;
+  let gpuComputationRenderer, dataPos, dataVel, dataPos_orig;
+  let textureVelocity, texturePosition;
+  const textureArraySize = texturesize * texturesize * 4;
+
+  const particleVert = document.getElementById( 'vertexShaderParticle' ).textContent;
+  const particleFrag = document.getElementById( 'fragmentShaderParticle' ).textContent;
+  const velocityFrag = document.getElementById( 'fragmentShaderVelocity' ).textContent;
+  const positionFrag = document.getElementById( 'fragmentShaderPosition' ).textContent;
+
+  let texture;
+  let loader = new THREE.TextureLoader();
+  loader.setCrossOrigin("anonymous");
+
+  // Fallback procedural texture in case AWS is offline/fails
+  function createFallbackNoiseTexture() {
+    const size = 256;
+    const data = new Uint8Array(size * size * 4);
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.floor(Math.random() * 255);
+      data[i + 1] = Math.floor(Math.random() * 255);
+      data[i + 2] = Math.floor(Math.random() * 255);
+      data[i + 3] = 255;
+    }
+    const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  loader.load(
+    'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/noise.png',
+    function (tex) {
+      texture = tex;
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.minFilter = THREE.LinearFilter;
+      init();
+      animate();
+    },
+    undefined,
+    function (err) {
+      console.warn("Could not load noise texture from URL, using fallback procedural noise.");
+      texture = createFallbackNoiseTexture();
+      init();
+      animate();
+    }
+  );
+
+  const colorSchemes = {
+    "Solar Flare": { core: "#ff5500", inner: "#e6e6e6", outer: "#ffffff" },
+    "Cosmic Nebula": { core: "#ff00cc", inner: "#00ffff", outer: "#0000ff" },
+    "Toxic Matrix": { core: "#39ff14", inner: "#006600", outer: "#00ffcc" },
+    "Frozen Abyss": { core: "#ffffff", inner: "#0033aa", outer: "#00aaff" },
+    "Electric Void": { core: "#7b2cbf", inner: "#240046", outer: "#ff6b00" }
+  };
+
+  const params = {
+    greenscreen: false,
+    colorScheme: "Solar Flare",
+    colorCore: "#ff5500",
+    colorInner: "#e6e6e6",
+    colorOuter: "#ffffff",
+    animation: "Cosmic Orbit",
+    animSpeed: 1.0,
+    pointSize: 1.0,
+    blending: "Additive",
+    resetView: function() {
+      controls.reset();
+      cloud_obj.position.set(0, 0, 0);
+      cloud_obj.rotation.set(0, 0, 0);
+      cloud_obj.scale.set(1, 1, 1);
+    }
+  };
+
+  let gui;
+  let guiVisible = true;
+  let coreController, innerController, outerController;
+
+  function init() {
+    container = document.getElementById( 'container' );
+
+    camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 50);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color( 0x111111 );
+
+    // Build the reference particles buffer
+    let vertices = new Float32Array(particles * 3).fill(0);
+    let references = new Float32Array(particles * 2);
+    
+    for (let i = 0; i < references.length; i += 2) {
+      let index = i / 2;
+      references[i] = (index % texturesize) / texturesize;
+      references[i + 1] = Math.floor(index / texturesize) / texturesize;
+    }
+    
+    let geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+    geometry.setAttribute('reference', new THREE.BufferAttribute(references, 2));
+    
+    // Create uniforms mapped to shaders
+    uniforms = {
+      u_time: { value: 1.0 },
+      u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+      u_noise: { value: texture },
+      u_mouse: { value: new THREE.Vector2() },
+      texturePosition: { value: null },
+      u_texturePosition: { value: null }, // backup map
+      u_colorCore: { value: new THREE.Color(params.colorCore) },
+      u_colorInner: { value: new THREE.Color(params.colorInner) },
+      u_colorOuter: { value: new THREE.Color(params.colorOuter) },
+      u_pointSize: { value: params.pointSize }
+    };
+
+    let particleMaterial = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: particleVert,
+      fragmentShader: particleFrag,
+      side: THREE.DoubleSide,
+      transparent: true,
+      depthTest: false,
+      blending: THREE.AdditiveBlending
+    });
+    
+    cloud_obj = new THREE.Points(geometry, particleMaterial);
+    scene.add( cloud_obj );
+
+    // WebGL Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild( renderer.domElement );
+    
+    // OrbitControls for panning, orbiting and zoom
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.screenSpacePanning = true;
+
+    // GPU Computation setup
+    gpuComputationRenderer = new GPUComputationRenderer(texturesize, texturesize, renderer);
+    
+    dataPos_orig = gpuComputationRenderer.createTexture();
+    dataPos = gpuComputationRenderer.createTexture();
+    dataVel = gpuComputationRenderer.createTexture();
+
+    for (let i = 0; i < textureArraySize; i += 4) {
+      let radius = 2.;
+      let phi = Math.random() * Math.PI * 2.;
+      let costheta = Math.random() * 2. - 1.;
+      let u = Math.random();
+
+      let theta = Math.acos( costheta );
+      let r = radius * Math.cbrt( u );
+      
+      let x = r * Math.sin( theta) * Math.cos( phi );
+      let y = r * Math.sin( theta) * Math.sin( phi );
+      let z = r * Math.cos( theta );
+
+      dataPos.image.data[i] = x;
+      dataPos.image.data[i + 1] = y;
+      dataPos.image.data[i + 2] = z;
+      dataPos.image.data[i + 3] = 1;
+      
+      dataPos_orig.image.data[i] = x;
+      dataPos_orig.image.data[i + 1] = y;
+      dataPos_orig.image.data[i + 2] = z;
+      dataPos_orig.image.data[i + 3] = 1;
+
+      dataVel.image.data[i] = x * 3.;
+      dataVel.image.data[i + 1] = y * 3.;
+      dataVel.image.data[i + 2] = z * 3.;
+      dataVel.image.data[i + 3] = 1;
+    }
+    
+    textureVelocity = gpuComputationRenderer.addVariable('v_samplerVelocity', velocityFrag, dataVel);
+    texturePosition = gpuComputationRenderer.addVariable('v_samplerPosition', positionFrag, dataPos);
+
+    texturePosition.material.uniforms.delta = { value: 0 };
+    texturePosition.material.uniforms.v_samplerPosition_orig = { value: dataPos_orig };
+    texturePosition.material.uniforms.u_noise = { value: texture };
+    
+    textureVelocity.material.uniforms.u_time = { value: -1000 };
+    textureVelocity.material.uniforms.u_mousex = { value: 0 };
+    texturePosition.material.uniforms.u_time = { value: 0 };
+
+    gpuComputationRenderer.setVariableDependencies(textureVelocity, [ textureVelocity, texturePosition ]);
+    gpuComputationRenderer.setVariableDependencies(texturePosition, [ textureVelocity, texturePosition ]);
+
+    texturePosition.wrapS = THREE.RepeatWrapping;
+    texturePosition.wrapT = THREE.RepeatWrapping;
+    textureVelocity.wrapS = THREE.RepeatWrapping;
+    textureVelocity.wrapT = THREE.RepeatWrapping;
+
+    const error = gpuComputationRenderer.init();
+    if (error) {
+      console.error('GPGPU Initialization Error:', error);
+    }
+
+    window.addEventListener( 'resize', onWindowResize, false );
+    document.addEventListener('pointermove', pointerMove);
+
+    setupGUI();
+    setupKeyboard();
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize( window.innerWidth, window.innerHeight );
+    uniforms.u_resolution.value.x = window.innerWidth;
+    uniforms.u_resolution.value.y = window.innerHeight;
+  }
+
+  function pointerMove( event ) {
+    let ratio = window.innerHeight / window.innerWidth;
+    textureVelocity.material.uniforms.u_mousex.value = event.pageX;
+    uniforms.u_mouse.value.x = (event.pageX - window.innerWidth / 2) / window.innerWidth / ratio;
+    uniforms.u_mouse.value.y = (event.pageY - window.innerHeight / 2) / window.innerHeight * -1;
+  }
+
+  function setupGUI() {
+    gui = new GUI({ title: "Simulation Panel" });
+
+    // Green Screen Setup
+    gui.add(params, 'greenscreen').name('Green Screen Background').onChange(val => {
+      if (val) {
+        scene.background = new THREE.Color(0x00ff00);
+        document.body.style.backgroundColor = '#00ff00';
+      } else {
+        scene.background = new THREE.Color(0x111111);
+        document.body.style.backgroundColor = '#111111';
+      }
+    });
+
+    // Preset & Custom Colors Folder
+    const colorsFolder = gui.addFolder('Colors');
+    colorsFolder.add(params, 'colorScheme', Object.keys(colorSchemes)).name('Preset Scheme').onChange(val => {
+      const scheme = colorSchemes[val];
+      params.colorCore = scheme.core;
+      params.colorInner = scheme.inner;
+      params.colorOuter = scheme.outer;
+      
+      coreController.setValue(scheme.core);
+      innerController.setValue(scheme.inner);
+      outerController.setValue(scheme.outer);
+      
+      updateColors();
+    });
+
+    coreController = colorsFolder.addColor(params, 'colorCore').name('Core Color').onChange(updateColors);
+    innerController = colorsFolder.addColor(params, 'colorInner').name('Inner Color').onChange(updateColors);
+    outerController = colorsFolder.addColor(params, 'colorOuter').name('Outer Color').onChange(updateColors);
+    colorsFolder.open();
+
+    // Render configuration folder
+    const renderFolder = gui.addFolder('Rendering');
+    renderFolder.add(params, 'pointSize', 0.1, 4.0, 0.05).name('Particle Size').onChange(val => {
+      uniforms.u_pointSize.value = val;
+    });
+    renderFolder.add(params, 'blending', ['Additive', 'Multiply', 'Normal', 'Subtractive']).name('Blending').onChange(val => {
+      if (val === 'Additive') {
+        cloud_obj.material.blending = THREE.AdditiveBlending;
+      } else if (val === 'Multiply') {
+        cloud_obj.material.blending = THREE.MultiplyBlending;
+      } else if (val === 'Normal') {
+        cloud_obj.material.blending = THREE.NormalBlending;
+      } else if (val === 'Subtractive') {
+        cloud_obj.material.blending = THREE.SubtractiveBlending;
+      }
+      cloud_obj.material.needsUpdate = true;
+    });
+    renderFolder.open();
+
+    // Animation presets
+    const animFolder = gui.addFolder('Animations');
+    animFolder.add(params, 'animation', [
+      'Cosmic Orbit',
+      'Heartbeat Pulse',
+      'Chaotic Vortex',
+      'Bouncing Wave',
+      'Dimensional Shift'
+    ]).name('Auto Preset');
+    animFolder.add(params, 'animSpeed', 0.0, 3.0, 0.1).name('Speed');
+    animFolder.open();
+
+    // Camera options
+    const cameraFolder = gui.addFolder('Camera');
+    cameraFolder.add(params, 'resetView').name('Reset View');
+    cameraFolder.open();
+  }
+
+  function updateColors() {
+    uniforms.u_colorCore.value.set(params.colorCore);
+    uniforms.u_colorInner.value.set(params.colorInner);
+    uniforms.u_colorOuter.value.set(params.colorOuter);
+  }
+
+  function setupKeyboard() {
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        guiVisible = !guiVisible;
+        gui.show(guiVisible);
+      }
+    });
+  }
+
+  // Safe CCapture wrapper for compatibility
+  let capturer = null;
+  let capturing = false;
+  if (typeof CCapture !== 'undefined') {
+    capturer = new CCapture({ 
+      verbose: true, 
+      framerate: 60,
+      quality: 90,
+      format: 'webm',
+      workersPath: 'js/'
+    });
+  }
+
+  window.isCapturing = function(val) {
+    if (!capturer) return;
+    if(val === false && capturing === true) {
+      capturer.stop();
+      capturer.save();
+      renderer.setPixelRatio( window.devicePixelRatio );
+    } else if(val === true && capturing === false) {
+      capturer.start();
+      controls.enabled = false;
+      renderer.setPixelRatio( 1 );
+    }
+    capturing = val;
+  }
+
+  window.toggleCapture = function() {
+    window.isCapturing(!capturing);
+  }
+
+  window.addEventListener('keyup', function(e) { 
+    if(e.keyCode == 68) window.toggleCapture(); // Key 'D'
+  });
+
+  let then = 0;
+  let animationTime = 0;
+
+  function animate() {
+    requestAnimationFrame( animate );
+    
+    let now = Date.now() / 1000;
+    let _delta = now - then;
+    if (then === 0) _delta = 0;
+    then = now;
+    
+    // Scale delta time by speed parameter
+    animationTime += _delta * params.animSpeed;
+    
+    render(_delta);
+  }
+
+  function render(delta) {
+    let stepSpeed = delta * params.animSpeed;
+    
+    // Compute positions & velocities
+    gpuComputationRenderer.compute();
+    
+    texturePosition.material.uniforms.delta.value = Math.min(delta, 0.5);
+    textureVelocity.material.uniforms.u_time.value += .0005 * params.animSpeed;
+    texturePosition.material.uniforms.u_time.value += stepSpeed;
+    
+    uniforms.u_time.value += stepSpeed;
+    
+    const posTex = gpuComputationRenderer.getCurrentRenderTarget(texturePosition).texture;
+    uniforms.texturePosition.value = posTex;
+    uniforms.u_texturePosition.value = posTex;
+    
+    // Reset cloud transformations so we can apply animations smoothly from origin
+    cloud_obj.position.set(0, 0, 0);
+    cloud_obj.rotation.set(0, 0, 0);
+    cloud_obj.scale.set(1, 1, 1);
+    
+    const time = animationTime;
+
+    // Apply auto-animations
+    switch (params.animation) {
+      case "Cosmic Orbit":
+        cloud_obj.rotation.y = time * 0.35;
+        cloud_obj.rotation.x = Math.sin(time * 0.15) * 0.25;
+        cloud_obj.scale.setScalar(1.0 + 0.15 * Math.sin(time * 0.5));
+        break;
+        
+      case "Heartbeat Pulse":
+        let hb = Math.sin(time * 2.8);
+        let scale = 1.0 + (hb > 0.0 ? hb * 0.22 : hb * 0.06);
+        cloud_obj.scale.setScalar(scale);
+        textureVelocity.material.uniforms.u_time.value += Math.sin(time * 2.8) * 0.0001;
+        cloud_obj.rotation.y = time * 0.12;
+        break;
+        
+      case "Chaotic Vortex":
+        cloud_obj.rotation.y = time * 1.5;
+        cloud_obj.rotation.x = time * 0.5;
+        textureVelocity.material.uniforms.u_time.value += 0.0012 * Math.sin(time * 2.5);
+        cloud_obj.scale.setScalar(0.9 + 0.2 * Math.cos(time * 3.5));
+        break;
+        
+      case "Bouncing Wave":
+        cloud_obj.position.y = Math.sin(time * 1.3) * 6.5;
+        cloud_obj.rotation.z = Math.sin(time * 0.6) * 0.25;
+        cloud_obj.rotation.y = time * 0.2;
+        break;
+        
+      case "Dimensional Shift":
+        cloud_obj.position.x = Math.sin(time * 0.7) * 7.5;
+        cloud_obj.position.y = Math.sin(time * 1.4) * 4.5;
+        cloud_obj.position.z = Math.cos(time * 0.7) * 5.5;
+        cloud_obj.scale.setScalar(1.0 + 0.28 * Math.sin(time * 0.45));
+        cloud_obj.rotation.y = time * 0.4;
+        break;
+    }
+    
+    controls.update();
+    
+    renderer.render( scene, camera );
+
+    if (capturing && capturer) {
+      capturer.capture( renderer.domElement );
+    }
+  }
+</script>
+
+</body>
+</html>

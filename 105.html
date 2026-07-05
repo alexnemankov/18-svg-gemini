@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>105 - Infinite Tunnel Raymarching</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: #000;
+      }
+      #container {
+        left: 50%;
+        position: fixed;
+        transform: translate(-50%, -50%);
+        top: 50%;
+      }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/88/three.min.js"></script>
+  </head>
+  <body>
+    <div id="container"></div>
+
+    <script id="vertexShader" type="x-shader/x-vertex">
+      void main() {
+          gl_Position = vec4( position, 1.0 );
+      }
+    </script>
+
+    <script id="fragmentShader" type="x-shader/x-fragment">
+      uniform vec2 u_resolution;
+      uniform float u_time;
+      uniform vec2 u_mouse;
+      uniform float u_zoom;
+      uniform vec2 u_offset;
+      uniform vec3 u_obj_color;
+      uniform vec3 u_bg_color;
+      uniform float u_greenscreen;
+      uniform float u_anim_mode;
+
+      const int octaves = 2;
+      const float seed = 43758.5453123;
+      const float seed2 = 73156.8473192;
+      const float eps = 0.005;
+
+      const vec3 ambientLight = 0.99 * vec3(1.0, 1.0, 1.0);
+      const vec3 light1Pos = vec3(10., 5.0, -25.0);
+      const vec3 light1Intensity = vec3(0.35);
+      const vec3 light2Pos = vec3(-20., -25.0, 85.0);
+      const vec3 light2Intensity = vec3(0.2);
+
+      vec3 movement = vec3(.0);
+
+      const int maxIterations = 256;
+      const int maxIterationsShad = 16;
+      const float stepScale = .7;
+      const float stopThreshold = 0.001;
+
+      // GLSL hue shifting helpers
+      vec3 rgb2hsv(vec3 c) {
+          vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+          vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+          vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+
+          float d = q.x - min(q.w, q.y);
+          float e = 1.0e-10;
+          return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+      }
+
+      vec3 hsv2rgb(vec3 c) {
+          vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+          vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+          return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+      }
+
+      vec3 shift_hue(vec3 rgb, float adjustment) {
+          vec3 hsv = rgb2hsv(rgb);
+          hsv.x = fract(hsv.x + adjustment);
+          return hsv2rgb(hsv);
+      }
+
+      mat4 rotationMatrix(vec3 axis, float angle)
+      {
+          axis = normalize(axis);
+          float s = sin(angle);
+          float c = cos(angle);
+          float oc = 1.0 - c;
+
+          return mat4(oc * axis.x * axis.x + c,           oc * axis.x * axis.y - axis.z * s,  oc * axis.z * axis.x + axis.y * s,  0.0,
+                      oc * axis.x * axis.y + axis.z * s,  oc * axis.y * axis.y + c,           oc * axis.y * axis.z - axis.x * s,  0.0,
+                      oc * axis.z * axis.x - axis.y * s,  oc * axis.y * axis.z + axis.x * s,  oc * axis.z * axis.z + c,           0.0,
+                      0.0,                                0.0,                                0.0,                                1.0);
+      }
+
+      float length2( vec2 p )
+      {
+        return sqrt( p.x*p.x + p.y*p.y );
+      }
+
+      float length6( vec2 p )
+      {
+        p = p*p*p; p = p*p;
+        return pow( p.x + p.y, 1.0/6.0 );
+      }
+
+      float length8( vec2 p )
+      {
+        p = p*p; p = p*p; p = p*p;
+        return pow( p.x + p.y, 1.0/8.0 );
+      }
+
+      float sdBox( vec3 p, vec3 b )
+      {
+        vec3 d = abs(p) - b;
+        return min(max(d.x,max(d.y,d.z)),0.0) + length(max(d,0.0));
+      }
+      float udBox( vec3 p, vec3 b )
+      {
+        return length(max(abs(p)-b,0.0));
+      }
+      float udRoundBox( vec3 p, vec3 b, float r )
+      {
+        return length(max(abs(p)-b,0.0))-r;
+      }
+      float sdSphere( vec3 p, float s )
+      {
+        return length(p)-s;
+      }
+      float sdCylinder( vec3 p, vec3 c )
+      {
+        return length(p.xz-c.xy)-c.z;
+      }
+      float sdCappedCylinder( vec3 p, vec2 h )
+      {
+        vec2 d = abs(vec2(length(p.xz),p.y)) - h;
+        return min(max(d.x,d.y),0.0) + length(max(d,0.0));
+      }
+      float sdTorus82( vec3 p, vec2 t )
+      {
+        vec2 q = vec2(length2(p.xz)-t.x,p.y);
+        return length8(q)-t.y;
+      }
+      float sdPlane( vec3 p)
+      {
+        return p.y;
+      }
+
+      float smin(float a, float b, float k) {
+          float res = exp(-k*a) + exp(-k*b);
+          return -log(res)/k;
+      }
+
+      vec3 random3( vec3 p ) {
+          return fract(sin(vec3(dot(p,vec3(127.1,311.7,319.8)),dot(p,vec3(269.5,183.3, 415.2)),dot(p,vec3(362.9,201.5,134.7))))*43758.5453);
+      }
+      vec2 random2( vec2 p ) {
+          return fract(sin(vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))))*43758.5453);
+      }
+
+      float world_sdf(in vec3 p) {
+        float world = 10.;
+
+        vec3 grid = floor(p);
+        vec2 rand = random2(grid.xy);
+
+        float time = u_time;
+        if (u_anim_mode == 4.0) { // Warp Speed
+          p.z += u_time * 2.5 * rand.x;
+          time = u_time * 2.5 + 20.0 * random2(floor(p.xz)).x;
+        } else {
+          p.z += u_time * rand.x;
+          time = u_time + 20.0 * random2(floor(p.xz)).x;
+        }
+
+        p = mod(p, 1.0) - .5;
+        p.y = p.y - abs(p.x) * (2. - abs(p.x))  / 3.;
+
+        float radius = .3 + -abs(sin(time + cos(time))) * .1;
+
+        if (u_anim_mode == 3.0) { // Matrix Wave
+          radius = 0.25 + 0.1 * sin(grid.x * 2.0 + grid.y * 2.0 + u_time * 3.0);
+        }
+
+        world = sdSphere(p, radius);
+        return world;
+      }
+
+      vec3 calculate_normal(in vec3 p)
+      {
+        const vec3 small_step = vec3(0.0001, 0.0, 0.0);
+
+        float gradient_x = world_sdf(vec3(p.x + eps, p.y, p.z)) - world_sdf(vec3(p.x - eps, p.y, p.z));
+        float gradient_y = world_sdf(vec3(p.x, p.y + eps, p.z)) - world_sdf(vec3(p.x, p.y - eps, p.z));
+        float gradient_z = world_sdf(vec3(p.x, p.y, p.z  + eps)) - world_sdf(vec3(p.x, p.y, p.z - eps));
+
+        vec3 normal = vec3(gradient_x, gradient_y, gradient_z);
+        return normalize(normal);
+      }
+
+      float rayMarching( vec3 origin, vec3 dir, float start, float end, inout float field ) {
+        float sceneDist = 1e4;
+        float rayDepth = start;
+        for ( int i = 0; i < maxIterations; i++ ) {
+          sceneDist = world_sdf( origin + dir * rayDepth );
+
+          if (( sceneDist < stopThreshold ) || (rayDepth >= end)) {
+            break;
+          }
+          rayDepth += sceneDist * stepScale;
+        }
+
+        if ( sceneDist >= stopThreshold ) rayDepth = end;
+        else rayDepth += sceneDist;
+
+        return rayDepth;
+      }
+
+      float softShadow(vec3 ro, vec3 lightPos, float start, float k){
+          vec3 rd = lightPos - ro;
+          float end = length(rd);
+          float shade = 1.0;
+          float dist = start;
+          float stepDist = start;
+
+          for (int i=0; i<maxIterationsShad; i++){
+              float h = world_sdf(ro + rd*dist);
+              shade = min(shade, k*h/dist);
+              dist += min(h, stepDist*2.);
+              if (h<0.001 || dist > end) break;
+          }
+          return min(max(shade, 0.) + 0.3, 1.0);
+      }
+
+      float calculateAO(vec3 p, vec3 n)
+      {
+         const float AO_SAMPLES = 5.0;
+         float r = 0.0;
+         float w = 1.0;
+         for (float i=1.0; i<=AO_SAMPLES; i++)
+         {
+            float d0 = i * 0.15;
+            r += w * (d0 - world_sdf(p + n * d0));
+            w *= 0.5;
+         }
+         return 1.0-clamp(r,0.0,1.0);
+      }
+
+      vec3 lighting( vec3 sp, vec3 camPos, int reflectionPass, float dist, float field, vec3 rd) {
+        vec3 sceneColor = vec3(0.0);
+
+        vec3 grid = floor(sp);
+        vec2 rand = random2(grid.xy);
+        vec3 voxPos = mod((sp + vec3(0., 0., u_time * rand.x)) * 0.25, 1.0);
+
+        vec3 objColor = u_obj_color;
+        if (u_anim_mode == 5.0) { // Color Pulsar
+          objColor = shift_hue(objColor, u_time * 0.15);
+        }
+        objColor.y *= voxPos.z*0.8;
+        objColor.z *= voxPos.x*0.8;
+
+        vec3 surfNormal = calculate_normal(sp);
+        vec3 lp = vec3(0., 0.0, -1.0) + movement;
+        vec3 ld = lp-sp;
+        vec3 lcolor = vec3(1.,0.97,0.92) * .8;
+
+        float len = length( ld );
+        ld /= len;
+
+        float sceneLen = length(camPos - sp);
+        float sceneAtten = min( 1.0 / ( 0.015*sceneLen*sceneLen ), 1.0 );
+
+        vec3 ref = reflect(-ld, surfNormal);
+        float ao = 1.0;
+
+        float ambient = .5;
+        float specularPower = 200.;
+        float diffuse = max( 0.0, dot(surfNormal, ld) );
+        float specular = max( 0.0, dot( ref, normalize(camPos-sp)) );
+        specular = pow(specular, specularPower);
+
+        sceneColor += (objColor*(diffuse*0.8+ambient)+specular*0.5)*lcolor*1.3;
+
+        vec3 bg_color = (u_greenscreen > 0.5) ? vec3(0.0, 1.0, 0.0) : u_bg_color;
+        if (u_anim_mode == 5.0 && u_greenscreen <= 0.5) { // Color Pulsar
+          bg_color = shift_hue(bg_color, u_time * 0.15 + 0.5);
+        }
+
+        sceneColor = mix(sceneColor, bg_color, 1.-sceneAtten*sceneAtten);
+        return sceneColor;
+      }
+
+      void main() {
+        vec2 aspect = vec2(u_resolution.x/u_resolution.y, 1.0);
+        vec2 uv = (2.0*gl_FragCoord.xy/u_resolution.xy - 1.0)*aspect;
+
+        // movement
+        movement = vec3(0.0);
+        float speed_factor = 1.0;
+        if (u_anim_mode == 4.0) { // Warp Speed
+          speed_factor = 3.5;
+        }
+
+        if (u_anim_mode == 2.0) { // Orbit Flight
+          movement.z = u_time / 6.0;
+          movement.x = cos(u_time / 4.0) * 3.0;
+          movement.y = sin(u_time / 4.0) * 3.0;
+        } else {
+          movement.z = u_time / 6.0 * speed_factor;
+          movement.x = cos(u_time / 8.0 * speed_factor) * 4.0;
+          movement.y = sin(u_time / 8.0 * speed_factor) * 4.0;
+        }
+
+        vec3 lookAt = vec3(-0., 0.2, 1.);
+        vec3 camera_position = vec3(clamp(0.5 - u_mouse.x / u_resolution.x, -.5, .5), 0.15 + u_mouse.y / u_resolution.y - .5, -1.0);
+
+        camera_position.xy += u_offset;
+        lookAt.xy += u_offset;
+
+        lookAt += movement;
+        camera_position += movement;
+
+        vec3 forward = normalize(lookAt-camera_position);
+        vec3 right = normalize(vec3(forward.z, 0., -forward.x ));
+        vec3 up = normalize(cross(forward,right));
+
+        float FOV = 0.4 / u_zoom;
+        if (u_anim_mode == 4.0) { // Warp Speed narrow FOV
+          FOV = 0.2 / u_zoom;
+        }
+
+        vec3 ro = camera_position;
+        vec3 rd = normalize(forward + FOV*uv.x*right + FOV*uv.y*up);
+
+        const float clipNear = 0.0;
+        const float clipFar = 16.0;
+        float field = 0.;
+        float dist = rayMarching(ro, rd, clipNear, clipFar, field );
+
+        vec3 bg_color = (u_greenscreen > 0.5) ? vec3(0.0, 1.0, 0.0) : u_bg_color;
+        if (u_anim_mode == 5.0 && u_greenscreen <= 0.5) { // Color Pulsar
+          bg_color = shift_hue(bg_color, u_time * 0.15 + 0.5);
+        }
+
+        if ( dist >= clipFar ) {
+          gl_FragColor = vec4(bg_color, 1.0);
+          return;
+        }
+
+        vec3 sp = ro + rd*dist;
+        vec3 sceneColor = lighting( sp, camera_position, 0, dist, field, rd);
+        gl_FragColor = vec4(clamp(sceneColor, 0.0, 1.0), 1.0);
+      }
+    </script>
+
+    <script type="module">
+      import { GUI } from "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js";
+
+      // Color Scheme Presets
+      const presets = {
+        "Cosmic Coral": { obj: "#ff8080", bg: "#ffffff" },
+        "Deep Space": { obj: "#00f5ff", bg: "#0c021a" },
+        "Cyberpunk City": { obj: "#ff00ff", bg: "#051a24" },
+        "Toxic Biohazard": { obj: "#39ff14", bg: "#041004" },
+        "Monochrome Metal": { obj: "#e0e0e0", bg: "#111111" },
+        Custom: { obj: "#ff8080", bg: "#ffffff" },
+      };
+
+      const params = {
+        colorScheme: "Cosmic Coral",
+        colorObj: "#ff8080",
+        colorBg: "#ffffff",
+        greenscreen: false,
+        zoom: 1.0,
+        dpr: 1.0,
+        animationMode: "Infinity Tunnel",
+        resetView: function () {
+          uniforms.u_zoom.value = 1.0;
+          uniforms.u_offset.value.set(0.0, 0.0);
+          params.zoom = 1.0;
+          gui.controllers.forEach((c) => c.updateDisplay());
+        },
+      };
+
+      let container;
+      let camera, scene, renderer;
+      let uniforms;
+      let gui;
+
+      function applyColorScheme(schemeName) {
+        const scheme = presets[schemeName];
+        if (scheme) {
+          params.colorObj = scheme.obj;
+          params.colorBg = scheme.bg;
+
+          uniforms.u_obj_color.value.set(scheme.obj);
+          uniforms.u_bg_color.value.set(scheme.bg);
+
+          gui.controllers.forEach((c) => c.updateDisplay());
+        }
+      }
+
+      function init() {
+        container = document.getElementById("container");
+
+        camera = new THREE.Camera();
+        camera.position.z = 1;
+
+        scene = new THREE.Scene();
+
+        var geometry = new THREE.PlaneBufferGeometry(2, 2);
+
+        uniforms = {
+          u_time: { type: "f", value: 1.0 },
+          u_resolution: { type: "v2", value: new THREE.Vector2() },
+          u_mouse: {
+            type: "v2",
+            value: new THREE.Vector2(
+              window.innerWidth / 2,
+              window.innerHeight / 2,
+            ),
+          },
+          u_zoom: { type: "f", value: 1.0 },
+          u_offset: { type: "v2", value: new THREE.Vector2(0.0, 0.0) },
+          u_obj_color: { type: "v3", value: new THREE.Color("#ff8080") },
+          u_bg_color: { type: "v3", value: new THREE.Color("#ffffff") },
+          u_greenscreen: { type: "f", value: 0.0 },
+          u_anim_mode: { type: "f", value: 1.0 },
+        };
+
+        var material = new THREE.ShaderMaterial({
+          uniforms: uniforms,
+          vertexShader: document.getElementById("vertexShader").textContent,
+          fragmentShader: document.getElementById("fragmentShader").textContent,
+        });
+
+        var mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        renderer = new THREE.WebGLRenderer();
+        renderer.setPixelRatio(params.dpr);
+
+        container.appendChild(renderer.domElement);
+
+        onWindowResize();
+        window.addEventListener("resize", onWindowResize, false);
+
+        // Mouse drag controls
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+
+        window.addEventListener("mousedown", function (e) {
+          if (e.target.closest(".lil-gui")) return;
+          isDragging = true;
+          previousMousePosition = { x: e.clientX, y: e.clientY };
+        });
+
+        window.addEventListener("mousemove", function (e) {
+          if (isDragging) {
+            let deltaX = e.clientX - previousMousePosition.x;
+            let deltaY = e.clientY - previousMousePosition.y;
+
+            let sens = 0.005 / uniforms.u_zoom.value;
+            uniforms.u_offset.value.x += deltaX * sens;
+            uniforms.u_offset.value.y -= deltaY * sens;
+
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+          }
+
+          uniforms.u_mouse.value.x = e.pageX;
+          uniforms.u_mouse.value.y = e.pageY;
+        });
+
+        window.addEventListener("mouseup", function () {
+          isDragging = false;
+        });
+
+        // Touch drag controls
+        window.addEventListener("touchstart", function (e) {
+          if (e.target.closest(".lil-gui")) return;
+          if (e.touches.length === 1) {
+            isDragging = true;
+            previousMousePosition = {
+              x: e.touches[0].clientX,
+              y: e.touches[0].clientY,
+            };
+          }
+        });
+
+        window.addEventListener("touchmove", function (e) {
+          if (isDragging && e.touches.length === 1) {
+            let deltaX = e.touches[0].clientX - previousMousePosition.x;
+            let deltaY = e.touches[0].clientY - previousMousePosition.y;
+
+            let sens = 0.005 / uniforms.u_zoom.value;
+            uniforms.u_offset.value.x += deltaX * sens;
+            uniforms.u_offset.value.y -= deltaY * sens;
+
+            previousMousePosition = {
+              x: e.touches[0].clientX,
+              y: e.touches[0].clientY,
+            };
+          }
+        });
+
+        window.addEventListener("touchend", function () {
+          isDragging = false;
+        });
+
+        // Mouse wheel zoom controls
+        window.addEventListener(
+          "wheel",
+          function (e) {
+            if (e.target.closest(".lil-gui")) return;
+
+            let zoomFactor = 1.1;
+            if (e.deltaY < 0) {
+              uniforms.u_zoom.value = Math.min(
+                uniforms.u_zoom.value * zoomFactor,
+                10.0,
+              );
+            } else {
+              uniforms.u_zoom.value = Math.max(
+                uniforms.u_zoom.value / zoomFactor,
+                0.1,
+              );
+            }
+            params.zoom = uniforms.u_zoom.value;
+            gui.controllers.forEach((c) => c.updateDisplay());
+          },
+          { passive: true },
+        );
+
+        // Keyboard H key to toggle GUI
+        window.addEventListener("keydown", function (e) {
+          if (e.key === "h" || e.key === "H") {
+            const guiEl = document.querySelector(".lil-gui");
+            if (guiEl) {
+              guiEl.style.display =
+                guiEl.style.display === "none" ? "" : "none";
+            }
+          }
+        });
+
+        initGUI();
+      }
+
+      function initGUI() {
+        gui = new GUI({ title: "Shader Settings" });
+
+        gui
+          .add(
+            params,
+            "colorScheme",
+            Object.keys(presets).filter((k) => k !== "Custom"),
+          )
+          .name("Preset Scheme")
+          .onChange((value) => {
+            applyColorScheme(value);
+          });
+
+        const colorFolder = gui.addFolder("Custom Colors");
+        colorFolder
+          .addColor(params, "colorObj")
+          .name("Object Color")
+          .onChange((value) => {
+            uniforms.u_obj_color.value.set(value);
+            params.colorScheme = "Custom";
+            gui.controllers.forEach((c) => c.updateDisplay());
+          });
+        colorFolder
+          .addColor(params, "colorBg")
+          .name("Background Color")
+          .onChange((value) => {
+            uniforms.u_bg_color.value.set(value);
+            params.colorScheme = "Custom";
+            gui.controllers.forEach((c) => c.updateDisplay());
+          });
+
+        gui
+          .add(params, "greenscreen")
+          .name("Greenscreen")
+          .onChange((value) => {
+            uniforms.u_greenscreen.value = value ? 1.0 : 0.0;
+          });
+
+        const animations = [
+          "Infinity Tunnel",
+          "Orbit Flight",
+          "Matrix Wave",
+          "Warp Speed",
+          "Color Pulsar",
+        ];
+        gui
+          .add(params, "animationMode", animations)
+          .name("Animation")
+          .onChange((value) => {
+            let modeVal = 1.0;
+            if (value === "Orbit Flight") modeVal = 2.0;
+            else if (value === "Matrix Wave") modeVal = 3.0;
+            else if (value === "Warp Speed") modeVal = 4.0;
+            else if (value === "Color Pulsar") modeVal = 5.0;
+            uniforms.u_anim_mode.value = modeVal;
+          });
+
+        gui
+          .add(params, "zoom", 0.1, 10.0, 0.1)
+          .name("Zoom")
+          .listen()
+          .onChange((value) => {
+            uniforms.u_zoom.value = value;
+          });
+
+        gui
+          .add(params, "dpr", 0.5, 3.0, 0.1)
+          .name("Pixel Ratio (DPR)")
+          .onChange((value) => {
+            renderer.setPixelRatio(value);
+          });
+
+        gui.add(params, "resetView").name("Reset View");
+      }
+
+      function onWindowResize(event) {
+        let w = window.innerWidth;
+        let h = window.innerHeight;
+
+        renderer.setSize(w, h);
+        uniforms.u_resolution.value.x = w;
+        uniforms.u_resolution.value.y = h;
+      }
+
+      function animate() {
+        requestAnimationFrame(animate);
+        render();
+      }
+
+      function render() {
+        uniforms.u_time.value += 0.04;
+        renderer.render(scene, camera);
+      }
+
+      init();
+      animate();
+    </script>
+  </body>
+</html>

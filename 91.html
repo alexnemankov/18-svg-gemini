@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volumetric Cave Marcher</title>
+    <meta name="description" content="An interactive 3D volumetric raymarching cave simulation with color presets, dynamic animations, camera panning/zooming, and greenscreen background support.">
+    <style>
+      body, html {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: #000;
+      }
+      #container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        touch-action: none;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        cursor: grab;
+      }
+      canvas:active {
+        cursor: grabbing;
+      }
+      /* Modern premium style adjustment for lil-gui settings panel */
+      .lil-gui {
+        --background-color: rgba(20, 20, 25, 0.9);
+        --text-color: #e0e0e0;
+        --title-background-color: #2c2c35;
+        --widget-color: #3c3c45;
+        --hover-color: #5c5c65;
+        --focus-color: #00ffd0;
+        --number-color: #00ffd0;
+        --string-color: #ff9000;
+        font-family: system-ui, -apple-system, sans-serif;
+        border-radius: 8px;
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      }
+    </style>
+</head>
+<body>
+
+<div id="container" touch-action="none"></div>
+
+<!-- Three.js Library -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/88/three.min.js"></script>
+
+<!-- Vertex Shader -->
+<script id="vertexShader" type="x-shader/x-vertex">
+    void main() {
+        gl_Position = vec4( position, 1.0 );
+    }
+</script>
+
+<!-- Fragment Shader -->
+<script id="fragmentShader" type="x-shader/x-fragment">
+  uniform vec2 u_resolution;
+  uniform vec2 u_mouse;
+  uniform float u_time;
+  uniform sampler2D u_noise;
+
+  // Custom Interactive Uniforms
+  uniform float u_zoom;
+  uniform vec2 u_offset;
+  uniform float u_greenscreen;
+  uniform vec3 u_color1;
+  uniform vec3 u_color2;
+  uniform vec3 u_colorCore;
+  uniform vec3 u_colorGlow;
+
+  vec3 hash33(vec3 p){ 
+    return texture2D(u_noise, p.xy * p.z * 256.).rgb;
+  }
+
+  mat2 rot2( float a ){ vec2 v = sin(vec2(1.570796, 0) + a);	return mat2(v, -v.y, v.x); }
+  
+  float pn( in vec3 p ) {
+    vec3 i = floor(p); p -= i; p *= p*(3. - 2.*p);
+    p.xy = texture2D(u_noise, (p.xy + i.xy + vec2(37, 17)*i.z + .5)/256., -100.).yx;
+    return mix(p.x, p.y, p.z);
+  }
+  
+  // Shane's low quality noise
+  float trigNoise3D(in vec3 p) {
+      float res = 0., sum = 0.;
+    
+      float n = pn(p*8. + u_time*.1);
+    
+      vec3 t = sin(p*3.14159265 + cos(p*3.14159265+1.57/2.))*0.5 + 0.5;
+      p = p*1.5 + (t - 1.5);
+      res += (dot(t, vec3(0.333)));
+
+      t = sin(p.yzx*3.14159265 + cos(p.zxy*3.14159265+1.57/2.))*0.5 + 0.5;
+      res += (dot(t, vec3(0.333)))*0.7071;    
+
+    return ((res/1.7071))*0.85 + n*0.15;
+  }
+  
+  float world(vec3 p) {
+    float n = trigNoise3D(p * .1) * 10.;
+    p.y += n;
+    return p.y - 3.;
+  }
+  
+  vec3 path(float p) {
+    return vec3(sin(p*.05)*10., cos(p * .3), p);
+  }
+
+  void main() {
+      // Setting up our screen coordinates.
+      vec2 aspect = vec2(u_resolution.x/u_resolution.y, 1.0);
+      vec2 uv = (2.0*gl_FragCoord.xy/u_resolution.xy - 1.0)*aspect;
+    
+      // Interactive Zoom and Drag Offset
+      uv = (uv - u_offset) / u_zoom;
+    
+      float modtime = u_time * 2.;
+      vec3 movement = path(modtime);
+    
+      vec3 lookAt = vec3(0, -.2, 0) + path(modtime + 1.);  // Point you look towards
+      vec3 camera_position = vec3(0,0,-1) + movement; // Camera position
+    
+      vec3 forward = normalize(lookAt-camera_position); // Forward vector.
+      vec3 right = normalize(vec3(forward.z, 0., -forward.x )); // Right vector.
+      vec3 up = normalize(cross(forward,right)); // Up vector.
+
+      // FOV - Field of view.
+      float FOV = .8;
+
+      // ro - Ray origin.
+      vec3 ro = camera_position; 
+      // rd - Ray direction.
+      vec3 rd = normalize(forward + FOV*uv.x*right + FOV*uv.y*up);
+      rd.xy = rot2( movement.x * .04 )*rd.xy;
+
+      vec3 lp = vec3( 0, -10, 10.5);
+      lp += ro;
+
+      float local_density = 0.;
+      float density = 0.;
+      float weighting = 0.;
+
+      float dist = 1.;
+      float travelled = 0.;
+
+      const float distanceThreshold = .3;
+
+      // Initializing the scene color to black
+      vec3 col = vec3(0);
+      vec3 sp;
+
+      // Raymarching loop.
+      for (int i=0; i<64; i++) {
+        if((density>1.) || travelled>80.) {
+          travelled = 80.;
+          break;
+        }
+
+        sp = ro + rd*travelled; // Ray position.
+        dist = world(sp); // Closest distance to the surface... particle.
+        
+        if(dist < .3) dist = .25;
+
+        local_density = (distanceThreshold - dist)*step(dist, distanceThreshold);
+        weighting = (1. - density)*local_density;
+
+        density += weighting*(1.-distanceThreshold)*1./dist*.1;
+
+        vec3 ld = lp-sp; // Direction vector from the surface to the light position.
+        float lDist = max(length(ld), .001); // Distance from the surface to the light.
+        ld/=lDist; // Normalizing the directional light vector.
+
+        // Light falloff
+        float atten = 1./(1. + lDist*.125 + lDist*lDist*.55);
+
+        col += weighting*atten*1.25 ;
+
+        travelled += max(dist*.2, .02);
+      }
+    
+      vec3 sunDir = normalize(lp-ro);
+      float sunF = 1. - dot(rd,sunDir);
+
+      // Color scheme uniforms integrated here
+      col = mix(
+        mix(
+          u_colorCore,
+          vec3(1.0),
+          col * density * 5.), vec3(0.), col);
+      
+      col = mix(col, u_colorGlow, (5.-density)*.01*(1.+sunF*.5));
+      
+      col = mix(
+        col, 
+        mix(
+          u_color1 * 3.,
+          u_color2 * .9,
+          sunF*sunF*1.
+        ),
+        travelled*.01);
+    
+      col *= col*col*col*2.;
+
+      // Green Screen Replacement Overlay
+      if (u_greenscreen > 0.5) {
+        float bg_factor = clamp(travelled * 0.012, 0.0, 1.0);
+        col = mix(col, vec3(0.0, 1.0, 0.0), bg_factor);
+        
+        float brightness = max(col.r, max(col.g, col.b));
+        float black_key = smoothstep(0.05, 0.0, brightness);
+        col = mix(col, vec3(0.0, 1.0, 0.0), black_key);
+      }
+
+      gl_FragColor = vec4(col, 1.0);
+  }
+</script>
+
+<script type="module">
+  // Load lil-gui from direct URL
+  import { GUI } from "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js";
+
+  let container;
+  let camera, scene, renderer;
+  let uniforms;
+
+  // Preset Color Schemes
+  const presetColorSchemes = {
+    "Classic Cave": {
+      color1: "#664d33",  // 0.4, 0.3, 0.2
+      color2: "#3366b3",  // 0.2, 0.4, 0.7
+      colorCore: "#808080", // 0.5, 0.5, 0.5
+      colorGlow: "#ffffff"  // 1.0, 1.0, 1.0 (scaled to 4.0 in shader)
+    },
+    "Golden Cavern": {
+      color1: "#ffaa00",
+      color2: "#331100",
+      colorCore: "#ffffff",
+      colorGlow: "#ffddaa"
+    },
+    "Neon Abyss": {
+      color1: "#ff00aa",
+      color2: "#001133",
+      colorCore: "#00ffff",
+      colorGlow: "#ff00ee"
+    },
+    "Acid Wasteland": {
+      color1: "#00ff55",
+      color2: "#112200",
+      colorCore: "#ffffff",
+      colorGlow: "#aaff00"
+    },
+    "Frozen Tundra": {
+      color1: "#00aaff",
+      color2: "#000511",
+      colorCore: "#ffffff",
+      colorGlow: "#d0f0ff"
+    }
+  };
+
+  // GUI Parameter mapping
+  const guiParams = {
+    greenscreen: false,
+    zoom: 1.0,
+    offsetX: 0.0,
+    offsetY: 0.0,
+    colorScheme: "Classic Cave",
+    color1: "#664d33",
+    color2: "#3366b3",
+    colorCore: "#808080",
+    colorGlow: "#ffffff",
+    animation: "Default Explorer",
+    animSpeed: 1.0
+  };
+
+  let color1Controller, color2Controller, colorCoreController, colorGlowController;
+  let zoomController, offsetXController, offsetYController;
+
+  // Fallback procedural texture in case loading fails or offline
+  function createFallbackNoiseTexture() {
+    const size = 256;
+    const data = new Uint8Array(size * size * 4);
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.floor(Math.random() * 255);
+      data[i + 1] = Math.floor(Math.random() * 255);
+      data[i + 2] = Math.floor(Math.random() * 255);
+      data[i + 3] = 255;
+    }
+    const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  let loader = new THREE.TextureLoader();
+  let texture;
+  loader.setCrossOrigin("anonymous");
+  loader.load(
+    'https://s3-us-west-2.amazonaws.com/s.cdpn.io/982762/noise.png',
+    function do_something_with_texture(tex) {
+      texture = tex;
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.minFilter = THREE.LinearFilter;
+      init();
+      animate(0);
+    },
+    undefined,
+    function (err) {
+      console.warn("Could not load noise texture from URL, using fallback procedural noise.");
+      texture = createFallbackNoiseTexture();
+      init();
+      animate(0);
+    }
+  );
+
+  function init() {
+    container = document.getElementById( 'container' );
+
+    camera = new THREE.Camera();
+    camera.position.z = 1;
+
+    scene = new THREE.Scene();
+
+    var geometry = new THREE.PlaneBufferGeometry( 2, 2 );
+
+    uniforms = {
+      u_time: { type: "f", value: 1.0 },
+      u_resolution: { type: "v2", value: new THREE.Vector2() },
+      u_noise: { type: "t", value: texture },
+      u_mouse: { type: "v2", value: new THREE.Vector2() },
+      u_zoom: { type: "f", value: 1.0 },
+      u_offset: { type: "v2", value: new THREE.Vector2(0, 0) },
+      u_greenscreen: { type: "f", value: 0.0 },
+      u_color1: { type: "v3", value: new THREE.Vector3() },
+      u_color2: { type: "v3", value: new THREE.Vector3() },
+      u_colorCore: { type: "v3", value: new THREE.Vector3() },
+      u_colorGlow: { type: "v3", value: new THREE.Vector3() }
+    };
+
+    updateUniformColors();
+
+    var material = new THREE.ShaderMaterial( {
+      uniforms: uniforms,
+      vertexShader: document.getElementById( 'vertexShader' ).textContent,
+      fragmentShader: document.getElementById( 'fragmentShader' ).textContent
+    } );
+    material.extensions.derivatives = true;
+
+    var mesh = new THREE.Mesh( geometry, material );
+    scene.add( mesh );
+
+    renderer = new THREE.WebGLRenderer();
+    container.appendChild( renderer.domElement );
+
+    onWindowResize();
+    window.addEventListener( 'resize', onWindowResize, false );
+
+    setupGUI();
+    setupInteraction();
+  }
+
+  function onWindowResize() {
+    renderer.setSize( window.innerWidth, window.innerHeight );
+    uniforms.u_resolution.value.x = renderer.domElement.width;
+    uniforms.u_resolution.value.y = renderer.domElement.height;
+  }
+
+  function hexToRgb(hex) {
+    let shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+    hex = hex.replace(shorthandRegex, function(m, r, g, b) {
+      return r + r + g + g + b + b;
+    });
+    let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result ? {
+      r: parseInt(result[1], 16) / 255,
+      g: parseInt(result[2], 16) / 255,
+      b: parseInt(result[3], 16) / 255
+    } : null;
+  }
+
+  function updateUniformColors() {
+    let c1 = hexToRgb(guiParams.color1);
+    let c2 = hexToRgb(guiParams.color2);
+    let cc = hexToRgb(guiParams.colorCore);
+    let cg = hexToRgb(guiParams.colorGlow);
+    
+    if (c1) uniforms.u_color1.value.set(c1.r, c1.g, c1.b);
+    if (c2) uniforms.u_color2.value.set(c2.r, c2.g, c2.b);
+    if (cc) uniforms.u_colorCore.value.set(cc.r, cc.g, cc.b);
+    if (cg) uniforms.u_colorGlow.value.set(cg.r * 4.0, cg.g * 4.0, cg.b * 4.0); // Scaled by 4 to match original multiplier
+  }
+
+  function updateColorsFromPreset(presetName) {
+    const scheme = presetColorSchemes[presetName];
+    if (!scheme) return;
+    
+    guiParams.color1 = scheme.color1;
+    guiParams.color2 = scheme.color2;
+    guiParams.colorCore = scheme.colorCore;
+    guiParams.colorGlow = scheme.colorGlow;
+    
+    color1Controller.setValue(scheme.color1);
+    color2Controller.setValue(scheme.color2);
+    colorCoreController.setValue(scheme.colorCore);
+    colorGlowController.setValue(scheme.colorGlow);
+    
+    updateUniformColors();
+  }
+
+  function setupGUI() {
+    const gui = new GUI({ title: "Cave Controller" });
+
+    // Green Screen Setup
+    gui.add(guiParams, "greenscreen")
+      .name("Green Screen Background")
+      .onChange(val => {
+        uniforms.u_greenscreen.value = val ? 1.0 : 0.0;
+      });
+
+    // Panning and Zooming Controls
+    const transformFolder = gui.addFolder("Controls & Position");
+    zoomController = transformFolder.add(guiParams, "zoom", 0.1, 10.0, 0.01).name("Zoom").listen().onChange(val => {
+      uniforms.u_zoom.value = val;
+    });
+    offsetXController = transformFolder.add(guiParams, "offsetX", -5.0, 5.0, 0.01).name("Pan X").listen().onChange(val => {
+      uniforms.u_offset.value.x = val;
+    });
+    offsetYController = transformFolder.add(guiParams, "offsetY", -5.0, 5.0, 0.01).name("Pan Y").listen().onChange(val => {
+      uniforms.u_offset.value.y = val;
+    });
+    transformFolder.open();
+
+    // Color controls
+    const colorsFolder = gui.addFolder("Color Palette");
+    colorsFolder.add(guiParams, "colorScheme", Object.keys(presetColorSchemes)).name("Presets").onChange(val => {
+      updateColorsFromPreset(val);
+    });
+    color1Controller = colorsFolder.addColor(guiParams, "color1").name("Atmosphere Dust").onChange(updateUniformColors);
+    color2Controller = colorsFolder.addColor(guiParams, "color2").name("Atmosphere Sky").onChange(updateUniformColors);
+    colorCoreController = colorsFolder.addColor(guiParams, "colorCore").name("Core Light").onChange(updateUniformColors);
+    colorGlowController = colorsFolder.addColor(guiParams, "colorGlow").name("Glow Intensity").onChange(updateUniformColors);
+    colorsFolder.open();
+
+    // Infinite Animation Controls
+    const animFolder = gui.addFolder("Animation Settings");
+    animFolder.add(guiParams, "animation", [
+      "Default Explorer",
+      "Turbulent Sway",
+      "Cosmic Pulsation",
+      "Spiral Vortex",
+      "Hyperspace Jump"
+    ]).name("Preset Animation");
+    animFolder.add(guiParams, "animSpeed", 0.0, 5.0, 0.1).name("Speed");
+    animFolder.open();
+
+    // Toggle GUI with "H"
+    let guiVisible = true;
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        guiVisible = !guiVisible;
+        gui.show(guiVisible);
+      }
+    });
+  }
+
+  function setupInteraction() {
+    let isDragging = false;
+    let previousMousePosition = { x: 0, y: 0 };
+    
+    // Zoom via Scroll Wheel
+    window.addEventListener('wheel', (e) => {
+      guiParams.zoom -= e.deltaY * 0.001;
+      guiParams.zoom = Math.max(0.1, Math.min(guiParams.zoom, 10.0));
+      zoomController.setValue(guiParams.zoom);
+    });
+
+    // Panning/Dragging via Pointer
+    window.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.lil-gui')) return;
+      isDragging = true;
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      let ratio = window.innerHeight / window.innerWidth;
+      uniforms.u_mouse.value.x = (e.pageX - window.innerWidth / 2) / window.innerWidth / ratio;
+      uniforms.u_mouse.value.y = (e.pageY - window.innerHeight / 2) / window.innerHeight * -1;
+
+      if (isDragging) {
+        let deltaX = e.clientX - previousMousePosition.x;
+        let deltaY = e.clientY - previousMousePosition.y;
+
+        guiParams.offsetX += deltaX * 0.003;
+        guiParams.offsetY -= deltaY * 0.003; // Inverted Y to match WebGL screen coordinate
+
+        // Clamp offsets
+        guiParams.offsetX = Math.max(-5.0, Math.min(guiParams.offsetX, 5.0));
+        guiParams.offsetY = Math.max(-5.0, Math.min(guiParams.offsetY, 5.0));
+
+        offsetXController.setValue(guiParams.offsetX);
+        offsetYController.setValue(guiParams.offsetY);
+
+        previousMousePosition = { x: e.clientX, y: e.clientY };
+      }
+    });
+
+    window.addEventListener('pointerup', () => {
+      isDragging = false;
+    });
+  }
+
+  let cumulativeTime = 0;
+  let lastTimestamp = 0;
+
+  function animate(timestamp) {
+    requestAnimationFrame( animate );
+
+    if (!lastTimestamp) lastTimestamp = timestamp;
+    let elapsed = timestamp - lastTimestamp;
+    lastTimestamp = timestamp;
+
+    if (elapsed > 100) elapsed = 100; // Cap frame time jumps
+    cumulativeTime += elapsed * guiParams.animSpeed;
+
+    render(cumulativeTime);
+  }
+
+  function render(timeMs) {
+    let t = timeMs * 0.001; // seconds
+
+    // Compute dynamic offsets & zoom based on selected animation preset
+    let activeZoom = guiParams.zoom;
+    let activeOffset = new THREE.Vector2(guiParams.offsetX, guiParams.offsetY);
+
+    switch (guiParams.animation) {
+      case "Default Explorer":
+        // Base values controlled directly by GUI parameters
+        break;
+      case "Turbulent Sway":
+        // Dynamic horizontal/vertical camera swaying
+        activeOffset.x += Math.sin(t * 1.5) * 0.25;
+        activeOffset.y += Math.cos(t * 1.0) * 0.2;
+        break;
+      case "Cosmic Pulsation":
+        // Wave-like zoom pulsation
+        activeZoom *= (1.0 + Math.sin(t * 2.0) * 0.25);
+        break;
+      case "Spiral Vortex":
+        // Orbital panning pattern
+        activeOffset.x += Math.sin(t * 1.2) * 0.35;
+        activeOffset.y += Math.cos(t * 1.2) * 0.35;
+        break;
+      case "Hyperspace Jump":
+        // Rapid forward acceleration effect (zoom pulsing + slight vibration)
+        activeZoom *= (0.8 + Math.cos(t * 3.5) * 0.3);
+        activeOffset.x += Math.sin(t * 8.0) * 0.04;
+        activeOffset.y += Math.cos(t * 8.0) * 0.04;
+        break;
+    }
+
+    uniforms.u_zoom.value = activeZoom;
+    uniforms.u_offset.value.copy(activeOffset);
+    uniforms.u_time.value = -11200 + timeMs * 0.0015;
+
+    renderer.render( scene, camera );
+  }
+</script>
+
+</body>
+</html>
