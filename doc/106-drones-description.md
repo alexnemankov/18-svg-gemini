@@ -18,7 +18,7 @@ The project is a self-contained, real-time 3D simulation of a tactical drone swa
 
 ## 2. Flight Scenarios & Motion Patterns
 
-Toggle between two distinct scenarios in the **"Flight Scenario"** dropdown:
+Toggle between three distinct scenarios in the **"Flight Scenario"** dropdown:
 
 ### Scenario A: Tactical Chase
 In this mode, the camera follows a swarm flying along a 480-meter winding 3D spline trajectory through the ruins corridor.
@@ -39,10 +39,19 @@ In this mode, the camera remains stationary at `X = -120` looking across the cor
 * **6 Predefined Flight Patterns**:
   1. **Straight L-to-R** (Default): Parallel lines from left (`Z = -280`) to right (`Z = 200`).
   2. **Fan Out**: Drones launch from the left and diverge in randomized 3D directions.
-  3. **Attack Run**: Drones fly from the left background directly towards the observer camera, sweeping past the lens for a dramatic close-up.
+  3. **Attack Run**: Drones fly from the left background directly towards the observer camera, sweeping past the lens for a stunning, high-speed close-up flyby.
   4. **Crossfire**: Even drones fly left-to-right, odd drones fly right-to-left, crossing paths at various heights in the center.
   5. **Tactical Dive**: Drones start high in the sky (`Y = 70`–`90`m) and dive steeply down into the ruins corridor.
   6. **Slalom Weave**: Drones weave horizontally in smooth S-curves through the ruins structures.
+
+### Scenario C: Product Presentation
+In this mode, a single master drone remains at the screen origin to showcase its features as a 360-degree interactive product.
+* **Turntable Rotation**: The drone spins continuously around the selected axis at a customizable rotation speed.
+* **Rotation Axes**: Supports Yaw (Y-axis), Pitch (X-axis), Roll (Z-axis), or Diagonal Showcase (combined axes).
+* **Pivot Point Offset**: Shift the center of rotation to any X, Y, Z offset on the drone (e.g. wings, nose, camera lens) using a negative/positive translation offset system.
+* **Hover Floating**: A slow sin-wave hover oscillation simulates hovering float dynamics with adjustable amplitude and frequency.
+* **Neon Glow Showcase Grid Floor**: Renders a custom glowing grid shader plane at `Y = 0.05`. Features a fully customizable Cyan-to-Blue color gradient, an anti-aliased mathematical core (`fwidth`), a soft radial vignette fading out at the edges, and slow radial wave pulsations propagating from the center.
+* **Camera Integration**: The camera stands still looking at the drone, supporting scroll wheel zoom, panning, and yaw/pitch rotation offsets around the centered showcase.
 
 ---
 
@@ -51,33 +60,40 @@ In this mode, the camera remains stationary at `X = -120` looking across the cor
 The control interface (press **"H"** to show/hide) is grouped into five logical panels:
 
 ### Global & Environmental Controls
-* **Greenscreen (Background)**: Turns background green (`#00ff00`), hides the ruins ground, and disables fog for clean green-screen keying.
-* **Drone Material**: Selects the drone surface texture. Options include:
-  * *Standard*: Original, Military Olive, Stealth Black, Desert Camo, Rusty Scrap, Polished Chrome.
-  * *Procedural Shaders*: Toon Shading, Manual PBR, Velvet Cloth, Tron Grid, Procedural Marble, Thermal Camera, Hologram Scanlines, Hex Force Field, Iridescent, Lava Lamp, Comic Halftone, Digital Glitch, Wave Distortion, Pulse Glow.
-* **Drone Scale** (Range: `0.1` to `2.5`): Scales the physical size of all drone models.
+* **Greenscreen (Background)**: Turns background green (`#00ff00`), hides the ruins ground, and disables ground rendering for clean green-screen keying.
+* **Drone Material**: Selects the drone surface texture. Options include standard materials and 14 procedural shader presets.
+* **Drone Scale**: Scales the physical size of all drone models.
 * **Load Custom Skybox / Drone**: File uploaders to drag and drop custom panorama backgrounds and `.glb`/`.gltf` drone meshes directly into the browser.
 
 ### Swarm Chase Settings (Active in Tactical Chase)
 * **Drone Count**: Sets the number of active drones (`1` to `1000`).
-* **Formation Shape**: Sets the shape (`Line`, `V-Shape`, `Grid`, `Circle`, `Swarm (Sphere)`).
-* **Formation Spread**: Spacing between individual slots.
-* **Chaos / Turbulence**: Wind drift intensity.
-* **Flight Speed**: Base velocity of the swarm along the spline.
+* **Formation Shape / Formation Spread**: Shape and spacing.
+* **Chaos / Turbulence / Flight Speed**: Wind drift and trajectory velocity.
 
 ### Cinematic Flyover Settings (Active in Cinematic Flyover)
 * **Drone Count**: Sets the number of active drones (`1` to `1000`).
-* **Flight Pattern**: Selects one of the 6 flight behaviors.
-* **Swarm Mode (All Together)**: When enabled, compresses launch delays to a tight `2.5`-second window. Drones fly through the screen as a single massive cloud rather than a staggered stream.
-* **Launch Interval (Density)**: Adjusts the timeline launch delay gaps.
-* **Flight Speed & Speed Variation (Spread)**: Adjusts base velocity and introduces speed offsets between drones.
+* **Flight Pattern / Swarm Mode**: Selects flight path and enables compressed launch delays.
+* **Launch Interval (Density)**: Adjusts launch timeline spacing.
+* **Flight Speed & Speed Variation (Spread)**: Adjusts velocity and speed variations.
 * **Horizontal & Vertical Spread**: Scales the corridor width (`[2.0, 80.0]`) and altitude height scattering (`[0.0, 50.0]`).
-* **Camera Handshake** (Range: `0.0` to `3.0`): Simulates handheld camera tremor. Combines low-frequency rig drift (positional) and high-frequency panning tremor (rotational) using independent, prime-related wave frequencies.
+* **Camera Handshake**: Simulates organic handheld rig drift and panning tremor.
+
+### Presentation Settings (Active in Product Presentation)
+* **Rotation Speed & Rotation Axis**: Showcase turntable speed and axis alignment.
+* **Base Altitude**: Centering height of the drone.
+* **Enable Hover Float / Hover Amplitude / Hover Frequency**: Controls the sinusoidal auto-hovering physics.
+* **Pivot Point Offset (Pivot X, Pivot Y, Pivot Z)**: Adjusts the rotation center of the showcase model in real-time.
+* **Grid Floor Customizations**:
+  * *Show Grid Floor*: Toggles floor helper plane.
+  * *Grid Color*: HTML color picker for the core wireframe lines.
+  * *Glow Color*: HTML color picker for the soft outer neon glow.
+  * *Line Thickness*: Controls the pixel width scale (`[0.1, 5.0]`) of both core and outer lines.
+  * *Glow Intensity*: Multiplier (`[0.0, 3.0]`) for the neon glow brightness and center wave pulses.
 
 ### Camera Offset & Pan Controls
 * **Yaw & Pitch Offset**: Rotates the camera angle manually relative to the target anchor.
-* **Auto Orbit Camera**: Rotates the camera continuously around the target at a adjustable speed.
-* **Camera Pan Offset (X, Y, Z)**: Translates the camera and lookAt target parallel to the screen plane, allowing manual frame adjustment without disrupting flight calculations.
+* **Auto Orbit Camera / Orbit Speed**: Slowly rotates camera around the target.
+* **Camera Pan Offset (X, Y, Z)**: Translates the camera viewport parallel to the screen plane.
 
 ---
 
