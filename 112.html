@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Nova Shader</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000000;
+            width: 100%;
+            height: 100%;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+    <!-- Import map for lil-gui as requested -->
+    <script type="importmap">
+        {
+            "imports": {
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <!-- PixiJS v8 CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.js"></script>
+</head>
+<body>
+    <script type="module">
+        import GUI from 'lil-gui';
+
+        // Base vertex shader (standard PixiJS filter vertex shader)
+        const vertexShader = `
+            in vec2 aPosition;
+            out vec2 vTextureCoord;
+            uniform vec4 uInputSize;
+            uniform vec4 uOutputFrame;
+            uniform vec4 uOutputTexture;
+            
+            vec4 filterVertexPosition() {
+              vec2 position = aPosition * uOutputFrame.zw + uOutputFrame.xy;
+              position.x = position.x * (2.0 / uOutputTexture.x) - 1.0;
+              position.y = position.y * (2.0 * uOutputTexture.z / uOutputTexture.y) - uOutputTexture.z;
+              return vec4(position, 0.0, 1.0);
+            }
+            
+            vec2 filterTextureCoord() {
+              return aPosition * (uOutputFrame.zw * uInputSize.zw);
+            }
+            
+            void main() {
+              gl_Position = filterVertexPosition();
+              vTextureCoord = filterTextureCoord();
+            }
+        `;
+
+        // Fragment shader with zoom, greenscreen, and color customizations
+        const fragmentShader = `
+            precision highp float;
+
+            in vec2 vTextureCoord;
+            uniform vec2 uResolution;
+            uniform float uTime;
+            uniform float uCenterX;      // Center offset X (0.0 - 1.0)
+            uniform float uCenterY;      // Center offset Y (0.0 - 1.0)
+            uniform float uZoom;         // Zoom factor (scales coordinate space)
+            uniform float uGreenScreen;  // 1.0 to enable greenscreen, 0.0 otherwise
+            uniform vec3 uColorOffsets;  // RGB Phase shifts for sine wave color palette
+            uniform vec3 uColorScale;    // RGB color multipliers for final look
+
+            void main() {
+              // Calculate center position in pixels
+              vec2 center = vec2(uCenterX * uResolution.x, uCenterY * uResolution.y);
+              
+              // Calculate coordinate p, divided by uZoom to scale the star size
+              vec2 p = (vTextureCoord * uResolution * 2.0 - center * 2.0) / uResolution.y;
+              p = p / uZoom;
+              
+              float l = 1.0 - length(p);
+              
+              // Avoid negative values going to infinity
+              float divisor = max(l * 3.4, -l * 0.3);
+              divisor = max(divisor, 0.001); // Minimum threshold
+              
+              // Calculate color with RGB shift and custom offsets
+              vec4 col = (1.1 + sin(p.x + uTime * 1.5 + vec4(uColorOffsets, 0.0))) / 200.0 / divisor;
+              
+              // Manual tanh approximation: tanh(x) ≈ x / (1 + |x|)
+              vec4 o = col / (1.0 + abs(col));
+              
+              // Boost brightness and apply color scales
+              o.rgb *= 2.0 * uColorScale;
+              o.a *= 2.0;
+              
+              // If greenscreen is enabled, mix with pure green (#00ff00) based on shader luminosity
+              if (uGreenScreen > 0.5) {
+                  float alpha = clamp(max(max(o.r, o.g), o.b), 0.0, 1.0);
+                  gl_FragColor = vec4(mix(vec3(0.0, 1.0, 0.0), o.rgb, alpha), 1.0);
+              } else {
+                  gl_FragColor = o;
+              }
+            }
+        `;
+
+        // Preset color schemes
+        const colorPresets = {
+            'Nova Cosmic': { offsets: [0.0, 2.0, 4.0], scale: [1.0, 1.0, 1.0] },
+            'Supernova Flare': { offsets: [0.0, 0.8, 1.6], scale: [1.5, 0.6, 0.1] },
+            'Aurora Dreams': { offsets: [1.0, 2.5, 4.5], scale: [0.2, 1.3, 0.8] },
+            'Neon Cyberpunk': { offsets: [3.5, 0.5, 1.5], scale: [1.3, 0.1, 1.2] },
+            'Abyssal Glow': { offsets: [2.0, 3.5, 5.0], scale: [0.05, 0.7, 1.4] }
+        };
+
+        // Application State / GUI Parameters
+        const params = {
+            greenScreen: false,
+            dpr: window.devicePixelRatio || 1.0,
+            speed: 1.0,
+            animationPreset: 'Cosmic Drift',
+            colorPreset: 'Nova Cosmic',
+            colorTint: '#ffffff',
+            colorOffsetR: 0.0,
+            colorOffsetG: 2.0,
+            colorOffsetB: 4.0,
+            colorScaleR: 1.0,
+            colorScaleG: 1.0,
+            colorScaleB: 1.0,
+            
+            get zoom() { return baseZoom; },
+            set zoom(v) { baseZoom = v; },
+            
+            get centerX() { return baseCenterX; },
+            set centerX(v) { baseCenterX = v; },
+            
+            get centerY() { return baseCenterY; },
+            set centerY(v) { baseCenterY = v; }
+        };
+
+        // Base user-controlled translation/zoom variables
+        let baseCenterX = 0.5;
+        let baseCenterY = 0.5;
+        let baseZoom = 1.0;
+
+        // Runtime variables
+        let app = null;
+        let filter = null;
+        let graphics = null;
+        let uTime = 0;
+
+        // Parse hex to RGB array (0.0 to 1.0)
+        function hexToRgb(hex) {
+            const shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+            const fullHex = hex.replace(shorthandRegex, (m, r, g, b) => r + r + g + g + b + b);
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(fullHex);
+            return result ? [
+                parseInt(result[1], 16) / 255,
+                parseInt(result[2], 16) / 255,
+                parseInt(result[3], 16) / 255
+            ] : [1, 1, 1];
+        }
+
+        // Get final scaled RGB values factoring in the color tint
+        function getFinalColorScale() {
+            const tint = hexToRgb(params.colorTint);
+            return [
+                params.colorScaleR * tint[0],
+                params.colorScaleG * tint[1],
+                params.colorScaleB * tint[2]
+            ];
+        }
+
+        // Update uniforms that are not calculated per-frame in ticker
+        function updateColorUniforms() {
+            if (filter) {
+                filter.resources.uniforms.uniforms.uColorOffsets = [
+                    params.colorOffsetR,
+                    params.colorOffsetG,
+                    params.colorOffsetB
+                ];
+                filter.resources.uniforms.uniforms.uColorScale = getFinalColorScale();
+            }
+        }
+
+        // Initialize or Recreate PixiJS Application (essential for reliable DPR changes)
+        async function initPixi() {
+            if (app) {
+                app.ticker.stop();
+                app.destroy(true, { children: true, texture: true, baseTexture: true });
+            }
+
+            app = new PIXI.Application();
+            await app.init({
+                background: '#000000',
+                resizeTo: window,
+                resolution: params.dpr,
+                autoDensity: true
+            });
+            document.body.appendChild(app.canvas);
+
+            filter = new PIXI.Filter({
+                glProgram: PIXI.GlProgram.from({
+                    vertex: vertexShader,
+                    fragment: fragmentShader
+                }),
+                resources: {
+                    uniforms: {
+                        uTime: { value: uTime, type: 'f32' },
+                        uResolution: { value: [app.screen.width, app.screen.height], type: 'vec2<f32>' },
+                        uCenterX: { value: baseCenterX, type: 'f32' },
+                        uCenterY: { value: baseCenterY, type: 'f32' },
+                        uZoom: { value: baseZoom, type: 'f32' },
+                        uGreenScreen: { value: params.greenScreen ? 1.0 : 0.0, type: 'f32' },
+                        uColorOffsets: { value: [params.colorOffsetR, params.colorOffsetG, params.colorOffsetB], type: 'vec3<f32>' },
+                        uColorScale: { value: getFinalColorScale(), type: 'vec3<f32>' }
+                    }
+                }
+            });
+
+            graphics = new PIXI.Graphics();
+            graphics.rect(0, 0, app.screen.width, app.screen.height);
+            graphics.fill(0x000000);
+            graphics.filters = [filter];
+            app.stage.addChild(graphics);
+
+            // Infinite Animation Loop Ticker
+            app.ticker.add((ticker) => {
+                const deltaSeconds = ticker.elapsedMS / 1000;
+                uTime += deltaSeconds * params.speed;
+
+                // Animate the center and zoom based on current selected animation preset
+                let activeCenterX = baseCenterX;
+                let activeCenterY = baseCenterY;
+                let activeZoom = baseZoom;
+
+                if (params.animationPreset === 'Cosmic Drift') {
+                    activeCenterX += Math.cos(uTime * 0.4) * 0.15;
+                    activeCenterY += Math.sin(uTime * 0.4) * 0.15;
+                } else if (params.animationPreset === 'Ethereal Pulse') {
+                    activeCenterX += Math.sin(uTime * 0.3) * 0.1;
+                    activeCenterY += Math.cos(uTime * 0.5) * 0.08;
+                    activeZoom += Math.sin(uTime * 0.25) * (baseZoom * 0.3);
+                } else if (params.animationPreset === 'Nova Wobble') {
+                    activeCenterX += Math.sin(uTime * 0.5) * 0.12;
+                    activeCenterY += Math.sin(uTime * 0.8) * 0.08;
+                } else if (params.animationPreset === 'Infinity Loop') {
+                    const speed = 0.3;
+                    const denom = 1.0 + Math.pow(Math.sin(uTime * speed), 2);
+                    activeCenterX += (Math.cos(uTime * speed) * 0.2) / denom;
+                    activeCenterY += (Math.sin(uTime * speed) * Math.cos(uTime * speed) * 0.2) / denom;
+                } else if (params.animationPreset === 'Sinking Orbit') {
+                    const radius = 0.12 + Math.sin(uTime * 0.15) * 0.05;
+                    activeCenterX += Math.cos(uTime * 0.35) * radius;
+                    activeCenterY += Math.sin(uTime * 0.35) * radius;
+                    activeZoom += Math.cos(uTime * 0.2) * (baseZoom * 0.15);
+                }
+
+                // Update dynamic uniforms
+                filter.resources.uniforms.uniforms.uTime = uTime;
+                filter.resources.uniforms.uniforms.uCenterX = activeCenterX;
+                filter.resources.uniforms.uniforms.uCenterY = activeCenterY;
+                filter.resources.uniforms.uniforms.uZoom = activeZoom;
+            });
+        }
+
+        // Initialize App
+        await initPixi();
+
+        // Window resize event handler
+        window.addEventListener('resize', () => {
+            if (app && graphics && filter) {
+                graphics.clear();
+                graphics.rect(0, 0, app.screen.width, app.screen.height);
+                graphics.fill(0x000000);
+                filter.resources.uniforms.uniforms.uResolution = [app.screen.width, app.screen.height];
+            }
+        });
+
+        // Pointer event drag interaction
+        let isDragging = false;
+        let prevPosition = { x: 0, y: 0 };
+
+        window.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('.lil-gui')) return;
+            isDragging = true;
+            prevPosition.x = e.clientX;
+            prevPosition.y = e.clientY;
+        });
+
+        window.addEventListener('pointermove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - prevPosition.x;
+            const dy = e.clientY - prevPosition.y;
+
+            // Sensitivity adjusts according to zoom to feel pinned under the mouse cursor
+            const sens = 1.0 / baseZoom;
+            baseCenterX += (dx / window.innerWidth) * sens;
+            baseCenterY += (dy / window.innerHeight) * sens;
+
+            prevPosition.x = e.clientX;
+            prevPosition.y = e.clientY;
+        });
+
+        window.addEventListener('pointerup', () => {
+            isDragging = false;
+        });
+
+        // Wheel zoom interaction
+        window.addEventListener('wheel', (e) => {
+            if (e.target.closest('.lil-gui')) return;
+            
+            const zoomFactor = 0.1;
+            if (e.deltaY < 0) {
+                baseZoom *= (1.0 + zoomFactor);
+            } else {
+                baseZoom /= (1.0 + zoomFactor);
+            }
+
+            // Clamping zoom range
+            baseZoom = Math.max(0.1, Math.min(10.0, baseZoom));
+        }, { passive: true });
+
+        // Show/Hide UI with 'H' key
+        window.addEventListener('keydown', (e) => {
+            if (document.activeElement.tagName === 'INPUT') return;
+            if (e.key === 'h' || e.key === 'H') {
+                if (gui._hidden) {
+                    gui.show();
+                } else {
+                    gui.hide();
+                }
+            }
+        });
+
+        // Setting up standard GUI
+        const gui = new GUI({ title: 'Nova Settings' });
+
+        gui.add(params, 'greenScreen').name('Green Screen').onChange(v => {
+            if (filter) {
+                filter.resources.uniforms.uniforms.uGreenScreen = v ? 1.0 : 0.0;
+            }
+        });
+
+        gui.add(params, 'dpr', [0.5, 0.75, 1.0, 1.5, 2.0]).name('DPR (Pixel Ratio)').onChange(async () => {
+            await initPixi();
+        });
+
+        gui.add(params, 'speed', 0.0, 3.0).name('Animation Speed');
+
+        gui.add(params, 'animationPreset', [
+            'Cosmic Drift',
+            'Ethereal Pulse',
+            'Nova Wobble',
+            'Infinity Loop',
+            'Sinking Orbit'
+        ]).name('Animation');
+
+        // Color Settings folder
+        const colorFolder = gui.addFolder('Colors');
+
+        colorFolder.add(params, 'colorPreset', Object.keys(colorPresets)).name('Preset Scheme').onChange(v => {
+            const preset = colorPresets[v];
+            params.colorOffsetR = preset.offsets[0];
+            params.colorOffsetG = preset.offsets[1];
+            params.colorOffsetB = preset.offsets[2];
+            params.colorScaleR = preset.scale[0];
+            params.colorScaleG = preset.scale[1];
+            params.colorScaleB = preset.scale[2];
+            updateColorUniforms();
+        });
+
+        colorFolder.addColor(params, 'colorTint').name('Color Tint').onChange(updateColorUniforms);
+
+        const offsetFolder = colorFolder.addFolder('Phase Offsets');
+        offsetFolder.add(params, 'colorOffsetR', 0.0, 6.28).name('Red Offset').onChange(updateColorUniforms);
+        offsetFolder.add(params, 'colorOffsetG', 0.0, 6.28).name('Green Offset').onChange(updateColorUniforms);
+        offsetFolder.add(params, 'colorOffsetB', 0.0, 6.28).name('Blue Offset').onChange(updateColorUniforms);
+
+        const scaleFolder = colorFolder.addFolder('RGB Scales');
+        scaleFolder.add(params, 'colorScaleR', 0.0, 3.0).name('Red Scale').onChange(updateColorUniforms);
+        scaleFolder.add(params, 'colorScaleG', 0.0, 3.0).name('Green Scale').onChange(updateColorUniforms);
+        scaleFolder.add(params, 'colorScaleB', 0.0, 3.0).name('Blue Scale').onChange(updateColorUniforms);
+
+        // Camera Settings folder
+        const cameraFolder = gui.addFolder('Camera');
+        cameraFolder.add(params, 'zoom', 0.1, 10.0).name('Zoom').listen();
+        cameraFolder.add(params, 'centerX', -1.0, 2.0).name('Center X').listen();
+        cameraFolder.add(params, 'centerY', -1.0, 2.0).name('Center Y').listen();
+
+        // Close UI by default
+        gui.close();
+
+    </script>
+</body>
+</html>
