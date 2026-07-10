@@ -97,7 +97,21 @@ The control interface (press **"H"** to show/hide) is grouped into five logical 
 
 ---
 
-## 4. Hardware-Accelerated 4K Video Exporter
+## 4. Proprietary Custom Drone Propeller Mapping
+When custom GLB drone meshes are loaded:
+* Meshes matching `"propeller"`, `"rotor"`, `"blade"`, `"spin"`, or `"baling"` in their naming hierarchy are mapped to spin on the **Y-axis (Yaw)** (default vertical-lift drone rotors).
+* Meshes containing a `_x` or `x` suffix (e.g. `rotor_x`, `rotorx`), or containing `"rough aluminum"`, `"rough_aluminum"`, `"aluminum_0"`, or `"v_rough"`, are mapped to spin on the **X-axis (Pitch)**.
+* Meshes containing a `_z` or `z` suffix (e.g. `rotor_z`, `rotorz`, `propellerz`) are mapped to spin on the **Z-axis (Roll)** (transverse/stabilizing propellers).
+
+### Exclusion Filters (Stationary Spinner/Nose Cones)
+To prevent nose cones or spinners from spinning independently of the fuselage, meshes containing `"cone"` in their naming hierarchy are automatically excluded from the animation arrays and remain stationary.
+
+### Wobble-Free Quaternion Rotation
+To prevent cross-axis wobbling (which happens when Euler rotation coordinates are added sequentially on top of pre-existing tilted model orientations), the simulation caches each propeller's initial orientation as a quaternion (`initialQuaternion`). Every frame, the propeller is restored to this base quaternion and rotated locally via `.rotateX()`, `.rotateY()`, or `.rotateZ()`, keeping the rotation strictly locked to the target local axis.
+
+---
+
+## 5. Hardware-Accelerated 4K Video Exporter
 
 The simulation includes a high-fidelity video rendering button: **"Export 20s 4K MP4 Video"**.
 
