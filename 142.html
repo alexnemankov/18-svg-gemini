@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fractal Light Tunnel</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .lil-gui.root {
+      --width: 320px;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm";
+
+    const vertexShader = /* glsl */ `
+      precision highp float;
+
+      attribute vec2 position;
+
+      void main() {
+        gl_Position = vec4(position, 0.0, 1.0);
+      }
+    `;
+
+    const fragmentShader = /* glsl */ `
+      precision highp float;
+      precision highp int;
+
+      #ifndef TRACE_STEPS
+        #define TRACE_STEPS 380
+      #endif
+
+      uniform vec2 uResolution;
+      uniform float uTime;
+
+      uniform float uCameraSpeed;
+      uniform float uFractalSpeed;
+      uniform float uFov;
+
+      uniform float uFractalScale;
+      uniform float uTurbulence;
+      uniform float uBoxSize;
+      uniform float uGlowStrength;
+      uniform float uGlowWidth;
+      uniform float uMirrorTileSize;
+      uniform float uWallNormalScale;
+
+      uniform vec3 uSoftTint;
+      uniform vec3 uCoreTint;
+      uniform vec3 uBackgroundColor;
+      uniform float uPaletteShift;
+      uniform float uExposure;
+      uniform float uGamma;
+
+      // Interactive camera uniforms
+      uniform mat4 uCameraMatrix;
+      uniform vec3 uCameraPosition;
+
+      const vec2 TUNNEL_HALF_SIZE = vec2(4.6, 2.15);
+      const vec2 SCREEN_STRETCH = vec2(1.0, 1.19);
+      const vec3 AXIS_OFFSET = vec3(5.0, 0.0, 1.0);
+      const vec3 COLOR_OFFSET = vec3(-0.750, 0.409, 1.310);
+
+      vec3 buildTransformAxis(float time) {
+        return normalize(cos(AXIS_OFFSET + time * 0.25));
+      }
+
+      vec3 transformPoint(vec3 point, vec3 axis) {
+        return axis * dot(axis, point) - cross(axis, point);
+      }
+
+      float sampleLightField(
+        vec3 point,
+        vec3 axis,
+        float time,
+        float baseFrequency,
+        float baseAmplitude,
+        out float animationPhase
+      ) {
+        vec3 basePoint = transformPoint(point, axis);
+        vec3 distortedPoint = basePoint;
+
+        float frequency = baseFrequency;
+        distortedPoint -= sin(
+          ceil(distortedPoint * frequency) + time
+        ).zxy * baseAmplitude;
+
+        frequency = baseFrequency * 2.0;
+        distortedPoint -= sin(
+          ceil(distortedPoint * frequency) + time
+        ).zxy * (baseAmplitude * 0.5);
+
+        frequency = baseFrequency * 3.0;
+        distortedPoint -= sin(
+          ceil(distortedPoint * frequency) + time
+        ).zxy * (baseAmplitude * 0.3333333333);
+
+        animationPhase = distortedPoint.y + time;
+
+        vec3 boxPoint = abs(basePoint);
+        float boxField = max(
+          boxPoint.x,
+          max(boxPoint.y, boxPoint.z)
+        ) - uBoxSize;
+
+        float foldedField = max(
+          boxField,
+          -boxField * 0.2
+        );
+
+        return foldedField + 0.2 * abs(cos(animationPhase));
+      }
+
+      vec3 getTunnelSurfaceData(
+        vec2 point,
+        float mirrorPeriod,
+        float inverseMirrorPeriod,
+        float inverseMirrorTile
+      ) {
+        vec2 signedWall = abs(point) - TUNNEL_HALF_SIZE;
+        vec2 wallDistance2D = abs(signedWall);
+
+        float verticalWall = step(
+          wallDistance2D.x,
+          wallDistance2D.y
+        );
+
+        float wallDistance = min(
+          wallDistance2D.x,
+          wallDistance2D.y
+        );
+
+        float normalCoordinate = mix(
+          signedWall.y,
+          signedWall.x,
+          verticalWall
+        ) * uWallNormalScale;
+
+        float tangentCoordinate = mix(
+          point.x,
+          point.y,
+          verticalWall
+        );
+
+        float localCoordinate = fract(
+          abs(tangentCoordinate) * inverseMirrorPeriod
+        ) * mirrorPeriod;
+
+        float mirrorCoordinate = 1.0 - abs(
+          localCoordinate - uMirrorTileSize
+        ) * inverseMirrorTile;
+
+        return vec3(
+          wallDistance,
+          normalCoordinate,
+          mirrorCoordinate
+        );
+      }
+
+      vec3 renderTunnel(
+        vec3 rayOrigin,
+        vec3 rayDirection,
+        float animationTime
+      ) {
+        vec3 accumulatedLight = vec3(0.0);
+        vec3 transformAxis = buildTransformAxis(animationTime);
+
+        float safeFractalScale = max(uFractalScale, 0.0001);
+        float baseAmplitude = uTurbulence / safeFractalScale;
+
+        float safeMirrorTile = max(uMirrorTileSize, 0.001);
+        float inverseMirrorTile = 1.0 / safeMirrorTile;
+        float mirrorPeriod = safeMirrorTile * 2.2;
+        float inverseMirrorPeriod = 1.0 / mirrorPeriod;
+
+        float travelDistance = 2.86;
+
+        for (int stepIndex = 0; stepIndex < TRACE_STEPS; stepIndex++) {
+          vec3 samplePoint = rayOrigin + rayDirection * travelDistance;
+
+          vec3 surfaceData = getTunnelSurfaceData(
+            samplePoint.xy,
+            mirrorPeriod,
+            inverseMirrorPeriod,
+            inverseMirrorTile
+          );
+
+          float wallDistance = surfaceData.x;
+          float mirrorCoordinate = surfaceData.z * 2.0 - 1.0;
+          float repeatedDepth = mod(samplePoint.z + 3.1, 10.0) - 5.0;
+
+          vec3 fieldPoint = vec3(
+            surfaceData.y,
+            mirrorCoordinate * 2.8,
+            repeatedDepth * 0.82
+          );
+
+          float animationPhase;
+          float fieldValue = sampleLightField(
+            fieldPoint,
+            transformAxis,
+            animationTime,
+            safeFractalScale,
+            baseAmplitude,
+            animationPhase
+          );
+
+          float fieldGlow = uGlowStrength / (
+            uGlowWidth + fieldValue * fieldValue
+          );
+
+          float colorPhase =
+            animationPhase - animationTime * 0.3 + uPaletteShift;
+
+          vec3 originalPalette = cos(
+            vec3(colorPhase) + COLOR_OFFSET
+          ) + 1.1;
+
+          float coreMix = clamp(
+            fieldGlow * 0.22,
+            0.0,
+            1.0
+          );
+
+          vec3 emissionColor = originalPalette * mix(
+            uSoftTint,
+            uCoreTint,
+            coreMix
+          );
+
+          float squaredWallDistance = wallDistance * wallDistance;
+          float softWall = 1.0 / (
+            1.0 + squaredWallDistance * 120.0
+          );
+
+          float sharpWall = 1.2 / (
+            1.0 + squaredWallDistance * 1400.0
+          );
+
+          float reflectionPattern = 0.55 + 0.45 * cos(
+            mirrorCoordinate * 10.0 + repeatedDepth * 0.45
+          );
+
+          float wallDensity =
+            softWall * (0.08 + fieldGlow * 0.76) +
+            sharpWall * (0.14 + fieldGlow * 3.4);
+
+          wallDensity *= 0.81 + reflectionPattern * 0.16;
+
+          float depthAttenuation = 1.0 / (
+            1.0 +
+            travelDistance * 0.06 +
+            travelDistance * travelDistance * 0.0025
+          );
+
+          accumulatedLight +=
+            emissionColor *
+            wallDensity *
+            depthAttenuation *
+            0.09;
+
+          travelDistance += 0.15 - travelDistance * 0.0008;
+        }
+
+        return accumulatedLight;
+      }
+
+      void main() {
+        vec2 screenPosition = (
+          gl_FragCoord.xy * 2.0 - uResolution.xy
+        ) / uResolution.y;
+
+        float animationTime = uTime * uFractalSpeed;
+
+        // Interactive camera support
+        vec3 cameraOrigin = uCameraPosition + vec3(
+          0.0,
+          0.0,
+          uTime * uCameraSpeed
+        );
+
+        // Map camera-space ray (facing -Z in Three.js) to world space
+        vec3 localDirection = normalize(
+          vec3(screenPosition * SCREEN_STRETCH, -uFov)
+        );
+
+        vec3 cameraDirection = normalize(
+          (uCameraMatrix * vec4(localDirection, 0.0)).xyz
+        );
+
+        vec3 color = renderTunnel(
+          cameraOrigin,
+          cameraDirection,
+          animationTime
+        );
+
+        float blackOpening = smoothstep(
+          -0.04,
+          0.18,
+          length(screenPosition)
+        );
+
+        color *= blackOpening;
+        color = 1.0 - exp(-color * uExposure);
+        color = pow(max(color, vec3(0.0)), vec3(uGamma));
+        color = mix(uBackgroundColor, color, blackOpening);
+
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `;
+
+    const scene = new THREE.Scene();
+    
+    // Create camera group to host camera and keep OrbitControls behavior independent of parent animation sways
+    const cameraGroup = new THREE.Group();
+    scene.add(cameraGroup);
+
+    // Use PerspectiveCamera so OrbitControls can calculate zoom/drag rotations properly
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, -5); // Position camera looking forward along +Z (towards target at (0,0,0))
+    cameraGroup.add(camera);
+
+    scene.matrixAutoUpdate = false;
+    scene.matrixWorldAutoUpdate = false;
+    camera.matrixAutoUpdate = false;
+    camera.matrixWorldAutoUpdate = false;
+
+    const uniforms = {
+      uResolution: { value: new THREE.Vector2(1, 1) },
+      uTime: { value: 0 },
+
+      uCameraSpeed: { value: 2.6 },
+      uFractalSpeed: { value: 1.0 },
+      uFov: { value: 1.5 },
+
+      uFractalScale: { value: 1.0 },
+      uTurbulence: { value: 1.0 },
+      uBoxSize: { value: 3.2 },
+      uGlowStrength: { value: 0.06 },
+      uGlowWidth: { value: 0.05 },
+      uMirrorTileSize: { value: 4.0 },
+      uWallNormalScale: { value: 4.0 },
+
+      uSoftTint: { value: new THREE.Color(0xffffff) },
+      uCoreTint: { value: new THREE.Color(0xffffff) },
+      uBackgroundColor: { value: new THREE.Color(0x000000) },
+      uPaletteShift: { value: 0.0 },
+      uExposure: { value: 2.0 },
+      uGamma: { value: 0.5815 },
+
+      // Interactive camera uniforms
+      uCameraMatrix: { value: new THREE.Matrix4() },
+      uCameraPosition: { value: new THREE.Vector3() }
+    };
+
+    const material = new THREE.RawShaderMaterial({
+      uniforms,
+      defines: {
+        TRACE_STEPS: 380
+      },
+      vertexShader,
+      fragmentShader,
+      depthTest: false,
+      depthWrite: false,
+      transparent: false,
+      blending: THREE.NoBlending
+    });
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(
+        [-1, -1, 3, -1, -1, 3],
+        2
+      )
+    );
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.matrixAutoUpdate = false;
+    mesh.matrixWorldAutoUpdate = false;
+    scene.add(mesh);
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: false,
+      powerPreference: "high-performance"
+    });
+
+    renderer.autoClear = false;
+    renderer.sortObjects = false;
+    renderer.setClearColor(0x000000, 1);
+    document.body.appendChild(renderer.domElement);
+
+    // Initialize OrbitControls
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    const params = {
+      dpr: 0.5,
+      traceSteps: 380,
+      cameraSpeed: 2.6,
+      fractalSpeed: 1.0,
+      fieldScale: 1.0,
+      turbulence: 1.0,
+      boxSize: 3.2,
+      glowIntensity: 0.06,
+      glowWidth: 0.05,
+      mirrorSize: 4.0,
+      wallScale: 4.0,
+      fov: 1.5,
+      softLight: "#ffffff",
+      coreLight: "#ffffff",
+      background: "#000000",
+      paletteShift: 0.0,
+      exposure: 2.0,
+      gamma: 0.5815,
+
+      // New settings parameters
+      greenscreen: false,
+      colorScheme: "Neon Cyber",
+      animation: "Classic Fly",
+      animationSpeed: 1.0
+    };
+
+    const colorSchemes = {
+      "Neon Cyber": { softLight: "#ff007f", coreLight: "#00ffff", background: "#050010", paletteShift: 0.0 },
+      "Solar Flare": { softLight: "#ffaa00", coreLight: "#ff3300", background: "#120200", paletteShift: 1.2 },
+      "Acid Matrix": { softLight: "#00ff66", coreLight: "#ffff00", background: "#000b04", paletteShift: -1.8 },
+      "Deep Ocean": { softLight: "#0088ff", coreLight: "#00ffe1", background: "#00050d", paletteShift: 2.5 },
+      "Cosmic Aurora": { softLight: "#a100ff", coreLight: "#ff00aa", background: "#08000f", paletteShift: -0.5 },
+      "Original": { softLight: "#ffffff", coreLight: "#ffffff", background: "#000000", paletteShift: 0.0 }
+    };
+
+    const gui = new GUI({
+      title: "Fractal Light Tunnel"
+    });
+
+    const bindUniform = (
+      folder,
+      property,
+      uniform,
+      min,
+      max,
+      step,
+      label
+    ) => {
+      return folder
+        .add(params, property, min, max, step)
+        .name(label)
+        .onChange((value) => {
+          uniforms[uniform].value = value;
+        });
+    };
+
+    // Color Preset handler
+    function applyColorScheme(name) {
+      if (name === "Custom") return;
+      const scheme = colorSchemes[name];
+      if (scheme) {
+        params.softLight = scheme.softLight;
+        params.coreLight = scheme.coreLight;
+        params.background = scheme.background;
+        params.paletteShift = scheme.paletteShift;
+
+        uniforms.uSoftTint.value.set(params.softLight);
+        uniforms.uCoreTint.value.set(params.coreLight);
+        if (params.greenscreen) {
+          uniforms.uBackgroundColor.value.set("#00ff00");
+        } else {
+          uniforms.uBackgroundColor.value.set(params.background);
+        }
+        uniforms.uPaletteShift.value = params.paletteShift;
+
+        softLightCtrl.updateDisplay();
+        coreLightCtrl.updateDisplay();
+        backgroundCtrl.updateDisplay();
+        paletteShiftCtrl.updateDisplay();
+      }
+    }
+
+    const onManualColorChange = () => {
+      params.colorScheme = "Custom";
+      colorPresetCtrl.updateDisplay();
+    };
+
+    // Preset / System controls at top level
+    const colorPresetCtrl = gui.add(params, "colorScheme", ["Neon Cyber", "Solar Flare", "Acid Matrix", "Deep Ocean", "Cosmic Aurora", "Original", "Custom"])
+      .name("Color Preset")
+      .onChange(applyColorScheme);
+
+    const animationPresetCtrl = gui.add(params, "animation", ["Classic Fly", "Infinite Helix", "Gentle Sway", "Scanning Drift", "Static View"])
+      .name("Animation Preset")
+      .onChange((val) => {
+        // Reset camera group position/rotation on preset change
+        cameraGroup.position.set(0, 0, 0);
+        cameraGroup.rotation.set(0, 0, 0);
+      });
+
+    gui.add(params, "animationSpeed", 0.0, 5.0, 0.1).name("Speed Scale");
+
+    const renderFolder = gui.addFolder("Render");
+    renderFolder
+      .add(params, "dpr", 0.25, 2.0, 0.05)
+      .name("DPR")
+      .onChange(resizeRenderer);
+
+    renderFolder
+      .add(params, "traceSteps", 80, 420, 1)
+      .name("Trace Steps")
+      .onFinishChange((value) => {
+        material.defines.TRACE_STEPS = Math.round(value);
+        material.needsUpdate = true;
+      });
+
+    const cameraFolder = gui.addFolder("Camera");
+    bindUniform(
+      cameraFolder,
+      "cameraSpeed",
+      "uCameraSpeed",
+      0.0,
+      8.0,
+      0.01,
+      "Camera Speed"
+    );
+    bindUniform(
+      cameraFolder,
+      "fov",
+      "uFov",
+      0.7,
+      2.8,
+      0.01,
+      "FOV"
+    );
+
+    const fractalFolder = gui.addFolder("Fractal Light");
+    bindUniform(
+      fractalFolder,
+      "fractalSpeed",
+      "uFractalSpeed",
+      0.0,
+      3.0,
+      0.01,
+      "Fractal Speed"
+    );
+    bindUniform(
+      fractalFolder,
+      "fieldScale",
+      "uFractalScale",
+      0.35,
+      2.5,
+      0.01,
+      "Field Scale"
+    );
+    bindUniform(
+      fractalFolder,
+      "turbulence",
+      "uTurbulence",
+      0.0,
+      2.5,
+      0.01,
+      "Turbulence"
+    );
+    bindUniform(
+      fractalFolder,
+      "boxSize",
+      "uBoxSize",
+      1.5,
+      5.0,
+      0.01,
+      "Structure Size"
+    );
+    bindUniform(
+      fractalFolder,
+      "glowIntensity",
+      "uGlowStrength",
+      0.005,
+      0.2,
+      0.001,
+      "Glow Intensity"
+    );
+    bindUniform(
+      fractalFolder,
+      "glowWidth",
+      "uGlowWidth",
+      0.005,
+      0.2,
+      0.001,
+      "Glow Width"
+    );
+    bindUniform(
+      fractalFolder,
+      "mirrorSize",
+      "uMirrorTileSize",
+      0.5,
+      10.0,
+      0.01,
+      "Mirror Size"
+    );
+    bindUniform(
+      fractalFolder,
+      "wallScale",
+      "uWallNormalScale",
+      0.5,
+      12.0,
+      0.01,
+      "Wall Scale"
+    );
+
+    const colorsFolder = gui.addFolder("Colors");
+    
+    colorsFolder.add(params, "greenscreen")
+      .name("Green Screen")
+      .onChange((val) => {
+        if (val) {
+          uniforms.uBackgroundColor.value.set("#00ff00");
+        } else {
+          uniforms.uBackgroundColor.value.set(params.background);
+        }
+      });
+
+    const softLightCtrl = colorsFolder
+      .addColor(params, "softLight")
+      .name("Soft Light")
+      .onChange((value) => {
+        uniforms.uSoftTint.value.set(value);
+        onManualColorChange();
+      });
+
+    const coreLightCtrl = colorsFolder
+      .addColor(params, "coreLight")
+      .name("Core Light")
+      .onChange((value) => {
+        uniforms.uCoreTint.value.set(value);
+        onManualColorChange();
+      });
+
+    const backgroundCtrl = colorsFolder
+      .addColor(params, "background")
+      .name("Background")
+      .onChange((value) => {
+        if (!params.greenscreen) {
+          uniforms.uBackgroundColor.value.set(value);
+        }
+        onManualColorChange();
+      });
+
+    const paletteShiftCtrl = colorsFolder
+      .add(params, "paletteShift", -3.1416, 3.1416, 0.001)
+      .name("Palette Shift")
+      .onChange((value) => {
+        uniforms.uPaletteShift.value = value;
+        onManualColorChange();
+      });
+
+    bindUniform(
+      colorsFolder,
+      "exposure",
+      "uExposure",
+      0.2,
+      5.0,
+      0.01,
+      "Exposure"
+    );
+    bindUniform(
+      colorsFolder,
+      "gamma",
+      "uGamma",
+      0.2,
+      1.4,
+      0.001,
+      "Gamma"
+    );
+
+    // Apply default color preset
+    applyColorScheme("Neon Cyber");
+
+    gui.close();
+
+    // Toggle GUI with "H" key
+    let guiVisible = true;
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "h" || event.key === "H") {
+        guiVisible = !guiVisible;
+        if (guiVisible) {
+          gui.show();
+        } else {
+          gui.hide();
+        }
+      }
+    });
+
+    const drawingBufferSize = new THREE.Vector2();
+
+    function resizeRenderer() {
+      renderer.setPixelRatio(params.dpr);
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+      // Adjust camera aspect ratio for PerspectiveCamera
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      renderer.getDrawingBufferSize(drawingBufferSize);
+      uniforms.uResolution.value.copy(drawingBufferSize);
+    }
+
+    let lastTime = performance.now();
+    let accumulatedTime = 0;
+    const worldPosition = new THREE.Vector3();
+
+    function render(timestamp) {
+      const dt = (timestamp - lastTime) * 0.001;
+      lastTime = timestamp;
+
+      // Accumulate time scaled by animation speed
+      accumulatedTime += dt * params.animationSpeed;
+      uniforms.uTime.value = accumulatedTime;
+
+      // Update camera animation path based on preset
+      const time = accumulatedTime;
+      if (params.animation === "Classic Fly") {
+        cameraGroup.position.set(0, 0, 0);
+        cameraGroup.rotation.set(0, 0, 0);
+        uniforms.uCameraSpeed.value = params.cameraSpeed;
+      } else if (params.animation === "Infinite Helix") {
+        const angle = time * 0.4;
+        const radius = 1.0;
+        cameraGroup.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius, 0.0);
+        cameraGroup.rotation.set(0, 0, 0);
+        uniforms.uCameraSpeed.value = params.cameraSpeed;
+      } else if (params.animation === "Gentle Sway") {
+        const swayX = Math.sin(time * 0.3) * 1.5;
+        const swayY = Math.cos(time * 0.5) * 0.8;
+        cameraGroup.position.set(swayX, swayY, 0.0);
+        cameraGroup.rotation.set(0, 0, 0);
+        uniforms.uCameraSpeed.value = params.cameraSpeed;
+      } else if (params.animation === "Scanning Drift") {
+        const driftX = Math.sin(time * 0.2) * 2.0;
+        cameraGroup.position.set(driftX, 0.0, 0.0);
+        cameraGroup.rotation.set(0.0, Math.sin(time * 0.2) * 0.15, 0.0);
+        uniforms.uCameraSpeed.value = params.cameraSpeed;
+      } else if (params.animation === "Static View") {
+        cameraGroup.position.set(0, 0, 0);
+        cameraGroup.rotation.set(0, 0, 0);
+        uniforms.uCameraSpeed.value = 0.0;
+      }
+
+      // Update camera world matrix and world position uniforms
+      camera.updateMatrixWorld();
+      uniforms.uCameraMatrix.value.copy(camera.matrixWorld);
+
+      camera.getWorldPosition(worldPosition);
+      uniforms.uCameraPosition.value.copy(worldPosition);
+
+      // Smooth camera interpolation/updates by OrbitControls
+      controls.update();
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    window.addEventListener("resize", resizeRenderer, { passive: true });
+
+    resizeRenderer();
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

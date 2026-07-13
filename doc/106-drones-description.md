@@ -50,8 +50,9 @@ In this mode, a single master drone remains at the screen origin to showcase its
 * **Rotation Axes**: Supports Yaw (Y-axis), Pitch (X-axis), Roll (Z-axis), or Diagonal Showcase (combined axes).
 * **Pivot Point Offset**: Shift the center of rotation to any X, Y, Z offset on the drone (e.g. wings, nose, camera lens) using a negative/positive translation offset system.
 * **Hover Floating**: A slow sin-wave hover oscillation simulates hovering float dynamics with adjustable amplitude and frequency.
-* **Neon Glow Showcase Grid Floor**: Renders a custom glowing grid shader plane at `Y = 0.05`. Features a fully customizable Cyan-to-Blue color gradient, an anti-aliased mathematical core (`fwidth`), a soft radial vignette fading out at the edges, and slow radial wave pulsations propagating from the center.
+* **Neon Glow Showcase Grid Floor**: Renders a custom glowing grid shader plane at `Y = 0.05`. Features a fully customizable grid color and glow color, line thickness settings, and adjustable neon glow intensity.
 * **Camera Integration**: The camera stands still looking at the drone, supporting scroll wheel zoom, panning, and yaw/pitch rotation offsets around the centered showcase.
+* **Presentation Particle Effects**: Swarms of dynamic particles drift around the drone to highlight its engineering and aesthetics. Features **7 selectable effects styles** (Cyber Plexus network, Golden Glitter sparkles, Fiery Embers, swirly Cosmic Nebula, falling Sakura Petals, Electric Storm jagged lightning, and falling Matrix code rain) with custom size, speed, spread, count, and color pickers.
 
 ---
 
@@ -83,12 +84,16 @@ The control interface (press **"H"** to show/hide) is grouped into five logical 
 * **Base Altitude**: Centering height of the drone.
 * **Enable Hover Float / Hover Amplitude / Hover Frequency**: Controls the sinusoidal auto-hovering physics.
 * **Pivot Point Offset (Pivot X, Pivot Y, Pivot Z)**: Adjusts the rotation center of the showcase model in real-time.
-* **Grid Floor Customizations**:
-  * *Show Grid Floor*: Toggles floor helper plane.
-  * *Grid Color*: HTML color picker for the core wireframe lines.
-  * *Glow Color*: HTML color picker for the soft outer neon glow.
-  * *Line Thickness*: Controls the pixel width scale (`[0.1, 5.0]`) of both core and outer lines.
-  * *Glow Intensity*: Multiplier (`[0.0, 3.0]`) for the neon glow brightness and center wave pulses.
+* **Grid Floor Customizations**: Adjusts grid line colors, neon glows, line thickness, and glow intensity.
+* **Particle Effects**:
+  * *Show Particles*: Toggles particle system visibility.
+  * *Effect Style*: Dropdown selection for the 7 particle animation modes.
+  * *Particle Count*: Adjusts the density pool (`[100, 5000]`).
+  * *Particle Size*: Multiplies pixel scale (`[0.1, 8.0]`). Uses circular Canvas radial gradients.
+  * *Motion Speed*: Speeds up/slows down physics particle movement.
+  * *Spread Radius*: Adjusts boundary envelope size around the drone.
+  * *Custom Color Override*: Toggles custom color override.
+  * *Particle Color*: HTML color picker for particles.
 
 ### Camera Offset & Pan Controls
 * **Yaw & Pitch Offset**: Rotates the camera angle manually relative to the target anchor.
