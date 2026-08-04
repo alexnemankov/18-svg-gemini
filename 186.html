@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Instanced Mesh Swarm - 186</title>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #06040a;
+      cursor: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: none;
+    }
+    .lil-gui, .lil-gui * {
+      cursor: auto !important;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <renderer ref="renderer" resize="window" :auto-clear="false" mouse-move mouse-raycast orbit-ctrl>
+    <camera :position="{ z: 300 }"></camera>
+    <scene ref="scene">
+      <ambient-light ref="ambient" color="#200030"></ambient-light>
+      <point-light ref="light1" color="#00f0ff"></point-light>
+      <point-light ref="light" color="#ff0055" :intensity="0.5"></point-light>
+      <point-light ref="light3" color="#00ffaa" :intensity="0.5" :position="{ x: 100 }"></point-light>
+      <point-light ref="light4" color="#9000ff" :intensity="0.5" :position="{ x: -100 }"></point-light>
+
+      <instanced-mesh ref="imesh" :count="NUM_INSTANCES">
+        <box-geometry :width="2" :height="2" :depth="10"></box-geometry>
+        <standard-material ref="material" transparent :opacity="0.9" :metalness="0.8" :roughness="0.5"></standard-material>
+      </instanced-mesh>
+    </scene>
+
+    <effect-composer ref="composer">
+      <render-pass></render-pass>
+      <unreal-bloom-pass ref="bloomPass" :strength="bloomStrength" :radius="bloomRadius" :threshold="bloomThreshold"></unreal-bloom-pass>
+      <halftone-pass ref="halftonePass" :radius="halftoneRadius" :scatter="halftoneScatter" :shape="halftoneShape"></halftone-pass>
+      <film-pass ref="filmPass" :noise-intensity="filmNoise" :scanlines-intensity="filmScanlines" :grayscale="filmGrayscale"></film-pass>
+      <bokeh-pass ref="bokehPass" :focus="bokehFocus" :aperture="bokehAperture" :maxblur="bokehMaxblur"></bokeh-pass>
+      <tilt-shift-pass ref="tiltShiftPass" :blur-radius="tiltBlurRadius" :gradient-radius="tiltGradientRadius"></tilt-shift-pass>
+      <zoom-blur-pass ref="zoomBlurPass" :strength="zoomBlurStrength"></zoom-blur-pass>
+      <fxaa-pass ref="fxaaPass"></fxaa-pass>
+      <smaa-pass ref="smaaPass"></smaa-pass>
+    </effect-composer>
+  </renderer>
+</div>
+
+<script type="module">
+import { createApp } from 'https://unpkg.com/troisjs@0.1.10/build/trois.module.cdn.min.js';
+import { Object3D, MathUtils, Vector3, Vector2, Color } from 'https://unpkg.com/three@0.125.2/build/three.module.js';
+import { ShaderPass } from 'https://unpkg.com/three@0.125.2/examples/jsm/postprocessing/ShaderPass.js';
+import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+const { randFloat: rnd, randFloatSpread: rndFS } = MathUtils;
+
+// Custom Shaders
+const ChromaticShader = {
+  uniforms: { tDiffuse: { value: null }, amount: { value: 0.008 } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float amount; varying vec2 vUv; void main() { vec2 offset = amount * (vUv - vec2(0.5)); vec4 r = texture2D(tDiffuse, vUv + offset); vec4 g = texture2D(tDiffuse, vUv); vec4 b = texture2D(tDiffuse, vUv - offset); gl_FragColor = vec4(r.r, g.g, b.b, g.a); }`
+};
+
+const AnamorphicShader = {
+  uniforms: { tDiffuse: { value: null }, scale: { value: 1.5 }, threshold: { value: 0.7 } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float scale; uniform float threshold; varying vec2 vUv; void main() { vec4 orig = texture2D(tDiffuse, vUv); vec3 streak = vec3(0.0); for (int i = -8; i <= 8; i++) { vec2 offset = vec2(float(i) * 0.004 * scale, 0.0); vec3 c = texture2D(tDiffuse, vUv + offset).rgb; float lum = dot(c, vec3(0.299, 0.587, 0.114)); if (lum > threshold) streak += c * (1.0 - abs(float(i)) / 8.0); } gl_FragColor = orig + vec4(streak * 0.15, 0.0); }`
+};
+
+const PixelationShader = {
+  uniforms: { tDiffuse: { value: null }, pixelSize: { value: 4.0 }, resolution: { value: new Vector2(window.innerWidth, window.innerHeight) } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float pixelSize; uniform vec2 resolution; varying vec2 vUv; void main() { vec2 d = pixelSize / resolution; vec2 uv = floor(vUv / d) * d + d * 0.5; gl_FragColor = texture2D(tDiffuse, uv); }`
+};
+
+const SobelShader = {
+  uniforms: { tDiffuse: { value: null }, resolution: { value: new Vector2(window.innerWidth, window.innerHeight) } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform vec2 resolution; varying vec2 vUv; void main() { vec2 texel = vec2(1.0 / resolution.x, 1.0 / resolution.y); vec3 Gx = vec3(0.0); vec3 Gy = vec3(0.0); vec3 c00 = texture2D(tDiffuse, vUv + vec2(-1.0, -1.0)*texel).rgb; vec3 c10 = texture2D(tDiffuse, vUv + vec2(1.0, -1.0)*texel).rgb; vec3 c01 = texture2D(tDiffuse, vUv + vec2(-1.0, 1.0)*texel).rgb; vec3 c11 = texture2D(tDiffuse, vUv + vec2(1.0, 1.0)*texel).rgb; Gx = c10 + c11 - c00 - c01; Gy = c01 + c11 - c00 - c10; float g = length(Gx) + length(Gy); gl_FragColor = vec4(vec3(g), 1.0); }`
+};
+
+const GodRaysShader = {
+  uniforms: { tDiffuse: { value: null }, lightPos: { value: new Vector2(0.5, 0.5) }, exposure: { value: 0.3 }, decay: { value: 0.95 }, density: { value: 0.8 }, weight: { value: 0.4 } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform vec2 lightPos; uniform float exposure; uniform float decay; uniform float density; uniform float weight; varying vec2 vUv; void main() { vec2 deltaTextCoord = (vUv - lightPos) * density / 30.0; vec2 textCoo = vUv; vec4 color = texture2D(tDiffuse, textCoo); float illuminationDecay = 1.0; for (int i = 0; i < 30; i++) { textCoo -= deltaTextCoord; vec4 sampleCol = texture2D(tDiffuse, textCoo); sampleCol *= illuminationDecay * weight; color += sampleCol; illuminationDecay *= decay; } gl_FragColor = color * exposure; }`
+};
+
+const RetroDitherShader = {
+  uniforms: { tDiffuse: { value: null }, colorLevels: { value: 4.0 } },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float colorLevels; varying vec2 vUv; void main() { vec4 c = texture2D(tDiffuse, vUv); vec3 q = floor(c.rgb * colorLevels) / colorLevels; gl_FragColor = vec4(q, c.a); }`
+};
+
+const colorSchemes = {
+  'Neon Cyberpunk': { meshColor: '#ff007f', bgColor: '#06040a', ambientColor: '#200030', light1Color: '#00f0ff', light2Color: '#ff0055', light3Color: '#00ffaa', light4Color: '#9000ff' },
+  'Solar Flare': { meshColor: '#ff7700', bgColor: '#0a0302', ambientColor: '#301000', light1Color: '#ffcc00', light2Color: '#ff2200', light3Color: '#ffaa00', light4Color: '#ff0044' },
+  'Bioluminescent Abyss': { meshColor: '#00ebd6', bgColor: '#020912', ambientColor: '#001525', light1Color: '#0077ff', light2Color: '#00ff88', light3Color: '#00e1ff', light4Color: '#4400ff' },
+  'Monochrome Platinum': { meshColor: '#e0e0e0', bgColor: '#08080a', ambientColor: '#333333', light1Color: '#ffffff', light2Color: '#888888', light3Color: '#aaaaaa', light4Color: '#666666' },
+  'Toxic Acid Matrix': { meshColor: '#76ff03', bgColor: '#030c04', ambientColor: '#0a2005', light1Color: '#39ff14', light2Color: '#a855f7', light3Color: '#00ffcc', light4Color: '#d4ff00' }
+};
+
+const CINEMATIC_PRESETS = {
+  'Cyberpunk Neon': { bloom: true, bStrength: 1.8, bRadius: 0.4, bThresh: 0.1, chromatic: true, cAmount: 0.008, anamorphic: true, pixel: false, pSize: 4, sobel: false, godRays: false, retro: false, halftone: true, film: true, bokeh: false, tilt: false, zoom: false },
+  'Hollywood Blockbuster': { bloom: true, bStrength: 0.9, bRadius: 0.2, bThresh: 0.2, chromatic: true, cAmount: 0.003, anamorphic: true, pixel: false, pSize: 4, sobel: false, godRays: true, retro: false, halftone: false, film: true, bokeh: true, tilt: false, zoom: false },
+  'Retro 8-Bit Pixelated': { bloom: false, bStrength: 0, bRadius: 0, bThresh: 0, chromatic: false, cAmount: 0, anamorphic: false, pixel: true, pSize: 8, sobel: false, godRays: false, retro: true, halftone: false, film: false, bokeh: false, tilt: false, zoom: false },
+  'Sobel Edge Sketch': { bloom: false, bStrength: 0, bRadius: 0, bThresh: 0, chromatic: false, cAmount: 0, anamorphic: false, pixel: false, pSize: 4, sobel: true, godRays: false, retro: false, halftone: false, film: false, bokeh: false, tilt: false, zoom: false },
+  'God Rays Sunset': { bloom: true, bStrength: 1.5, bRadius: 0.5, bThresh: 0.1, chromatic: true, cAmount: 0.004, anamorphic: true, pixel: false, pSize: 4, sobel: false, godRays: true, retro: false, halftone: false, film: false, bokeh: true, tilt: false, zoom: false },
+  'Vintage 35mm Film Noir': { bloom: true, bStrength: 0.5, bRadius: 0.1, bThresh: 0.4, chromatic: true, cAmount: 0.006, anamorphic: false, pixel: false, pSize: 4, sobel: false, godRays: false, retro: false, halftone: true, film: true, bokeh: true, tilt: false, zoom: false },
+  'Miniature Diorama': { bloom: true, bStrength: 0.8, bRadius: 0.2, bThresh: 0.2, chromatic: false, cAmount: 0, anamorphic: false, pixel: false, pSize: 4, sobel: false, godRays: false, retro: false, halftone: false, film: false, bokeh: false, tilt: true, zoom: false },
+  'Hyper Warp Velocity': { bloom: true, bStrength: 2.2, bRadius: 0.6, bThresh: 0.05, chromatic: true, cAmount: 0.012, anamorphic: true, pixel: false, pSize: 4, sobel: false, godRays: true, retro: false, halftone: false, film: true, bokeh: false, tilt: false, zoom: true },
+  'Clean Pure 3D': { bloom: false, bStrength: 0, bRadius: 0, bThresh: 0, chromatic: false, cAmount: 0, anamorphic: false, pixel: false, pSize: 4, sobel: false, godRays: false, retro: false, halftone: false, film: false, bokeh: false, tilt: false, zoom: false }
+};
+
+createApp({
+  setup() {
+    const NUM_INSTANCES = 2000;
+    const instances = [];
+    const target = new Vector3();
+    const dummyO = new Object3D();
+    const dummyV = new Vector3();
+
+    for (let i = 0; i < NUM_INSTANCES; i++) {
+      instances.push({
+        position: new Vector3(rndFS(200), rndFS(200), rndFS(200)),
+        scale: rnd(0.2, 1),
+        scaleZ: rnd(0.1, 1),
+        velocity: new Vector3(rndFS(2), rndFS(2), rndFS(2)),
+        attraction: 0.03 + rnd(-0.01, 0.01),
+        vlimit: 1.2 + rnd(-0.1, 0.1),
+      });
+    }
+
+    return {
+      NUM_INSTANCES, instances, target, dummyO, dummyV,
+      bloomStrength: 1.8, bloomRadius: 0.4, bloomThreshold: 0.1,
+      halftoneRadius: 1.2, halftoneScatter: 0.2, halftoneShape: 1,
+      filmNoise: 0.35, filmScanlines: 0.15, filmGrayscale: 0,
+      bokehFocus: 300, bokehAperture: 0.025, bokehMaxblur: 0.01,
+      tiltBlurRadius: 10, tiltGradientRadius: 100, zoomBlurStrength: 0.2,
+    };
+  },
+  mounted() {
+    this.renderer = this.$refs.renderer;
+    this.imesh = this.$refs.imesh.mesh;
+    this.light = this.$refs.light.light;
+    this.light1 = this.$refs.light1.light;
+    this.light3 = this.$refs.light3.light;
+    this.light4 = this.$refs.light4.light;
+    this.ambient = this.$refs.ambient.light;
+    this.material = this.$refs.material.material;
+    this.scene = this.$refs.scene.scene;
+    
+    this.clockTime = 0;
+    this.init();
+
+    this.$nextTick(() => {
+      this.initCustomPasses();
+      this.initGUI();
+    });
+  },
+  methods: {
+    init() {
+      for (let i = 0; i < this.NUM_INSTANCES; i++) {
+        const { position, scale, scaleZ } = this.instances[i];
+        this.dummyO.position.copy(position);
+        this.dummyO.scale.set(scale, scale, scaleZ);
+        this.dummyO.updateMatrix();
+        this.imesh.setMatrixAt(i, this.dummyO.matrix);
+      }
+      this.imesh.instanceMatrix.needsUpdate = true;
+      this.renderer.onBeforeRender(this.animate);
+    },
+    initCustomPasses() {
+      if (!this.$refs.composer || !this.$refs.composer.composer) return;
+      const comp = this.$refs.composer.composer;
+
+      this.chromaticPass = new ShaderPass(ChromaticShader);
+      this.anamorphicPass = new ShaderPass(AnamorphicShader);
+      this.pixelPass = new ShaderPass(PixelationShader);
+      this.sobelPass = new ShaderPass(SobelShader);
+      this.godRaysPass = new ShaderPass(GodRaysShader);
+      this.retroPass = new ShaderPass(RetroDitherShader);
+
+      this.chromaticPass.enabled = true;
+      this.anamorphicPass.enabled = true;
+      this.pixelPass.enabled = false;
+      this.sobelPass.enabled = false;
+      this.godRaysPass.enabled = false;
+      this.retroPass.enabled = false;
+
+      comp.addPass(this.chromaticPass);
+      comp.addPass(this.anamorphicPass);
+      comp.addPass(this.pixelPass);
+      comp.addPass(this.sobelPass);
+      comp.addPass(this.godRaysPass);
+      comp.addPass(this.retroPass);
+    },
+    disableAllPasses() {
+      if (this.$refs.bloomPass && this.$refs.bloomPass.pass) this.$refs.bloomPass.pass.enabled = false;
+      if (this.$refs.halftonePass && this.$refs.halftonePass.pass) this.$refs.halftonePass.pass.enabled = false;
+      if (this.$refs.filmPass && this.$refs.filmPass.pass) this.$refs.filmPass.pass.enabled = false;
+      if (this.$refs.bokehPass && this.$refs.bokehPass.pass) this.$refs.bokehPass.pass.enabled = false;
+      if (this.$refs.tiltShiftPass) {
+        if (this.$refs.tiltShiftPass.pass) this.$refs.tiltShiftPass.pass.enabled = false;
+        if (this.$refs.tiltShiftPass.pass1) this.$refs.tiltShiftPass.pass1.enabled = false;
+      }
+      if (this.$refs.zoomBlurPass && this.$refs.zoomBlurPass.pass) this.$refs.zoomBlurPass.pass.enabled = false;
+      if (this.$refs.fxaaPass && this.$refs.fxaaPass.pass) this.$refs.fxaaPass.pass.enabled = false;
+      if (this.$refs.smaaPass && this.$refs.smaaPass.pass) this.$refs.smaaPass.pass.enabled = false;
+
+      if (this.chromaticPass) this.chromaticPass.enabled = false;
+      if (this.anamorphicPass) this.anamorphicPass.enabled = false;
+      if (this.pixelPass) this.pixelPass.enabled = false;
+      if (this.sobelPass) this.sobelPass.enabled = false;
+      if (this.godRaysPass) this.godRaysPass.enabled = false;
+      if (this.retroPass) this.retroPass.enabled = false;
+    },
+    applyPreset(name) {
+      const p = CINEMATIC_PRESETS[name];
+      if (!p) return;
+
+      if (name === 'Clean Pure 3D') {
+        this.disableAllPasses();
+        this.guiParams.bloomEnable = false;
+        this.guiParams.chromaticEnable = false;
+        this.guiParams.anamorphicEnable = false;
+        this.guiParams.pixelEnable = false;
+        this.guiParams.sobelEnable = false;
+        this.guiParams.godRaysEnable = false;
+        this.guiParams.retroEnable = false;
+        this.guiParams.halftoneEnable = false;
+        this.guiParams.filmEnable = false;
+        this.guiParams.bokehEnable = false;
+        this.guiParams.tiltEnable = false;
+        this.guiParams.zoomEnable = false;
+        return;
+      }
+
+      if (this.$refs.bloomPass && this.$refs.bloomPass.pass) this.$refs.bloomPass.pass.enabled = p.bloom;
+      if (this.chromaticPass) { this.chromaticPass.enabled = p.chromatic; this.chromaticPass.uniforms.amount.value = p.cAmount; }
+      if (this.anamorphicPass) this.anamorphicPass.enabled = p.anamorphic;
+      if (this.pixelPass) { this.pixelPass.enabled = p.pixel; this.pixelPass.uniforms.pixelSize.value = p.pSize; }
+      if (this.sobelPass) this.sobelPass.enabled = p.sobel;
+      if (this.godRaysPass) this.godRaysPass.enabled = p.godRays;
+      if (this.retroPass) this.retroPass.enabled = p.retro;
+      if (this.$refs.halftonePass && this.$refs.halftonePass.pass) this.$refs.halftonePass.pass.enabled = p.halftone;
+      if (this.$refs.filmPass && this.$refs.filmPass.pass) this.$refs.filmPass.pass.enabled = p.film;
+      if (this.$refs.bokehPass && this.$refs.bokehPass.pass) this.$refs.bokehPass.pass.enabled = p.bokeh;
+
+      if (this.$refs.tiltShiftPass) {
+        if (this.$refs.tiltShiftPass.pass) this.$refs.tiltShiftPass.pass.enabled = p.tilt;
+        if (this.$refs.tiltShiftPass.pass1) this.$refs.tiltShiftPass.pass1.enabled = p.tilt;
+      }
+
+      if (this.$refs.zoomBlurPass && this.$refs.zoomBlurPass.pass) this.$refs.zoomBlurPass.pass.enabled = p.zoom;
+
+      this.guiParams.bloomEnable = p.bloom;
+      this.guiParams.chromaticEnable = p.chromatic;
+      this.guiParams.anamorphicEnable = p.anamorphic;
+      this.guiParams.pixelEnable = p.pixel;
+      this.guiParams.sobelEnable = p.sobel;
+      this.guiParams.godRaysEnable = p.godRays;
+      this.guiParams.retroEnable = p.retro;
+      this.guiParams.halftoneEnable = p.halftone;
+      this.guiParams.filmEnable = p.film;
+      this.guiParams.bokehEnable = p.bokeh;
+      this.guiParams.tiltEnable = p.tilt;
+      this.guiParams.zoomEnable = p.zoom;
+    },
+    initGUI() {
+      const self = this;
+      this.guiParams = {
+        colorScheme: 'Neon Cyberpunk',
+        animationPreset: 'Orbit Vortex',
+        greenScreen: false,
+        bgColor: colorSchemes['Neon Cyberpunk'].bgColor,
+        meshColor: colorSchemes['Neon Cyberpunk'].meshColor,
+        metalness: 0.8, roughness: 0.5, opacity: 0.9, animSpeed: 1.0, dpr: Math.min(window.devicePixelRatio, 2),
+
+        preset: 'Cyberpunk Neon',
+        bloomEnable: true, bloomStrength: 1.8, bloomRadius: 0.4, bloomThreshold: 0.1,
+        halftoneEnable: true, halftoneRadius: 1.2, halftoneScatter: 0.2, halftoneShape: 1,
+        filmEnable: true, filmNoise: 0.35, filmScanlines: 0.15, filmGrayscale: false,
+        bokehEnable: false, bokehFocus: 300, bokehAperture: 0.025, bokehMaxblur: 0.01,
+        tiltEnable: false, tiltBlurRadius: 10, tiltGradientRadius: 100,
+        zoomEnable: false, zoomBlurStrength: 0.2,
+        chromaticEnable: true, chromaticAmount: 0.008,
+        anamorphicEnable: true, anamorphicScale: 1.5,
+        pixelEnable: false, pixelSize: 4,
+        sobelEnable: false,
+        godRaysEnable: false, godRaysExposure: 0.3, godRaysDecay: 0.95, godRaysWeight: 0.4,
+        retroEnable: false, retroLevels: 4,
+        fxaaEnable: true, smaaEnable: false
+      };
+
+      const gui = new GUI({ title: 'Settings' });
+      this.gui = gui;
+
+      gui.add(this.guiParams, 'colorScheme', Object.keys(colorSchemes)).name('Color Scheme').onChange((schemeName) => {
+        const scheme = colorSchemes[schemeName];
+        if (scheme) {
+          self.guiParams.meshColor = scheme.meshColor;
+          self.guiParams.bgColor = scheme.bgColor;
+          meshColorCtrl.updateDisplay(); bgColorCtrl.updateDisplay();
+          self.applyColors(); self.updateBackground();
+        }
+      });
+
+      gui.add(this.guiParams, 'animationPreset', ['Orbit Vortex', 'Cosmic Drift', 'Pulse Wave', 'Spiral Flow', 'Static View']).name('Animation');
+
+      const fxFolder = gui.addFolder('Post-Processing Suite');
+      fxFolder.add(this.guiParams, 'preset', Object.keys(CINEMATIC_PRESETS)).name('Effect Preset').onChange((name) => {
+        self.applyPreset(name);
+      });
+
+      // 1. Unreal Bloom
+      const bloomF = fxFolder.addFolder('Unreal Bloom');
+      bloomF.add(this.guiParams, 'bloomEnable').name('Enable Bloom').onChange(v => {
+        if (self.$refs.bloomPass && self.$refs.bloomPass.pass) self.$refs.bloomPass.pass.enabled = v;
+      });
+      bloomF.add(this.guiParams, 'bloomStrength', 0, 5, 0.1).name('Strength').onChange(v => {
+        if (self.$refs.bloomPass && self.$refs.bloomPass.pass) self.$refs.bloomPass.pass.strength = v;
+      });
+      bloomF.add(this.guiParams, 'bloomRadius', 0, 2, 0.05).name('Radius').onChange(v => {
+        if (self.$refs.bloomPass && self.$refs.bloomPass.pass) self.$refs.bloomPass.pass.radius = v;
+      });
+      bloomF.add(this.guiParams, 'bloomThreshold', 0, 1, 0.05).name('Threshold').onChange(v => {
+        if (self.$refs.bloomPass && self.$refs.bloomPass.pass) self.$refs.bloomPass.pass.threshold = v;
+      });
+
+      // 2. Chromatic Aberration
+      const caF = fxFolder.addFolder('Chromatic Aberration');
+      caF.add(this.guiParams, 'chromaticEnable').name('Enable Chromatic').onChange(v => { if (self.chromaticPass) self.chromaticPass.enabled = v; });
+      caF.add(this.guiParams, 'chromaticAmount', 0, 0.03, 0.001).name('Offset Amount').onChange(v => { if (self.chromaticPass) self.chromaticPass.uniforms.amount.value = v; });
+
+      // 3. Anamorphic Lens Flare
+      const anaF = fxFolder.addFolder('Anamorphic Lens Flare');
+      anaF.add(this.guiParams, 'anamorphicEnable').name('Enable Anamorphic').onChange(v => { if (self.anamorphicPass) self.anamorphicPass.enabled = v; });
+      anaF.add(this.guiParams, 'anamorphicScale', 0, 5, 0.1).name('Streak Length').onChange(v => { if (self.anamorphicPass) self.anamorphicPass.uniforms.scale.value = v; });
+
+      // 4. Halftone Grid
+      const halftoneF = fxFolder.addFolder('Halftone Grid');
+      halftoneF.add(this.guiParams, 'halftoneEnable').name('Enable Halftone').onChange(v => {
+        if (self.$refs.halftonePass && self.$refs.halftonePass.pass) self.$refs.halftonePass.pass.enabled = v;
+      });
+      halftoneF.add(this.guiParams, 'halftoneRadius', 0, 10, 0.5).name('Dot Radius').onChange(v => {
+        if (self.$refs.halftonePass && self.$refs.halftonePass.pass && self.$refs.halftonePass.pass.uniforms) self.$refs.halftonePass.pass.uniforms.radius.value = v;
+      });
+      halftoneF.add(this.guiParams, 'halftoneScatter', 0, 5, 0.1).name('Scatter').onChange(v => {
+        if (self.$refs.halftonePass && self.$refs.halftonePass.pass && self.$refs.halftonePass.pass.uniforms) self.$refs.halftonePass.pass.uniforms.scatter.value = v;
+      });
+      halftoneF.add(this.guiParams, 'halftoneShape', { Dot: 1, Ellipse: 2, Line: 3, Square: 4 }).name('Shape').onChange(v => {
+        if (self.$refs.halftonePass && self.$refs.halftonePass.pass && self.$refs.halftonePass.pass.uniforms) self.$refs.halftonePass.pass.uniforms.shape.value = parseInt(v);
+      });
+
+      // 5. Film Grain & CRT
+      const filmF = fxFolder.addFolder('Film Grain & CRT');
+      filmF.add(this.guiParams, 'filmEnable').name('Enable Film').onChange(v => {
+        if (self.$refs.filmPass && self.$refs.filmPass.pass) self.$refs.filmPass.pass.enabled = v;
+      });
+      filmF.add(this.guiParams, 'filmNoise', 0, 1, 0.05).name('Noise Intensity').onChange(v => {
+        if (self.$refs.filmPass && self.$refs.filmPass.pass && self.$refs.filmPass.pass.uniforms) self.$refs.filmPass.pass.uniforms.nIntensity.value = v;
+      });
+      filmF.add(this.guiParams, 'filmScanlines', 0, 0.5, 0.01).name('Scanlines Intensity').onChange(v => {
+        if (self.$refs.filmPass && self.$refs.filmPass.pass && self.$refs.filmPass.pass.uniforms) self.$refs.filmPass.pass.uniforms.sIntensity.value = v;
+      });
+      filmF.add(this.guiParams, 'filmGrayscale').name('Grayscale Mode').onChange(v => {
+        if (self.$refs.filmPass && self.$refs.filmPass.pass && self.$refs.filmPass.pass.uniforms) self.$refs.filmPass.pass.uniforms.grayscale.value = v ? 1 : 0;
+      });
+
+      // 6. Bokeh Depth of Field
+      const bokehF = fxFolder.addFolder('Bokeh Depth of Field');
+      bokehF.add(this.guiParams, 'bokehEnable').name('Enable Bokeh').onChange(v => {
+        if (self.$refs.bokehPass && self.$refs.bokehPass.pass) self.$refs.bokehPass.pass.enabled = v;
+      });
+      bokehF.add(this.guiParams, 'bokehFocus', 0, 600, 10).name('Focus Distance').onChange(v => {
+        if (self.$refs.bokehPass && self.$refs.bokehPass.pass && self.$refs.bokehPass.pass.uniforms) self.$refs.bokehPass.pass.uniforms.focus.value = v;
+      });
+      bokehF.add(this.guiParams, 'bokehAperture', 0, 0.1, 0.005).name('Aperture').onChange(v => {
+        if (self.$refs.bokehPass && self.$refs.bokehPass.pass && self.$refs.bokehPass.pass.uniforms) self.$refs.bokehPass.pass.uniforms.aperture.value = v;
+      });
+      bokehF.add(this.guiParams, 'bokehMaxblur', 0, 0.05, 0.002).name('Max Blur').onChange(v => {
+        if (self.$refs.bokehPass && self.$refs.bokehPass.pass && self.$refs.bokehPass.pass.uniforms) self.$refs.bokehPass.pass.uniforms.maxblur.value = v;
+      });
+
+      // 7. Tilt Shift Blur
+      const tiltF = fxFolder.addFolder('Tilt Shift Blur');
+      tiltF.add(this.guiParams, 'tiltEnable').name('Enable Tilt Shift').onChange(v => {
+        if (self.$refs.tiltShiftPass) {
+          if (self.$refs.tiltShiftPass.pass) self.$refs.tiltShiftPass.pass.enabled = v;
+          if (self.$refs.tiltShiftPass.pass1) self.$refs.tiltShiftPass.pass1.enabled = v;
+        }
+      });
+      tiltF.add(this.guiParams, 'tiltBlurRadius', 0, 30, 1).name('Blur Radius').onChange(v => {
+        if (self.$refs.tiltShiftPass && self.$refs.tiltShiftPass.pass && self.$refs.tiltShiftPass.pass.uniforms) self.$refs.tiltShiftPass.pass.uniforms.blurRadius.value = v;
+      });
+      tiltF.add(this.guiParams, 'tiltGradientRadius', 10, 300, 10).name('Gradient Radius').onChange(v => {
+        if (self.$refs.tiltShiftPass && self.$refs.tiltShiftPass.pass && self.$refs.tiltShiftPass.pass.uniforms) self.$refs.tiltShiftPass.pass.uniforms.gradientRadius.value = v;
+      });
+
+      // 8. Zoom Blur
+      const zoomF = fxFolder.addFolder('Zoom Blur');
+      zoomF.add(this.guiParams, 'zoomEnable').name('Enable Zoom Blur').onChange(v => {
+        if (self.$refs.zoomBlurPass && self.$refs.zoomBlurPass.pass) self.$refs.zoomBlurPass.pass.enabled = v;
+      });
+      zoomF.add(this.guiParams, 'zoomBlurStrength', 0, 1.5, 0.05).name('Strength').onChange(v => {
+        if (self.$refs.zoomBlurPass && self.$refs.zoomBlurPass.pass && self.$refs.zoomBlurPass.pass.uniforms) self.$refs.zoomBlurPass.pass.uniforms.strength.value = v;
+      });
+
+      // 9. Retro Pixelation
+      const pixF = fxFolder.addFolder('Retro Pixelation');
+      pixF.add(this.guiParams, 'pixelEnable').name('Enable Pixelation').onChange(v => { if (self.pixelPass) self.pixelPass.enabled = v; });
+      pixF.add(this.guiParams, 'pixelSize', 1, 32, 1).name('Pixel Size').onChange(v => { if (self.pixelPass) self.pixelPass.uniforms.pixelSize.value = v; });
+
+      // 10. Sobel Line-Art
+      const sobF = fxFolder.addFolder('Sobel Edge Sketch');
+      sobF.add(this.guiParams, 'sobelEnable').name('Enable Sobel Lines').onChange(v => { if (self.sobelPass) self.sobelPass.enabled = v; });
+
+      // 11. God Rays
+      const godF = fxFolder.addFolder('God Rays (Volumetric)');
+      godF.add(this.guiParams, 'godRaysEnable').name('Enable God Rays').onChange(v => { if (self.godRaysPass) self.godRaysPass.enabled = v; });
+      godF.add(this.guiParams, 'godRaysExposure', 0.1, 1.0, 0.05).name('Exposure').onChange(v => { if (self.godRaysPass) self.godRaysPass.uniforms.exposure.value = v; });
+      godF.add(this.guiParams, 'godRaysDecay', 0.8, 0.99, 0.01).name('Decay').onChange(v => { if (self.godRaysPass) self.godRaysPass.uniforms.decay.value = v; });
+      godF.add(this.guiParams, 'godRaysWeight', 0.1, 1.0, 0.05).name('Weight').onChange(v => { if (self.godRaysPass) self.godRaysPass.uniforms.weight.value = v; });
+
+      // 12. Retro Color Dither
+      const retF = fxFolder.addFolder('Retro Color Dither');
+      retF.add(this.guiParams, 'retroEnable').name('Enable Dither').onChange(v => { if (self.retroPass) self.retroPass.enabled = v; });
+      retF.add(this.guiParams, 'retroLevels', 2, 16, 1).name('Color Levels').onChange(v => { if (self.retroPass) self.retroPass.uniforms.colorLevels.value = v; });
+
+      // 13. Anti-Aliasing
+      const aaF = fxFolder.addFolder('Anti-Aliasing');
+      aaF.add(this.guiParams, 'fxaaEnable').name('Enable FXAA').onChange(v => {
+        if (self.$refs.fxaaPass && self.$refs.fxaaPass.pass) self.$refs.fxaaPass.pass.enabled = v;
+      });
+      aaF.add(this.guiParams, 'smaaEnable').name('Enable SMAA').onChange(v => {
+        if (self.$refs.smaaPass && self.$refs.smaaPass.pass) self.$refs.smaaPass.pass.enabled = v;
+      });
+
+      // Background & Green Screen Folder
+      const bgFolder = gui.addFolder('Background');
+      bgFolder.add(this.guiParams, 'greenScreen').name('Green Screen (#00ff00)').onChange(() => self.updateBackground());
+      const bgColorCtrl = bgFolder.addColor(this.guiParams, 'bgColor').name('Background Color').onChange(() => self.updateBackground());
+
+      // Material Controls Folder
+      const matFolder = gui.addFolder('Material & Colors');
+      const meshColorCtrl = matFolder.addColor(this.guiParams, 'meshColor').name('Mesh Color').onChange((val) => {
+        if (self.material) self.material.color.set(val);
+      });
+      matFolder.add(this.guiParams, 'metalness', 0, 1, 0.05).name('Metalness').onChange((val) => { if (self.material) self.material.metalness = val; });
+      matFolder.add(this.guiParams, 'roughness', 0, 1, 0.05).name('Roughness').onChange((val) => { if (self.material) self.material.roughness = val; });
+      matFolder.add(this.guiParams, 'opacity', 0.1, 1, 0.05).name('Opacity').onChange((val) => { if (self.material) self.material.opacity = val; });
+
+      // Render Settings Folder
+      const settingsFolder = gui.addFolder('Render Settings');
+      settingsFolder.add(this.guiParams, 'animSpeed', 0, 3, 0.1).name('Animation Speed');
+      settingsFolder.add(this.guiParams, 'dpr', 0.5, 3, 0.1).name('Pixel Ratio (DPR)').onChange((val) => {
+        if (self.renderer && self.renderer.three && self.renderer.three.renderer) {
+          self.renderer.three.renderer.setPixelRatio(val);
+        }
+      });
+
+      this.applyColors();
+      this.updateBackground();
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'h' || e.key === 'H') {
+          if (gui._hidden) { gui.show(); } else { gui.hide(); }
+        }
+      });
+    },
+    applyColors() {
+      const scheme = colorSchemes[this.guiParams.colorScheme];
+      if (!scheme) return;
+      if (this.material) this.material.color.set(this.guiParams.meshColor);
+      if (this.ambient) this.ambient.color.set(scheme.ambientColor);
+      if (this.light1) this.light1.color.set(scheme.light1Color);
+      if (this.light) this.light.color.set(scheme.light2Color);
+      if (this.light3) this.light3.color.set(scheme.light3Color);
+      if (this.light4) this.light4.color.set(scheme.light4Color);
+    },
+    updateBackground() {
+      if (!this.scene) return;
+      if (this.guiParams.greenScreen) {
+        this.scene.background = new Color('#00ff00');
+      } else {
+        this.scene.background = new Color(this.guiParams.bgColor);
+      }
+    },
+    animate() {
+      const delta = 0.016 * this.guiParams.animSpeed;
+      this.clockTime += delta;
+      const t = this.clockTime;
+
+      switch(this.guiParams.animationPreset) {
+        case 'Orbit Vortex':
+          this.target.x = Math.sin(t * 1.5) * 80;
+          this.target.y = Math.cos(t * 1.2) * 50;
+          this.target.z = Math.sin(t * 0.8) * 80;
+          if (this.renderer.three && this.renderer.three.camera) {
+            const radius = 300;
+            const camAngle = t * 0.2;
+            this.renderer.three.camera.position.x = Math.cos(camAngle) * radius;
+            this.renderer.three.camera.position.z = Math.sin(camAngle) * radius;
+            this.renderer.three.camera.position.y = Math.sin(t * 0.3) * 40;
+            this.renderer.three.camera.lookAt(0, 0, 0);
+          }
+          break;
+
+        case 'Cosmic Drift':
+          this.target.x = Math.sin(t * 0.7) * 120;
+          this.target.y = Math.cos(t * 0.5) * 90;
+          this.target.z = Math.sin(t * 0.9) * 100;
+          if (this.renderer.three && this.renderer.three.camera) {
+            this.renderer.three.camera.position.x = Math.sin(t * 0.15) * 60;
+            this.renderer.three.camera.position.y = Math.cos(t * 0.1) * 40;
+          }
+          break;
+
+        case 'Pulse Wave':
+          const pVal = Math.sin(t * 2.0);
+          this.target.set(pVal * 40, Math.cos(t * 1.5) * 40, pVal * 40);
+          if (this.renderer.three && this.renderer.three.camera) {
+            this.renderer.three.camera.position.z = 300 + Math.sin(t * 0.4) * 50;
+          }
+          break;
+
+        case 'Spiral Flow':
+          this.target.x = Math.cos(t * 2.0) * 100;
+          this.target.y = Math.sin(t * 1.0) * 80;
+          this.target.z = Math.sin(t * 2.0) * 100;
+          if (this.renderer.three && this.renderer.three.camera) {
+            const camAngle = t * 0.3;
+            this.renderer.three.camera.position.x = Math.sin(camAngle) * 320;
+            this.renderer.three.camera.position.z = Math.cos(camAngle) * 320;
+          }
+          break;
+
+        case 'Static View':
+          if (this.renderer.three && this.renderer.three.mouseV3) {
+            this.target.copy(this.renderer.three.mouseV3);
+          }
+          break;
+      }
+
+      if (this.light) {
+        this.light.position.copy(this.target);
+      }
+
+      for (let i = 0; i < this.NUM_INSTANCES; i++) {
+        const { position, scale, scaleZ, velocity, attraction, vlimit } = this.instances[i];
+
+        this.dummyV.copy(this.target).sub(position).normalize().multiplyScalar(attraction);
+        velocity.add(this.dummyV).clampScalar(-vlimit, vlimit);
+        position.add(velocity);
+
+        this.dummyO.position.copy(position);
+        this.dummyO.scale.set(scale, scale, scaleZ);
+        this.dummyO.lookAt(this.dummyV.copy(position).add(velocity));
+        this.dummyO.updateMatrix();
+        this.imesh.setMatrixAt(i, this.dummyO.matrix);
+      }
+      this.imesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

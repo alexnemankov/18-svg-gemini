@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Shader Visualizer</title>
+  <style>
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background-color: black;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+
+<button id="start" style="position:fixed;z-index:10;top:1rem;left:1rem;padding:.5rem 1rem;">
+  Start
+</button>
+<input type="file" id="svg-file-input" accept=".svg,image/svg+xml" style="display:none;" />
+<canvas id="glcanvas"></canvas>
+
+<script id="vertex-shader" type="x-shader/x-vertex">
+  attribute vec2 a_position;
+  void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+</script>
+
+<script id="fragment-shader" type="x-shader/x-fragment">
+  #ifdef GL_ES
+  precision highp float;
+  #endif
+
+  uniform vec2 u_resolution;
+  uniform vec2 u_mouse;
+  uniform float u_time;
+  uniform float audioData[16];
+  uniform float previousAudioData[16];
+
+  // Custom Controls
+  uniform vec2 u_drag;
+  uniform float u_zoom;
+  uniform float u_rotation;
+  uniform vec3 u_bgColor;
+  uniform float u_greenscreen;
+
+  // Palette uniforms
+  uniform vec3 u_palA;
+  uniform vec3 u_palB;
+  uniform vec3 u_palC;
+  uniform vec3 u_palD;
+  uniform float u_palFactor;
+
+  // SVG Texture uniforms
+  uniform sampler2D u_svgTexture;
+  uniform float u_useSvg;
+  uniform float u_svgScale;
+
+  float sdfCircle(vec2 p, float r) {
+    return length(p) - r;
+  }
+
+  vec3 paletteCustom(float t, float factor, vec3 a, vec3 b, vec3 c, vec3 d) {
+    return a + b * cos(6.28318 * (c * t + d));
+  }
+
+  float ema(float prev, float cur, float alpha) {
+    return mix(prev, cur, alpha); 
+  }
+
+  void main() {
+    vec2 uv = (gl_FragCoord.xy - u_resolution * 0.5) / min(u_resolution.x, u_resolution.y);
+
+    // Apply drag & zoom
+    uv = (uv - u_drag) / u_zoom;
+
+    // Apply rotation
+    float cr = cos(u_rotation);
+    float sr = sin(u_rotation);
+    uv = vec2(uv.x * cr - uv.y * sr, uv.x * sr + uv.y * cr);
+
+    float t = u_time;
+    vec3 col = vec3(0.0);
+    float a0 = ema(previousAudioData[12], audioData[12], 0.5);
+
+    // SVG shape evaluation
+    float svgShape = 0.0;
+    if (u_useSvg > 0.5) {
+      vec2 st = (uv / u_svgScale) * 0.5 + 0.5;
+      if (st.x >= 0.0 && st.x <= 1.0 && st.y >= 0.0 && st.y <= 1.0) {
+        vec4 tex = texture2D(u_svgTexture, st);
+        svgShape = max(tex.a, max(tex.r, max(tex.g, tex.b)));
+      }
+    }
+
+    for (int i = 0; i < 50; i++) {
+      float fi = float(i);
+      float angle = atan(uv.y, uv.x);
+      float speed = 0.5 + fi * 0.5 * a0 * 0.1;
+
+      vec2 offset = vec2(
+        cos(t * speed * 0.05) * 0.09,
+        sin(t * speed * 0.05) * 0.09
+      );
+      
+      vec2 p = uv * tan(fi * 2.0 - angle + t * 0.1) * 0.2 - offset * 0.4;
+      float d = sdfCircle(p, 0.0001);
+
+      if (u_useSvg > 0.5 && svgShape > 0.01) {
+        d = mix(d, d * (1.0 - svgShape * 0.8), 0.5);
+      }
+
+      float glow = 0.001 / (abs(d) + 0.001);
+      vec3 hue = paletteCustom(d, u_palFactor, u_palA, u_palB, u_palC, u_palD);
+      col += glow * hue;
+    }
+
+    vec3 bg = (u_greenscreen > 0.5) ? vec3(0.0, 1.0, 0.0) : u_bgColor;
+
+    if (u_greenscreen > 0.5) {
+      float glowIntensity = clamp(length(col) * 1.2, 0.0, 1.0);
+      vec3 finalCol = mix(bg, col, glowIntensity);
+      gl_FragColor = vec4(finalCol, 1.0);
+    } else {
+      gl_FragColor = vec4(col + bg, 1.0);
+    }
+  }
+</script>
+
+<script type="module">
+  import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+
+  function getShaderSource(id) {
+    return document.getElementById(id).textContent;
+  }
+
+  const vertexShaderSource = getShaderSource('vertex-shader');
+  const fragmentShaderSource = getShaderSource('fragment-shader');
+
+  function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      console.error('An error occurred compiling the shaders:', gl.getShaderInfoLog(shader));
+      gl.deleteShader(shader);
+      return null;
+    }
+    return shader;
+  }
+
+  function createProgram(gl, vertexShader, fragmentShader) {
+    const program = gl.createProgram();
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error('Unable to initialize the shader program:', gl.getProgramInfoLog(program));
+      return null;
+    }
+    return program;
+  }
+
+  const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+  const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+  const program = createProgram(gl, vertexShader, fragmentShader);
+
+  const positionBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+  const positions = [
+    -1.0, -1.0,
+     1.0, -1.0,
+    -1.0,  1.0,
+     1.0,  1.0,
+  ];
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+  const positionLocation = gl.getAttribLocation(program, 'a_position');
+  gl.enableVertexAttribArray(positionLocation);
+  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+  gl.useProgram(program);
+
+  const resolutionLocation = gl.getUniformLocation(program, 'u_resolution');
+  const timeLocation = gl.getUniformLocation(program, 'u_time');
+  const audioDataLoc = gl.getUniformLocation(program, 'audioData[0]');
+  const previousAudioDataLoc = gl.getUniformLocation(program, 'previousAudioData[0]');
+
+  // Custom uniform locations
+  const dragLoc = gl.getUniformLocation(program, 'u_drag');
+  const zoomLoc = gl.getUniformLocation(program, 'u_zoom');
+  const rotationLoc = gl.getUniformLocation(program, 'u_rotation');
+  const bgColorLoc = gl.getUniformLocation(program, 'u_bgColor');
+  const greenscreenLoc = gl.getUniformLocation(program, 'u_greenscreen');
+
+  const palALoc = gl.getUniformLocation(program, 'u_palA');
+  const palBLoc = gl.getUniformLocation(program, 'u_palB');
+  const palCLoc = gl.getUniformLocation(program, 'u_palC');
+  const palDLoc = gl.getUniformLocation(program, 'u_palD');
+  const palFactorLoc = gl.getUniformLocation(program, 'u_palFactor');
+
+  const svgTextureLoc = gl.getUniformLocation(program, 'u_svgTexture');
+  const useSvgLoc = gl.getUniformLocation(program, 'u_useSvg');
+  const svgScaleLoc = gl.getUniformLocation(program, 'u_svgScale');
+
+  // Setup Default 1x1 White Texture for SVG
+  const svgTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, svgTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  // Preset Color Schemes definitions
+  const colorPresets = {
+    'Cyber Neon': {
+      a: [0.5, 0.3, 0.5],
+      b: [0.5, 0.3, 0.5],
+      c: [1.0, 0.5, 0.9],
+      d: [0.25, 0.4, 0.55],
+      factor: 3.5
+    },
+    'Solar Flare': {
+      a: [0.5, 0.5, 0.5],
+      b: [0.5, 0.5, 0.5],
+      c: [2.0, 1.0, 0.0],
+      d: [0.5, 0.20, 0.25],
+      factor: 4.0
+    },
+    'Cosmic Plasma': {
+      a: [0.8, 0.5, 0.4],
+      b: [0.2, 0.4, 0.2],
+      c: [2.0, 1.0, 1.0],
+      d: [0.0, 0.25, 0.25],
+      factor: 3.0
+    },
+    'Emerald Bio': {
+      a: [0.1, 0.5, 0.3],
+      b: [0.2, 0.5, 0.4],
+      c: [0.5, 1.5, 1.0],
+      d: [0.1, 0.3, 0.6],
+      factor: 3.8
+    },
+    'Acid Opal': {
+      a: [0.5, 0.5, 0.5],
+      b: [0.5, 0.5, 0.5],
+      c: [1.0, 1.0, 1.0],
+      d: [0.0, 0.33, 0.67],
+      factor: 5.0
+    }
+  };
+
+  // Application Settings State
+  const settings = {
+    greenscreen: false,
+    bgColor: '#000000',
+    colorScheme: 'Cyber Neon',
+    dpr: Math.min(window.devicePixelRatio || 1, 2),
+    animSpeed: 1.0,
+    animationPreset: 'Static',
+    zoom: 1.0,
+    dragX: 0.0,
+    dragY: 0.0,
+    resetView: () => {
+      settings.zoom = 1.0;
+      settings.dragX = 0.0;
+      settings.dragY = 0.0;
+      zoomCtrl.updateDisplay();
+      dragXCtrl.updateDisplay();
+      dragYCtrl.updateDisplay();
+    },
+    useSvg: false,
+    svgScale: 1.0,
+    uploadSvg: () => {
+      document.getElementById('svg-file-input').click();
+    }
+  };
+
+  // Helper to convert hex string to RGB array [0..1]
+  function hexToRgb(hex) {
+    const c = hex.replace('#', '');
+    const bigint = parseInt(c, 16);
+    return [
+      ((bigint >> 16) & 255) / 255,
+      ((bigint >> 8) & 255) / 255,
+      (bigint & 255) / 255
+    ];
+  }
+
+  // Set up GUI
+  const gui = new GUI({ title: 'Scene Settings' });
+
+  const bgFolder = gui.addFolder('Background & Display');
+  bgFolder.add(settings, 'greenscreen').name('Greenscreen (#00ff00)');
+  bgFolder.addColor(settings, 'bgColor').name('Background Color');
+  const dprCtrl = bgFolder.add(settings, 'dpr', 0.5, 3.0, 0.1).name('Pixel Ratio (DPR)').onChange(resize);
+
+  const colorFolder = gui.addFolder('Color Schemes');
+  colorFolder.add(settings, 'colorScheme', Object.keys(colorPresets)).name('Preset Scheme');
+
+  const animFolder = gui.addFolder('Animation');
+  animFolder.add(settings, 'animSpeed', 0.0, 3.0, 0.1).name('Speed');
+  animFolder.add(settings, 'animationPreset', [
+    'Static',
+    'Cosmic Drift',
+    'Hypnotic Pulse',
+    'Orbital Spiral',
+    'Oceanic Wave'
+  ]).name('Camera Preset');
+
+  const transformFolder = gui.addFolder('Transform');
+  const zoomCtrl = transformFolder.add(settings, 'zoom', 0.1, 10.0, 0.05).name('Zoom');
+  const dragXCtrl = transformFolder.add(settings, 'dragX', -3.0, 3.0, 0.01).name('Drag X');
+  const dragYCtrl = transformFolder.add(settings, 'dragY', -3.0, 3.0, 0.01).name('Drag Y');
+  transformFolder.add(settings, 'resetView').name('Reset View');
+
+  const svgFolder = gui.addFolder('SVG Custom Form');
+  svgFolder.add(settings, 'uploadSvg').name('Upload SVG File');
+  const useSvgCtrl = svgFolder.add(settings, 'useSvg').name('Use SVG Form').listen();
+  svgFolder.add(settings, 'svgScale', 0.2, 3.0, 0.05).name('SVG Form Scale');
+
+  // Keydown event listener to toggle UI with "H" key
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'h' || e.key === 'H') {
+      if (gui.domElement.style.display === 'none') {
+        gui.domElement.style.display = '';
+      } else {
+        gui.domElement.style.display = 'none';
+      }
+    }
+  });
+
+  // Handle Dragging across screen with mouse
+  let isDragging = false;
+  let startX = 0;
+  let startY = 0;
+
+  canvas.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    const minDim = Math.min(window.innerWidth, window.innerHeight);
+    settings.dragX += (dx / minDim) * (2.0 / settings.zoom);
+    settings.dragY -= (dy / minDim) * (2.0 / settings.zoom);
+    startX = e.clientX;
+    startY = e.clientY;
+    dragXCtrl.updateDisplay();
+    dragYCtrl.updateDisplay();
+  });
+
+  window.addEventListener('mouseup', () => { isDragging = false; });
+
+  // Handle Zoom with Mouse Wheel
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+    settings.zoom = Math.max(0.1, Math.min(10.0, settings.zoom * zoomFactor));
+    zoomCtrl.updateDisplay();
+  }, { passive: false });
+
+  // SVG Upload Handler
+  const fileInput = document.getElementById('svg-file-input');
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        const offscreen = document.createElement('canvas');
+        offscreen.width = 512;
+        offscreen.height = 512;
+        const ctx = offscreen.getContext('2d');
+        ctx.clearRect(0, 0, 512, 512);
+        ctx.drawImage(img, 0, 0, 512, 512);
+
+        gl.bindTexture(gl.TEXTURE_2D, svgTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offscreen);
+        settings.useSvg = true;
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  // Audio setup
+  const RAW_URL = '';
+  let audioCtx;
+  let analyser;
+  let sourceNode;
+  let previousData = new Float32Array(16).fill(0);
+
+  const audioElement = new Audio();
+  audioElement.src = RAW_URL;
+  audioElement.crossOrigin = 'anonymous';
+  audioElement.loop = true;
+  audioElement.preload = 'auto';
+
+  function setupAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (sourceNode) {
+      try { sourceNode.disconnect(); } catch {}
+    }
+    if (analyser) {
+      try { analyser.disconnect(); } catch {}
+    }
+    sourceNode = audioCtx.createMediaElementSource(audioElement);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 32;
+    sourceNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+  }
+
+  document.getElementById('start').addEventListener('click', async () => {
+    setupAudio();
+    try {
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      await audioElement.play();
+    } catch (e) {
+      console.error('Play failed:', e);
+    }
+    document.getElementById('start').style.display = 'none';
+  });
+
+  let lastTimeMs = null;
+  let accumulatedTime = 0.0;
+
+  function render(nowMs) {
+    if (lastTimeMs === null) lastTimeMs = nowMs;
+    const dt = (nowMs - lastTimeMs) * 0.001;
+    lastTimeMs = nowMs;
+
+    accumulatedTime += dt * settings.animSpeed;
+    const t = accumulatedTime;
+
+    // Calculate Animation Preset offsets
+    let animDragX = 0;
+    let animDragY = 0;
+    let animRot = 0;
+    let animZoomMult = 1.0;
+
+    switch (settings.animationPreset) {
+      case 'Cosmic Drift':
+        animDragX = Math.sin(t * 0.15) * 0.15;
+        animDragY = Math.cos(t * 0.12) * 0.12;
+        animRot = Math.sin(t * 0.05) * 0.1;
+        animZoomMult = 1.0 + Math.sin(t * 0.1) * 0.1;
+        break;
+      case 'Hypnotic Pulse':
+        animRot = Math.sin(t * 0.08) * 0.2;
+        animZoomMult = 1.0 + Math.sin(t * 0.25) * 0.25;
+        break;
+      case 'Orbital Spiral':
+        animDragX = Math.cos(t * 0.2) * 0.1;
+        animDragY = Math.sin(t * 0.2) * 0.1;
+        animRot = t * 0.08;
+        break;
+      case 'Oceanic Wave':
+        animDragX = Math.sin(t * 0.18) * 0.18;
+        animDragY = Math.sin(t * 0.36) * 0.09;
+        animRot = Math.cos(t * 0.1) * 0.15;
+        animZoomMult = 1.0 + Math.cos(t * 0.15) * 0.1;
+        break;
+      case 'Static':
+      default:
+        break;
+    }
+
+    // Audio data handling
+    const data = new Float32Array(16);
+    if (analyser) {
+      const bufferLen = analyser.frequencyBinCount;
+      const byteFreq = new Uint8Array(bufferLen);
+      analyser.getByteFrequencyData(byteFreq);
+      for (let i = 0; i < bufferLen; i++) data[i] = byteFreq[i] / 255.0;
+    }
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(resolutionLocation, canvas.width, canvas.height);
+    gl.uniform1f(timeLocation, t);
+    gl.uniform1fv(previousAudioDataLoc, previousData);
+    gl.uniform1fv(audioDataLoc, data);
+
+    // Pass custom uniforms
+    const finalZoom = settings.zoom * animZoomMult;
+    const finalDragX = settings.dragX + animDragX;
+    const finalDragY = settings.dragY + animDragY;
+
+    gl.uniform2f(dragLoc, finalDragX, finalDragY);
+    gl.uniform1f(zoomLoc, finalZoom);
+    gl.uniform1f(rotationLoc, animRot);
+
+    const bgRgb = hexToRgb(settings.bgColor);
+    gl.uniform3f(bgColorLoc, bgRgb[0], bgRgb[1], bgRgb[2]);
+    gl.uniform1f(greenscreenLoc, settings.greenscreen ? 1.0 : 0.0);
+
+    // Pass palette uniforms
+    const activePal = colorPresets[settings.colorScheme] || colorPresets['Cyber Neon'];
+    gl.uniform3fv(palALoc, activePal.a);
+    gl.uniform3fv(palBLoc, activePal.b);
+    gl.uniform3fv(palCLoc, activePal.c);
+    gl.uniform3fv(palDLoc, activePal.d);
+    gl.uniform1f(palFactorLoc, activePal.factor);
+
+    // Pass SVG uniforms
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, svgTexture);
+    gl.uniform1i(svgTextureLoc, 0);
+    gl.uniform1f(useSvgLoc, settings.useSvg ? 1.0 : 0.0);
+    gl.uniform1f(svgScaleLoc, settings.svgScale);
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    previousData = data;
+
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+
+  function resize() {
+    const dpr = settings.dpr;
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+</script>
+
+</body>
+</html>

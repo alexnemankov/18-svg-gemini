@@ -1,0 +1,1799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
+  <title>Unknown Galaxy</title>
+
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000000;
+      cursor: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: none;
+    }
+
+    .lil-gui,
+    .lil-gui * {
+      cursor: auto !important;
+    }
+
+    .lil-gui.root {
+      --background-color: rgba(12, 12, 12, 0.92);
+      --widget-color: #3f3f3f;
+      --hover-color: #505050;
+      --focus-color: #5a5a5a;
+      --text-color: #f2f2f2;
+      --number-color: #7fd2ff;
+      --string-color: #ffffff;
+      top: 12px;
+      right: 12px;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.20/+esm";
+
+    // -------------------------------------------------------------
+    // Inline PostProcessor Suite (Fixes file:// CORS issues)
+    // -------------------------------------------------------------
+    const postOrthoVertexShader = `
+      precision highp float;
+      in vec3 position;
+      out vec2 vUv;
+      void main() {
+        vUv = position.xy * 0.5 + 0.5;
+        gl_Position = vec4(position, 1.0);
+      }
+    `;
+
+    const postBlur13ShaderChunk = `
+      vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+        vec2 resolution = vec2(textureSize(image,0));
+        vec4 color = vec4(0.0);
+        vec2 off1 = vec2(1.411764705882353) * direction;
+        vec2 off2 = vec2(3.2941176470588234) * direction;
+        vec2 off3 = vec2(5.176470588235294) * direction;
+        color += texture(image, uv) * 0.1964825501511404;
+        color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+        color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+        return color;
+      }
+    `;
+
+    const postBlurFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform vec2 direction;
+      in vec2 vUv;
+      out vec4 color;
+      ${postBlur13ShaderChunk}
+      void main() {
+        color = blur13(inputTexture, vUv, direction);
+      }
+    `;
+
+    const postFinalFragmentShader = `
+      precision highp float;
+      uniform vec2 resolution;
+      uniform sampler2D inputTexture;
+      uniform sampler2D blur0Texture;
+      uniform sampler2D blur1Texture;
+      uniform sampler2D blur2Texture;
+      uniform sampler2D blur3Texture;
+      uniform sampler2D blur4Texture;
+      uniform float vignetteBoost;
+      uniform float vignetteReduction;
+      uniform float noiseIntensity;
+      uniform float time;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      float vignette(vec2 uv, float boost, float reduction) {
+        vec2 position = vUv - 0.5;
+        return boost - length(position) * reduction;
+      }
+
+      float hash1(uint n) {
+        n = (n << 13U) ^ n;
+        n = n * (n * n * 15731U + 789221U) + 1376312589U;
+        return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+      }
+
+      float noise(in vec2 uv, in float time) {
+        uvec2 p = uvec2(uv);
+        return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(time));
+      }
+
+      vec4 screen(vec4 base, vec4 blend, float opacity) {
+        vec4 color = 1.0 - (1.0 - base) * (1.0 - blend);
+        return color * opacity + base * (1.0 - opacity);
+      }
+
+      void main() {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+        
+        vec4 color = texture(inputTexture, vUv);
+        float factor = 40.0;
+        vec4 b = b0 / factor;
+        b += 2.0 * b1 / factor;
+        b += 4.0 * b2 / factor;
+        b += 8.0 * b3 / factor;
+        b += 16.0 * b4 / factor;
+        fragColor = color + b;
+        float f = 0.25;
+        b = clamp(b - f, vec4(0.0), vec4(1.0)) * (1.0 / (1.0 - f));
+        fragColor = screen(color, b, 1.0);
+        fragColor *= vignette(vUv, vignetteBoost, vignetteReduction);
+        fragColor += noiseIntensity * noise(gl_FragCoord.xy, time);
+        fragColor.a = 1.0;
+      }
+    `;
+
+    const postChromaticShaderChunk = `
+      vec2 barrelDistortion(vec2 coord, float amt) {
+        vec2 cc = coord - 0.5;
+        float dist = dot(cc, cc);
+        return coord + cc * dist * amt;
+      }
+      float sat(float t) { return clamp(t, 0.0, 1.0); }
+      float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+      float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+      vec4 spectrum_offset(float t) {
+        float lo = step(t, 0.5);
+        float hi = 1.0 - lo;
+        float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+        vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+        return pow(ret, vec4(1.0 / 2.2));
+      }
+      const float max_distort = 2.2;
+      const int num_iter = 8;
+      const float reci_num_iter_f = 1.0 / float(num_iter);
+      vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+        vec4 sumcol = vec4(0.0);
+        vec4 sumw = vec4(0.0);
+        for (int i = 0; i < num_iter; ++i) {
+          float t = float(i) * reci_num_iter_f;
+          vec4 w = spectrum_offset(t);
+          sumw += w;
+          sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+        }
+        return sumcol / sumw;
+      }
+    `;
+
+    const postColorFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float chromaticAberrationAmount;
+      uniform float minInputLevel;
+      uniform float maxInputLevel;
+      uniform float gammaLevel;
+      uniform float time;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      ${postChromaticShaderChunk}
+
+      vec3 gammaCorrect(vec3 color, vec3 gamma) {
+        return pow(color, 1.0 / gamma);
+      }
+      vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+        return min(max(color - minInput, vec3(0.0)) / (maxInput - minInput), vec3(1.0));
+      }
+      vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+        return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+      }
+      void main() {
+        vec2 uv = 0.8 * (vUv - 0.5) + 0.5;
+        fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (vUv - 0.5));
+        fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+        fragColor.a = 1.0;
+      }
+    `;
+
+    const postCopyFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        fragColor = texture(inputTexture, vUv);
+      }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.UnsignedByteType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer || true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) {
+          renderer.setRenderTarget(this.fbo);
+        }
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) {
+          renderer.setRenderTarget(null);
+        }
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 3, levels = 5) {
+        this.strength = strength;
+        this.levels = levels;
+        this.blurPasses = [];
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: postOrthoVertexShader,
+          fragmentShader: postBlurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+          }));
+        }
+      }
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+      set source(texture) {
+        this.blurShader.uniforms.inputTexture.value = texture;
+      }
+      render(renderer) {
+        const offset = this.strength;
+        const u = this.blurShader.uniforms;
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          u.direction.value.set(offset, 0);
+          blurPass.render(renderer);
+          u.inputTexture.value = blurPass.current.texture;
+          u.direction.value.set(0, offset / 2);
+          blurPass.render(renderer);
+          u.inputTexture.value = blurPass.current.texture;
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.8,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.45,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.02,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.06,
+          gamma: params.gamma !== undefined ? params.gamma : 0.85,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 9.0 / 255.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 237.0 / 255.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1);
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: postOrthoVertexShader,
+          fragmentShader: postFinalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            time: { value: 0 },
+          },
+          vertexShader: postOrthoVertexShader,
+          fragmentShader: postColorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: postOrthoVertexShader,
+          fragmentShader: postCopyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+
+        this.bloomPass = new BloomPass(this.settings.bloomStrength, 5);
+      }
+
+      updateSettings() {
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post Processor Settings") {
+        const folder = gui.addFolder(title);
+
+        folder.add(this.settings, "enabled").name("Enable PostProcess");
+        folder.add(this.settings, "bloomStrength", 0, 10, 0.1).name("Bloom Strength").onChange(() => this.updateSettings());
+        folder.add(this.settings, "chromaticAberration", 0, 0.5, 0.01).name("Chromatic Aberration").onChange(() => this.updateSettings());
+        folder.add(this.settings, "vignetteBoost", 0, 2, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        folder.add(this.settings, "vignetteReduction", 0, 2, 0.05).name("Vignette Reduction").onChange(() => this.updateSettings());
+        folder.add(this.settings, "noiseIntensity", 0, 0.2, 0.005).name("Noise Intensity").onChange(() => this.updateSettings());
+        folder.add(this.settings, "gamma", 0.1, 2.0, 0.05).name("Gamma Level").onChange(() => this.updateSettings());
+        folder.add(this.settings, "minInputLevel", 0, 0.5, 0.005).name("Min Input Level").onChange(() => this.updateSettings());
+        folder.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.005).name("Max Input Level").onChange(() => this.updateSettings());
+
+        return folder;
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Scene Setup
+    // -------------------------------------------------------------
+    const COLOR_SCHEMES = {
+      "Cyan Hyperdrive": {
+        particleColor: "#8af1ff",
+        lineColor: "#c7f8ff",
+        background: "#000000"
+      },
+      "Cosmic Violet": {
+        particleColor: "#ff44cc",
+        lineColor: "#9955ff",
+        background: "#080014"
+      },
+      "Solar Flare": {
+        particleColor: "#ffaa00",
+        lineColor: "#ff4400",
+        background: "#0f0500"
+      },
+      "Emerald Nebula": {
+        particleColor: "#00ffaa",
+        lineColor: "#70ffea",
+        background: "#00120b"
+      },
+      "Monochrome Void": {
+        particleColor: "#e0f7fa",
+        lineColor: "#ffffff",
+        background: "#020813"
+      }
+    };
+
+    const params = {
+      colorScheme: "Cyan Hyperdrive",
+      greenscreen: false,
+      animationPreset: "Slow Orbit",
+      animSpeed: 1.0,
+
+      cameraFov: 51,
+      cameraZ: 7.1,
+      cameraY: 4.0,
+
+      flowSpeed: 0.002,
+      twist: 2.3,
+
+      particleCount: 129000,
+      particleSize: 1.5,
+
+      neckRadius: 0.46,
+      upperWidth: 7.0,
+      lowerWidth: 1.0,
+      height: 2.91,
+
+      lineCount: 4,
+      lineOpacity: 0.0,
+      lineFade: 0.45,
+
+      brightness: 3.02,
+      coreBrightness: 2.7,
+
+      particleColor: "#8af1ff",
+      lineColor: "#c7f8ff",
+      background: "#000000",
+
+      starCount: 1800,
+      starOpacity: 0.5,
+      starFieldRadius: 65,
+
+      dpr: 1.5
+    };
+
+    const RESPONSIVE_REFERENCE_ASPECT = 16 / 9;
+    const RESPONSIVE_DISTANCE_STRENGTH = 0.72;
+    const MAX_RESPONSIVE_DISTANCE_SCALE = 2.4;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.background);
+
+    const camera = new THREE.PerspectiveCamera(
+      params.cameraFov,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      150
+    );
+
+    const cameraTarget = new THREE.Vector3(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,
+      powerPreference: "high-performance"
+    });
+
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1;
+
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.rotateSpeed = 0.8;
+    controls.zoomSpeed = 1.0;
+    controls.panSpeed = 0.8;
+
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomStrength: 1.8,
+      chromaticAberration: 0.06,
+      vignetteBoost: 1.0,
+      vignetteReduction: 0.45,
+      noiseIntensity: 0.02
+    });
+
+    const sharedFlowGLSL = `
+      const float TAU = 6.28318530718;
+
+      float easeInOut(float value) {
+        return value * value * (3.0 - 2.0 * value);
+      }
+
+      vec3 getFlowPosition(
+        float phase,
+        float lane,
+        float seed,
+        float region,
+        vec2 randomOffset,
+        float time,
+        float twist,
+        float neckRadius,
+        float upperWidth,
+        float lowerWidth,
+        float height
+      ) {
+        float progress = phase;
+        float y = 0.0;
+        float radius = 0.0;
+        float angle = 0.0;
+
+        if (region < 1.5) {
+          y = mix(
+            -0.48 * height,
+            0.48 * height,
+            progress
+          );
+
+          float centerDistance =
+            abs(progress - 0.5) * 2.0;
+
+          float bodyShape =
+            pow(centerDistance, 1.7);
+
+          float asymmetry =
+            mix(0.86, 1.18, progress);
+
+          radius =
+            neckRadius +
+            bodyShape *
+            mix(
+              1.45,
+              upperWidth,
+              lane
+            ) *
+            asymmetry;
+
+          angle =
+            TAU *
+            (
+              seed +
+              progress * twist +
+              0.04 *
+              sin(
+                progress * 12.0 +
+                seed * 17.0
+              )
+            );
+
+          radius *=
+            0.97 +
+            0.05 *
+            sin(
+              seed * 43.0 +
+              progress * 15.0
+            );
+        } else {
+          y =
+            0.5 * height -
+            0.65 *
+            pow(
+              1.0 - progress,
+              1.65
+            );
+
+          radius = mix(
+            neckRadius * 1.8,
+            upperWidth,
+            easeInOut(progress)
+          );
+
+          radius *= mix(
+            0.4,
+            1.0,
+            lane
+          );
+
+          angle =
+            TAU *
+            (
+              seed +
+              progress * twist +
+              0.025 *
+              sin(
+                progress * 10.0 +
+                seed * 17.0
+              )
+            );
+        }
+
+        float wave =
+          0.045 *
+          sin(
+            seed * 37.0 +
+            time * 2.0 +
+            y * 1.6
+          );
+
+        float x =
+          cos(angle) * radius +
+          wave * randomOffset.x;
+
+        float z =
+          sin(angle) *
+          radius *
+          0.72 +
+          wave * randomOffset.y;
+
+        if (region < 1.5) {
+          float shear =
+            smoothstep(
+              0.15,
+              0.95,
+              y / height + 0.5
+            );
+
+          x +=
+            (shear - 0.5) *
+            0.22;
+
+          z +=
+            sin(
+              y * 0.9 +
+              seed * 5.0
+            ) *
+            0.045;
+        }
+
+        return vec3(x, y, z);
+      }
+    `;
+
+    const particleVertexShader = `
+      uniform float uTime;
+      uniform float uPointSize;
+      uniform float uFlowSpeed;
+      uniform float uTwist;
+      uniform float uNeckRadius;
+      uniform float uUpperWidth;
+      uniform float uLowerWidth;
+      uniform float uHeight;
+
+      attribute vec4 aData;
+      attribute vec3 aRandom;
+
+      varying float vAlpha;
+      varying float vGlow;
+
+      ${sharedFlowGLSL}
+
+      void main() {
+        float lane = aData.x;
+        float seed = aData.y;
+        float region = aData.z;
+        float offset = aData.w;
+
+        float flowTime =
+          uTime * uFlowSpeed;
+
+        float phase =
+          fract(offset + flowTime);
+
+        vec3 flowPosition =
+          getFlowPosition(
+            phase,
+            lane,
+            seed,
+            region,
+            aRandom.xy,
+            flowTime,
+            uTwist,
+            uNeckRadius,
+            uUpperWidth,
+            uLowerWidth,
+            uHeight
+          );
+
+        vec4 viewPosition =
+          modelViewMatrix *
+          vec4(flowPosition, 1.0);
+
+        gl_Position =
+          projectionMatrix *
+          viewPosition;
+
+        float depthScale =
+          1.0 /
+          max(
+            1.0,
+            -viewPosition.z * 0.18
+          );
+
+        gl_PointSize = max(
+          1.0,
+          uPointSize *
+          depthScale *
+          (
+            0.72 +
+            0.72 * aRandom.z
+          )
+        );
+
+        float phaseFade =
+          smoothstep(
+            0.0,
+            0.06,
+            phase
+          ) *
+          (
+            1.0 -
+            smoothstep(
+              0.92,
+              1.0,
+              phase
+            )
+          );
+
+        vAlpha =
+          phaseFade *
+          (
+            0.22 +
+            0.78 * aRandom.z
+          );
+
+        if (region < 1.5) {
+          float radialDistance =
+            length(flowPosition.xz);
+
+          vGlow =
+            1.0 -
+            smoothstep(
+              uNeckRadius,
+              uNeckRadius + 0.9,
+              radialDistance
+            );
+        } else {
+          vGlow =
+            0.35 *
+            (1.0 - lane);
+        }
+      }
+    `;
+
+    const particleFragmentShader = `
+      uniform vec3 uColor;
+      uniform float uBrightness;
+      uniform float uCoreBrightness;
+
+      varying float vAlpha;
+      varying float vGlow;
+
+      void main() {
+        vec2 point =
+          gl_PointCoord - 0.5;
+
+        float radialDistance =
+          length(point);
+
+        float softMask =
+          1.0 -
+          smoothstep(
+            0.0,
+            0.5,
+            radialDistance
+          );
+
+        float coreMask =
+          1.0 -
+          smoothstep(
+            0.0,
+            0.13,
+            radialDistance
+          );
+
+        float intensity =
+          softMask * uBrightness +
+          coreMask *
+          uCoreBrightness *
+          (
+            0.45 +
+            vGlow
+          );
+
+        float alpha =
+          vAlpha * softMask;
+
+        if (alpha < 0.01) {
+          discard;
+        }
+
+        gl_FragColor = vec4(
+          uColor * intensity,
+          alpha
+        );
+      }
+    `;
+
+    const starVertexShader = `
+      uniform float uPointSize;
+
+      attribute float aStarScale;
+
+      varying float vStarAlpha;
+
+      void main() {
+        vec4 viewPosition =
+          modelViewMatrix *
+          vec4(position, 1.0);
+
+        gl_Position =
+          projectionMatrix *
+          viewPosition;
+
+        gl_PointSize = max(
+          1.0,
+          uPointSize *
+          (
+            0.72 +
+            aStarScale * 0.34
+          )
+        );
+
+        vStarAlpha =
+          0.62 +
+          aStarScale * 0.38;
+      }
+    `;
+
+    const starFragmentShader = `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+
+      varying float vStarAlpha;
+
+      void main() {
+        vec2 point =
+          gl_PointCoord - 0.5;
+
+        float radialDistance =
+          length(point);
+
+        float mask =
+          1.0 -
+          smoothstep(
+            0.08,
+            0.5,
+            radialDistance
+          );
+
+        float alpha =
+          mask *
+          uOpacity *
+          vStarAlpha;
+
+        if (alpha < 0.005) {
+          discard;
+        }
+
+        gl_FragColor = vec4(
+          uColor,
+          alpha
+        );
+      }
+    `;
+
+    const lineVertexShader = `
+      uniform float uTime;
+      uniform float uFlowSpeed;
+      uniform float uTwist;
+      uniform float uNeckRadius;
+      uniform float uUpperWidth;
+      uniform float uLowerWidth;
+      uniform float uHeight;
+      uniform float uLineFade;
+
+      attribute vec4 aLineData;
+      attribute vec3 aLineRandom;
+
+      varying float vLineAlpha;
+
+      ${sharedFlowGLSL}
+
+      void main() {
+        float localProgress =
+          aLineData.x;
+
+        float lane =
+          aLineData.y;
+
+        float seed =
+          aLineData.z;
+
+        float region =
+          aLineData.w;
+
+        float flowTime =
+          uTime * uFlowSpeed;
+
+        float phase =
+          fract(
+            localProgress +
+            flowTime
+          );
+
+        vec3 flowPosition =
+          getFlowPosition(
+            phase,
+            lane,
+            seed,
+            region,
+            aLineRandom.xy,
+            flowTime,
+            uTwist,
+            uNeckRadius,
+            uUpperWidth,
+            uLowerWidth,
+            uHeight
+          );
+
+        gl_Position =
+          projectionMatrix *
+          modelViewMatrix *
+          vec4(flowPosition, 1.0);
+
+        float startFade =
+          smoothstep(
+            0.0,
+            uLineFade,
+            localProgress
+          );
+
+        float endFade =
+          1.0 -
+          smoothstep(
+            1.0 - uLineFade,
+            1.0,
+            localProgress
+          );
+
+        float laneFade =
+          1.0 -
+          smoothstep(
+            0.72,
+            1.0,
+            lane
+          ) *
+          0.35;
+
+        vLineAlpha =
+          startFade *
+          endFade *
+          laneFade;
+      }
+    `;
+
+    const lineFragmentShader = `
+      uniform vec3 uLineColor;
+      uniform float uLineOpacity;
+
+      varying float vLineAlpha;
+
+      void main() {
+        float alpha =
+          vLineAlpha *
+          uLineOpacity;
+
+        if (alpha < 0.002) {
+          discard;
+        }
+
+        gl_FragColor = vec4(
+          uLineColor,
+          alpha
+        );
+      }
+    `;
+
+    let particlePoints = null;
+    let particleGeometry = null;
+    let particleMaterial = null;
+
+    let starPoints = null;
+    let starGeometry = null;
+    let starMaterial = null;
+
+    let flowLines = null;
+    let lineGeometry = null;
+    let lineMaterial = null;
+
+    function getResponsiveCameraDistance(width, height) {
+      const safeHeight = Math.max(height, 1);
+      const aspect = width / safeHeight;
+
+      if (aspect >= RESPONSIVE_REFERENCE_ASPECT) {
+        return params.cameraZ;
+      }
+
+      const narrowness =
+        RESPONSIVE_REFERENCE_ASPECT /
+        Math.max(aspect, 0.25);
+
+      const distanceScale =
+        1 +
+        (narrowness - 1) *
+        RESPONSIVE_DISTANCE_STRENGTH;
+
+      return (
+        params.cameraZ *
+        Math.min(
+          distanceScale,
+          MAX_RESPONSIVE_DISTANCE_SCALE
+        )
+      );
+    }
+
+    function updateCamera(width = window.innerWidth, height = window.innerHeight) {
+      const safeWidth = Math.max(width, 1);
+      const safeHeight = Math.max(height, 1);
+
+      const responsiveDistance =
+        getResponsiveCameraDistance(
+          safeWidth,
+          safeHeight
+        );
+
+      const directionLength =
+        Math.hypot(
+          params.cameraY,
+          params.cameraZ
+        );
+
+      const normalizedY =
+        directionLength > 0
+          ? params.cameraY / directionLength
+          : 0;
+
+      const normalizedZ =
+        directionLength > 0
+          ? params.cameraZ / directionLength
+          : 1;
+
+      const baseLength =
+        Math.hypot(
+          params.cameraY,
+          responsiveDistance
+        );
+
+      camera.fov = params.cameraFov;
+      camera.aspect = safeWidth / safeHeight;
+
+      camera.position.set(
+        0,
+        normalizedY * baseLength,
+        normalizedZ * baseLength
+      );
+
+      camera.lookAt(cameraTarget);
+      camera.updateProjectionMatrix();
+
+      if (controls) {
+        controls.target.copy(cameraTarget);
+        controls.update();
+      }
+    }
+
+    function updateBackgroundColor() {
+      if (params.greenscreen) {
+        scene.background.set("#00ff00");
+      } else {
+        scene.background.set(params.background);
+      }
+    }
+
+    function resizeRenderer() {
+      const width =
+        Math.max(
+          document.documentElement.clientWidth,
+          window.innerWidth,
+          1
+        );
+
+      const height =
+        Math.max(
+          document.documentElement.clientHeight,
+          window.innerHeight,
+          1
+        );
+
+      const pixelRatio = Math.min(
+        Number(params.dpr),
+        2
+      );
+
+      renderer.setPixelRatio(pixelRatio);
+      renderer.setSize(
+        width,
+        height,
+        false
+      );
+
+      postProcessor.setSize(
+        width,
+        height,
+        pixelRatio
+      );
+
+      updateCamera(
+        width,
+        height
+      );
+
+      updateFlowUniforms();
+    }
+
+    function createParticleUniforms() {
+      return {
+        uTime: {
+          value: 0
+        },
+        uPointSize: {
+          value:
+            params.particleSize *
+            params.dpr
+        },
+        uFlowSpeed: {
+          value: params.flowSpeed
+        },
+        uTwist: {
+          value: params.twist
+        },
+        uNeckRadius: {
+          value: params.neckRadius
+        },
+        uUpperWidth: {
+          value: params.upperWidth
+        },
+        uLowerWidth: {
+          value: params.lowerWidth
+        },
+        uHeight: {
+          value: params.height
+        },
+        uColor: {
+          value:
+            new THREE.Color(
+              params.particleColor
+            )
+        },
+        uBrightness: {
+          value: params.brightness
+        },
+        uCoreBrightness: {
+          value:
+            params.coreBrightness
+        }
+      };
+    }
+
+    function createStarUniforms() {
+      return {
+        uPointSize: {
+          value:
+            params.particleSize *
+            params.dpr
+        },
+        uColor: {
+          value:
+            new THREE.Color(
+              params.particleColor
+            )
+        },
+        uOpacity: {
+          value:
+            params.starOpacity
+        }
+      };
+    }
+
+    function createLineUniforms() {
+      return {
+        uTime: {
+          value: 0
+        },
+        uFlowSpeed: {
+          value: params.flowSpeed
+        },
+        uTwist: {
+          value: params.twist
+        },
+        uNeckRadius: {
+          value: params.neckRadius
+        },
+        uUpperWidth: {
+          value: params.upperWidth
+        },
+        uLowerWidth: {
+          value: params.lowerWidth
+        },
+        uHeight: {
+          value: params.height
+        },
+        uLineColor: {
+          value:
+            new THREE.Color(
+              params.lineColor
+            )
+        },
+        uLineOpacity: {
+          value: params.lineOpacity
+        },
+        uLineFade: {
+          value: params.lineFade
+        }
+      };
+    }
+
+    function rebuildStars() {
+      if (starPoints) {
+        scene.remove(starPoints);
+        starGeometry.dispose();
+        starMaterial.dispose();
+      }
+
+      const count = Math.floor(params.starCount);
+      const positions = new Float32Array(count * 3);
+      const starScales = new Float32Array(count);
+
+      for (let index = 0; index < count; index++) {
+        const index3 = index * 3;
+        const radius = params.starFieldRadius * (0.72 + Math.random() * 0.28);
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+
+        positions[index3] = radius * Math.sin(phi) * Math.cos(theta);
+        positions[index3 + 1] = radius * Math.cos(phi) * 0.65;
+        positions[index3 + 2] = radius * Math.sin(phi) * Math.sin(theta) - 15;
+        starScales[index] = Math.random();
+      }
+
+      starGeometry = new THREE.BufferGeometry();
+      starGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      starGeometry.setAttribute("aStarScale", new THREE.BufferAttribute(starScales, 1));
+      starGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, -15), params.starFieldRadius * 1.1);
+
+      starMaterial = new THREE.ShaderMaterial({
+        uniforms: createStarUniforms(),
+        vertexShader: starVertexShader,
+        fragmentShader: starFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        depthTest: true,
+        blending: THREE.AdditiveBlending
+      });
+
+      starPoints = new THREE.Points(starGeometry, starMaterial);
+      starPoints.frustumCulled = false;
+      starPoints.renderOrder = -1;
+      scene.add(starPoints);
+    }
+
+    function rebuildParticles() {
+      if (particlePoints) {
+        scene.remove(particlePoints);
+        particleGeometry.dispose();
+        particleMaterial.dispose();
+      }
+
+      const count = Math.floor(params.particleCount);
+      const positions = new Float32Array(count * 3);
+      const data = new Float32Array(count * 4);
+      const random = new Float32Array(count * 3);
+
+      for (let index = 0; index < count; index++) {
+        const index3 = index * 3;
+        const index4 = index * 4;
+        const region = Math.random() < 0.72 ? 1 : 2;
+        const lane = Math.pow(Math.random(), region === 1 ? 0.78 : 0.58);
+
+        data[index4] = lane;
+        data[index4 + 1] = Math.random();
+        data[index4 + 2] = region;
+        data[index4 + 3] = Math.random();
+
+        random[index3] = Math.random() * 2 - 1;
+        random[index3 + 1] = Math.random() * 2 - 1;
+        random[index3 + 2] = Math.random();
+      }
+
+      particleGeometry = new THREE.BufferGeometry();
+      particleGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      particleGeometry.setAttribute("aData", new THREE.BufferAttribute(data, 4));
+      particleGeometry.setAttribute("aRandom", new THREE.BufferAttribute(random, 3));
+      particleGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 20);
+
+      particleMaterial = new THREE.ShaderMaterial({
+        uniforms: createParticleUniforms(),
+        vertexShader: particleVertexShader,
+        fragmentShader: particleFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        depthTest: true,
+        blending: THREE.AdditiveBlending
+      });
+
+      particlePoints = new THREE.Points(particleGeometry, particleMaterial);
+      particlePoints.frustumCulled = false;
+      particlePoints.renderOrder = 1;
+      scene.add(particlePoints);
+    }
+
+    function rebuildLines() {
+      if (flowLines) {
+        scene.remove(flowLines);
+        lineGeometry.dispose();
+        lineMaterial.dispose();
+      }
+
+      const lineCount = Math.floor(params.lineCount);
+      const activeRegions = [1, 2];
+      const samplesPerLine = 260;
+      const segmentCount = samplesPerLine - 1;
+      const vertexCount = lineCount * activeRegions.length * segmentCount * 2;
+
+      const positions = new Float32Array(vertexCount * 3);
+      const lineData = new Float32Array(vertexCount * 4);
+      const lineRandom = new Float32Array(vertexCount * 3);
+
+      let vertexIndex = 0;
+
+      function writeVertex(progress, lane, seed, region, randomX, randomY) {
+        const index3 = vertexIndex * 3;
+        const index4 = vertexIndex * 4;
+
+        lineData[index4] = progress;
+        lineData[index4 + 1] = lane;
+        lineData[index4 + 2] = seed;
+        lineData[index4 + 3] = region;
+
+        lineRandom[index3] = randomX;
+        lineRandom[index3 + 1] = randomY;
+
+        vertexIndex++;
+      }
+
+      for (let regionIndex = 0; regionIndex < activeRegions.length; regionIndex++) {
+        const region = activeRegions[regionIndex];
+        for (let lineIndex = 0; lineIndex < lineCount; lineIndex++) {
+          const lineRatio = lineCount > 1 ? lineIndex / (lineCount - 1) : 0.5;
+          const lane = 0.08 + Math.pow(lineRatio, region === 1 ? 0.82 : 0.64) * 0.82;
+          const seed = lineIndex / Math.max(lineCount, 1) + regionIndex * 0.173;
+          const randomX = Math.sin(seed * 91.7) * 0.7;
+          const randomY = Math.cos(seed * 73.3) * 0.7;
+
+          for (let sample = 0; sample < segmentCount; sample++) {
+            const progressA = sample / segmentCount;
+            const progressB = (sample + 1) / segmentCount;
+
+            writeVertex(progressA, lane, seed, region, randomX, randomY);
+            writeVertex(progressB, lane, seed, region, randomX, randomY);
+          }
+        }
+      }
+
+      lineGeometry = new THREE.BufferGeometry();
+      lineGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      lineGeometry.setAttribute("aLineData", new THREE.BufferAttribute(lineData, 4));
+      lineGeometry.setAttribute("aLineRandom", new THREE.BufferAttribute(lineRandom, 3));
+      lineGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 20);
+
+      lineMaterial = new THREE.ShaderMaterial({
+        uniforms: createLineUniforms(),
+        vertexShader: lineVertexShader,
+        fragmentShader: lineFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        depthTest: true,
+        blending: THREE.AdditiveBlending
+      });
+
+      flowLines = new THREE.LineSegments(lineGeometry, lineMaterial);
+      flowLines.frustumCulled = false;
+      flowLines.renderOrder = 0;
+      scene.add(flowLines);
+    }
+
+    function updateFlowUniforms() {
+      const pixelRatio = Math.min(Number(params.dpr), 2);
+
+      if (particleMaterial) {
+        const uniforms = particleMaterial.uniforms;
+        uniforms.uPointSize.value = params.particleSize * pixelRatio;
+        uniforms.uFlowSpeed.value = params.flowSpeed;
+        uniforms.uTwist.value = params.twist;
+        uniforms.uNeckRadius.value = params.neckRadius;
+        uniforms.uUpperWidth.value = params.upperWidth;
+        uniforms.uLowerWidth.value = params.lowerWidth;
+        uniforms.uHeight.value = params.height;
+        uniforms.uBrightness.value = params.brightness;
+        uniforms.uCoreBrightness.value = params.coreBrightness;
+        uniforms.uColor.value.set(params.particleColor);
+      }
+
+      if (starMaterial) {
+        const uniforms = starMaterial.uniforms;
+        uniforms.uPointSize.value = params.particleSize * pixelRatio;
+        uniforms.uColor.value.set(params.particleColor);
+        uniforms.uOpacity.value = params.starOpacity;
+      }
+
+      if (lineMaterial) {
+        const uniforms = lineMaterial.uniforms;
+        uniforms.uFlowSpeed.value = params.flowSpeed;
+        uniforms.uTwist.value = params.twist;
+        uniforms.uNeckRadius.value = params.neckRadius;
+        uniforms.uUpperWidth.value = params.upperWidth;
+        uniforms.uLowerWidth.value = params.lowerWidth;
+        uniforms.uHeight.value = params.height;
+        uniforms.uLineOpacity.value = params.lineOpacity;
+        uniforms.uLineFade.value = params.lineFade;
+        uniforms.uLineColor.value.set(params.lineColor);
+      }
+    }
+
+    rebuildStars();
+    rebuildParticles();
+    rebuildLines();
+    resizeRenderer();
+
+    const gui = new GUI({
+      title: "Settings"
+    });
+
+    const presetsFolder = gui.addFolder("Presets & Modes");
+
+    presetsFolder
+      .add(params, "colorScheme", Object.keys(COLOR_SCHEMES))
+      .name("Color Scheme")
+      .onChange((schemeName) => {
+        const scheme = COLOR_SCHEMES[schemeName];
+        if (scheme) {
+          params.particleColor = scheme.particleColor;
+          params.lineColor = scheme.lineColor;
+          params.background = scheme.background;
+
+          particleColorCtrl.updateDisplay();
+          lineColorCtrl.updateDisplay();
+          backgroundCtrl.updateDisplay();
+
+          updateBackgroundColor();
+          updateFlowUniforms();
+        }
+      });
+
+    const greenscreenCtrl = presetsFolder
+      .add(params, "greenscreen")
+      .name("Greenscreen (#00ff00)")
+      .onChange(updateBackgroundColor);
+
+    presetsFolder
+      .add(params, "animationPreset", [
+        "Static (Manual Control)",
+        "Slow Orbit",
+        "Gentle Wave",
+        "Deep Breathing Zoom",
+        "Spiral Drift"
+      ])
+      .name("Animation Preset");
+
+    presetsFolder
+      .add(params, "animSpeed", 0.0, 3.0, 0.05)
+      .name("Anim Speed Multiplier");
+
+    const cameraFolder = gui.addFolder("Camera");
+
+    cameraFolder
+      .add(params, "cameraFov", 30, 75, 1)
+      .name("FOV")
+      .onChange(() => updateCamera());
+
+    cameraFolder
+      .add(params, "cameraZ", 4, 12, 0.1)
+      .name("Distance")
+      .onChange(() => updateCamera());
+
+    cameraFolder
+      .add(params, "cameraY", -6, 6, 0.01)
+      .name("Vertical")
+      .onChange(() => updateCamera());
+
+    const animationFolder = gui.addFolder("Flow Speed");
+
+    animationFolder
+      .add(params, "flowSpeed", 0, 0.12, 0.001)
+      .name("Flow Speed")
+      .onChange(updateFlowUniforms);
+
+    animationFolder
+      .add(params, "twist", 0, 8, 0.01)
+      .name("Twist")
+      .onChange(updateFlowUniforms);
+
+    const geometryFolder = gui.addFolder("Geometry");
+
+    geometryFolder
+      .add(params, "particleCount", 30000, 220000, 1000)
+      .name("Particle Count")
+      .onFinishChange(rebuildParticles);
+
+    geometryFolder
+      .add(params, "particleSize", 0.4, 3, 0.01)
+      .name("Particle Size")
+      .onChange(updateFlowUniforms);
+
+    geometryFolder
+      .add(params, "neckRadius", 0.15, 1, 0.01)
+      .name("Neck Radius")
+      .onChange(updateFlowUniforms);
+
+    geometryFolder
+      .add(params, "upperWidth", 1, 7, 0.01)
+      .name("Upper Width")
+      .onChange(updateFlowUniforms);
+
+    geometryFolder
+      .add(params, "lowerWidth", 1, 7, 0.01)
+      .name("Lower Width")
+      .onChange(updateFlowUniforms);
+
+    geometryFolder
+      .add(params, "height", 2, 8, 0.01)
+      .name("Height")
+      .onChange(updateFlowUniforms);
+
+    geometryFolder
+      .add(params, "lineCount", 0, 32, 1)
+      .name("Line Count")
+      .onFinishChange(rebuildLines);
+
+    const materialFolder = gui.addFolder("Material");
+
+    materialFolder
+      .add(params, "brightness", 0.1, 4, 0.01)
+      .name("Brightness")
+      .onChange(updateFlowUniforms);
+
+    materialFolder
+      .add(params, "coreBrightness", 0, 5, 0.01)
+      .name("Core Brightness")
+      .onChange(updateFlowUniforms);
+
+    materialFolder
+      .add(params, "lineOpacity", 0, 1, 0.01)
+      .name("Line Opacity")
+      .onChange(updateFlowUniforms);
+
+    materialFolder
+      .add(params, "lineFade", 0.03, 0.45, 0.01)
+      .name("Line End Fade")
+      .onChange(updateFlowUniforms);
+
+    const colorsFolder = gui.addFolder("Colors");
+
+    const particleColorCtrl = colorsFolder
+      .addColor(params, "particleColor")
+      .name("Particles")
+      .onChange(updateFlowUniforms);
+
+    const lineColorCtrl = colorsFolder
+      .addColor(params, "lineColor")
+      .name("Lines")
+      .onChange(updateFlowUniforms);
+
+    const backgroundCtrl = colorsFolder
+      .addColor(params, "background")
+      .name("Background")
+      .onChange((value) => {
+        if (params.greenscreen) {
+          params.greenscreen = false;
+          greenscreenCtrl.updateDisplay();
+        }
+        updateBackgroundColor();
+      });
+
+    // Attach PostProcessor settings into lil-gui
+    postProcessor.attachGUI(gui, "Post Processing");
+
+    const performanceFolder = gui.addFolder("Performance");
+
+    performanceFolder
+      .add(params, "dpr", [0.5, 0.75, 1, 1.25, 1.5, 2])
+      .name("DPR (Pixel Ratio)")
+      .onChange(resizeRenderer);
+
+    gui.close();
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "h" || e.key === "H") {
+        gui._hidden ? gui.show() : gui.hide();
+      }
+    });
+
+    const clock = new THREE.Clock();
+
+    let elapsed = 0;
+    let resizeFrame = 0;
+
+    function handleResize() {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(resizeRenderer);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.05);
+      elapsed += delta * params.animSpeed;
+
+      if (particleMaterial) {
+        particleMaterial.uniforms.uTime.value = elapsed;
+      }
+
+      if (lineMaterial) {
+        lineMaterial.uniforms.uTime.value = elapsed;
+      }
+
+      if (starPoints) {
+        starPoints.rotation.y = elapsed * 0.002;
+        starPoints.rotation.x = Math.sin(elapsed * 0.025) * 0.008;
+      }
+
+      const preset = params.animationPreset;
+      const baseDist = params.cameraZ;
+      const baseHeight = params.cameraY;
+
+      if (preset === "Slow Orbit") {
+        const orbitAngle = elapsed * 0.2;
+        camera.position.x = Math.sin(orbitAngle) * baseDist;
+        camera.position.z = Math.cos(orbitAngle) * baseDist;
+        camera.position.y = baseHeight + Math.sin(elapsed * 0.3) * 0.5;
+        camera.lookAt(controls.target);
+      } else if (preset === "Gentle Wave") {
+        const waveX = Math.sin(elapsed * 0.4) * 1.5;
+        const waveY = baseHeight + Math.cos(elapsed * 0.3) * 0.8;
+        camera.position.x = waveX;
+        camera.position.y = waveY;
+        camera.position.z = baseDist + Math.sin(elapsed * 0.2) * 0.5;
+        camera.lookAt(controls.target);
+      } else if (preset === "Deep Breathing Zoom") {
+        const zoomOffset = Math.sin(elapsed * 0.35) * 2.2;
+        const currentDist = Math.max(3.0, baseDist + zoomOffset);
+        const ratio = currentDist / Math.hypot(baseHeight, baseDist);
+        camera.position.x = 0;
+        camera.position.y = baseHeight * ratio;
+        camera.position.z = baseDist * ratio;
+        camera.lookAt(controls.target);
+      } else if (preset === "Spiral Drift") {
+        const spiralAngle = elapsed * 0.15;
+        const r = baseDist + Math.sin(elapsed * 0.25) * 0.8;
+        camera.position.x = Math.sin(spiralAngle) * r;
+        camera.position.z = Math.cos(spiralAngle) * r;
+        camera.position.y = baseHeight + Math.cos(spiralAngle * 1.5) * 1.2;
+        camera.lookAt(controls.target);
+      }
+
+      controls.update();
+      postProcessor.renderScene(scene, camera);
+    }
+
+    window.addEventListener("resize", handleResize, { passive: true });
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", handleResize, { passive: true });
+    }
+
+    animate();
+  </script>
+</body>
+</html>
