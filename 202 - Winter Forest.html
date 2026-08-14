@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Procedural Winter Forest</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: #120902;
+      font-family: sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.115.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.115.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+
+<script type="module">
+  import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+  // -------------------------------------------------------------
+  // PostProcessor Suite (GLSL 100 Compatible with Controllable Bloom)
+  // -------------------------------------------------------------
+  const orthoVertexShader = `
+  precision highp float;
+  attribute vec3 position;
+  varying vec2 vUv;
+  void main() {
+    vUv = position.xy * 0.5 + 0.5;
+    gl_Position = vec4(position, 1.0);
+  }
+  `;
+
+  const blur13ShaderChunk = `
+  vec4 blur13(sampler2D image, vec2 uv, vec2 dir, vec2 res) {
+    vec4 color = vec4(0.0);
+    vec2 off1 = vec2(1.411764705882353) * dir;
+    vec2 off2 = vec2(3.2941176470588234) * dir;
+    vec2 off3 = vec2(5.176470588235294) * dir;
+    color += texture2D(image, uv) * 0.1964825501511404;
+    color += texture2D(image, uv + (off1 / res)) * 0.2969069646728344;
+    color += texture2D(image, uv - (off1 / res)) * 0.2969069646728344;
+    color += texture2D(image, uv + (off2 / res)) * 0.09447039785044732;
+    color += texture2D(image, uv - (off2 / res)) * 0.09447039785044732;
+    color += texture2D(image, uv + (off3 / res)) * 0.010381362401148057;
+    color += texture2D(image, uv - (off3 / res)) * 0.010381362401148057;
+    return color;
+  }
+  `;
+
+  const blurFragmentShader = `
+  precision highp float;
+  uniform sampler2D inputTexture;
+  uniform vec2 direction;
+  uniform vec2 resolution;
+  varying vec2 vUv;
+  ${blur13ShaderChunk}
+  void main() {
+    gl_FragColor = blur13(inputTexture, vUv, direction, resolution);
+  }
+  `;
+
+  const finalFragmentShader = `
+  precision highp float;
+  uniform vec2 resolution;
+  uniform sampler2D inputTexture;
+  uniform sampler2D blur0Texture;
+  uniform sampler2D blur1Texture;
+  uniform sampler2D blur2Texture;
+  uniform sampler2D blur3Texture;
+  uniform sampler2D blur4Texture;
+  uniform float bloomStrength;
+  uniform float vignetteBoost;
+  uniform float vignetteReduction;
+  uniform float noiseIntensity;
+  uniform float time;
+  varying vec2 vUv;
+
+  float vignette(vec2 uv, float boost, float reduction) {
+    vec2 position = uv - 0.5;
+    return boost - length(position) * reduction;
+  }
+
+  float noise(vec2 uv, float t) {
+    return fract(sin(dot(uv + vec2(t * 0.001, t * 0.0005), vec2(12.9898, 78.233))) * 43758.5453);
+  }
+
+  void main() {
+    vec4 b0 = texture2D(blur0Texture, vUv);
+    vec4 b1 = texture2D(blur1Texture, vUv);
+    vec4 b2 = texture2D(blur2Texture, vUv);
+    vec4 b3 = texture2D(blur3Texture, vUv);
+    vec4 b4 = texture2D(blur4Texture, vUv);
+    
+    vec4 color = texture2D(inputTexture, vUv);
+    
+    vec4 b = (b0 + b1 * 0.7 + b2 * 0.5 + b3 * 0.3 + b4 * 0.1) * 0.25;
+    b *= bloomStrength;
+    
+    vec4 fragColor = color + b;
+    fragColor *= vignette(vUv, vignetteBoost, vignetteReduction);
+    fragColor += noiseIntensity * noise(gl_FragCoord.xy, time);
+    fragColor.a = 1.0;
+    gl_FragColor = fragColor;
+  }
+  `;
+
+  const chromaticAberrationShaderChunk = `
+  vec2 barrelDistortion(vec2 coord, float amt) {
+    vec2 cc = coord - 0.5;
+    float dist = dot(cc, cc);
+    return coord + cc * dist * amt;
+  }
+  float sat(float t) { return clamp(t, 0.0, 1.0); }
+  float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+  float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+  vec4 spectrum_offset(float t) {
+    float lo = step(t, 0.5);
+    float hi = 1.0 - lo;
+    float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+    vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+    return pow(ret, vec4(1.0 / 2.2));
+  }
+  const float max_distort = 2.2;
+  const int num_iter = 8;
+  const float reci_num_iter_f = 0.125;
+
+  vec4 chromaticAberration(sampler2D inputTex, vec2 uv, float amount, vec2 dir) {
+    vec4 sumcol = vec4(0.0);
+    vec4 sumw = vec4(0.0);
+    for (int i = 0; i < num_iter; ++i) {
+      float t = float(i) * reci_num_iter_f;
+      vec4 w = spectrum_offset(t);
+      sumw += w;
+      sumcol += w * texture2D(inputTex, barrelDistortion(uv, amount * max_distort * t));
+    }
+    return sumcol / sumw;
+  }
+  `;
+
+  const colorFragmentShader = `
+  precision highp float;
+  uniform sampler2D inputTexture;
+  uniform float chromaticAberrationAmount;
+  uniform float minInputLevel;
+  uniform float maxInputLevel;
+  uniform float gammaLevel;
+  uniform float time;
+  varying vec2 vUv;
+
+  ${chromaticAberrationShaderChunk}
+
+  vec3 gammaCorrect(vec3 color, vec3 gamma) {
+    return pow(color, 1.0 / gamma);
+  }
+  vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+    return min(max(color - minInput, vec3(0.0)) / (maxInput - minInput), vec3(1.0));
+  }
+  vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+    return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+  }
+
+  void main() {
+    vec2 uv = 0.8 * (vUv - 0.5) + 0.5;
+    vec4 fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (vUv - 0.5));
+    fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+    fragColor.a = 1.0;
+    gl_FragColor = fragColor;
+  }
+  `;
+
+  const copyFragmentShader = `
+  precision highp float;
+  uniform sampler2D inputTexture;
+  varying vec2 vUv;
+  void main() {
+    gl_FragColor = texture2D(inputTexture, vUv);
+  }
+  `;
+
+  function createFBO(w, h, options = {}) {
+    return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+      wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+      wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+      minFilter: options.minFilter || THREE.LinearFilter,
+      magFilter: options.magFilter || THREE.LinearFilter,
+      format: options.format || THREE.RGBAFormat,
+      type: options.type || THREE.UnsignedByteType,
+      stencilBuffer: options.stencilBuffer || false,
+      depthBuffer: options.depthBuffer || true,
+      samples: options.samples || 0,
+    });
+  }
+
+  class ShaderPass {
+    constructor(shader, options = {}) {
+      this.shader = shader;
+      this.orthoScene = new THREE.Scene();
+      this.fbo = createFBO(1, 1, options);
+      this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+      this.orthoScene.add(this.orthoQuad);
+      this.texture = this.fbo.texture;
+    }
+    render(renderer, toScreen = false) {
+      if (!toScreen) {
+        renderer.setRenderTarget(this.fbo);
+      }
+      renderer.render(this.orthoScene, this.orthoCamera);
+      if (!toScreen) {
+        renderer.setRenderTarget(null);
+      }
+    }
+    setSize(width, height) {
+      this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+    }
+  }
+
+  class ShaderPingPongPass {
+    constructor(shader, options = {}) {
+      this.shader = shader;
+      this.orthoScene = new THREE.Scene();
+      this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+      this.currentFBO = 0;
+      this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+      this.orthoScene.add(this.orthoQuad);
+    }
+    render(renderer) {
+      renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+      renderer.render(this.orthoScene, this.orthoCamera);
+      renderer.setRenderTarget(null);
+      this.currentFBO = 1 - this.currentFBO;
+    }
+    get current() { return this.fbos[this.currentFBO]; }
+    get texture() { return this.current.texture; }
+    setSize(width, height) {
+      const w = Math.max(1, width);
+      const h = Math.max(1, height);
+      this.fbos[0].setSize(w, h);
+      this.fbos[1].setSize(w, h);
+    }
+  }
+
+  class BloomPass {
+    constructor(strength = 0.5, levels = 5) {
+      this.strength = strength;
+      this.levels = levels;
+      this.blurPasses = [];
+      for (let i = 0; i < this.levels; i++) {
+        const blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+            resolution: { value: new THREE.Vector2(512, 512) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+        });
+        this.blurPasses.push(new ShaderPingPongPass(blurShader, {
+          format: THREE.RGBAFormat,
+        }));
+      }
+    }
+    setSize(w, h) {
+      let tw = Math.max(1, w);
+      let th = Math.max(1, h);
+      for (let i = 0; i < this.levels; i++) {
+        tw = Math.max(1, Math.round(tw / 2));
+        th = Math.max(1, Math.round(th / 2));
+        this.blurPasses[i].setSize(tw, th);
+        this.blurPasses[i].shader.uniforms.resolution.value.set(tw, th);
+      }
+    }
+    set source(texture) {
+      this.blurPasses[0].shader.uniforms.inputTexture.value = texture;
+    }
+    render(renderer) {
+      const offset = 1.2;
+      for (let j = 0; j < this.levels; j++) {
+        const blurPass = this.blurPasses[j];
+        const u = blurPass.shader.uniforms;
+
+        u.direction.value.set(offset, 0);
+        blurPass.render(renderer);
+
+        u.inputTexture.value = blurPass.current.texture;
+        u.direction.value.set(0, offset);
+        blurPass.render(renderer);
+
+        if (j < this.levels - 1) {
+          this.blurPasses[j + 1].shader.uniforms.inputTexture.value = blurPass.current.texture;
+        }
+      }
+    }
+  }
+
+  class PostProcessor {
+    constructor(renderer, params = {}) {
+      this.renderer = renderer;
+
+      this.settings = {
+        enabled: params.enabled !== undefined ? params.enabled : true,
+        bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.5,
+        vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
+        vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.5,
+        noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.02,
+        chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.03,
+        gamma: params.gamma !== undefined ? params.gamma : 0.9,
+        minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+        maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+      };
+
+      this.sceneTarget = createFBO(1, 1);
+
+      this.finalShader = new THREE.RawShaderMaterial({
+        uniforms: {
+          resolution: { value: new THREE.Vector2(1, 1) },
+          bloomStrength: { value: this.settings.bloomStrength },
+          vignetteBoost: { value: this.settings.vignetteBoost },
+          vignetteReduction: { value: this.settings.vignetteReduction },
+          noiseIntensity: { value: this.settings.noiseIntensity },
+          inputTexture: { value: null },
+          blur0Texture: { value: null },
+          blur1Texture: { value: null },
+          blur2Texture: { value: null },
+          blur3Texture: { value: null },
+          blur4Texture: { value: null },
+          time: { value: 0 },
+        },
+        vertexShader: orthoVertexShader,
+        fragmentShader: finalFragmentShader,
+      });
+      this.finalPass = new ShaderPass(this.finalShader);
+
+      this.rgbShader = new THREE.RawShaderMaterial({
+        uniforms: {
+          inputTexture: { value: this.finalPass.texture },
+          chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+          minInputLevel: { value: this.settings.minInputLevel },
+          maxInputLevel: { value: this.settings.maxInputLevel },
+          gammaLevel: { value: this.settings.gamma },
+          time: { value: 0 },
+        },
+        vertexShader: orthoVertexShader,
+        fragmentShader: colorFragmentShader,
+      });
+      this.rgbPass = new ShaderPass(this.rgbShader);
+
+      this.copyShader = new THREE.RawShaderMaterial({
+        uniforms: {
+          inputTexture: { value: null },
+        },
+        vertexShader: orthoVertexShader,
+        fragmentShader: copyFragmentShader,
+      });
+      this.copyPass = new ShaderPass(this.copyShader);
+
+      this.bloomPass = new BloomPass(this.settings.bloomStrength, 5);
+    }
+
+    updateSettings() {
+      this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+      this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+      this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+      this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+      this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+      this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+      this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+      this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+    }
+
+    setSize(w0, h0, dpr = 1) {
+      const w = Math.max(1, Math.floor(w0 * dpr));
+      const h = Math.max(1, Math.floor(h0 * dpr));
+      this.sceneTarget.setSize(w, h);
+      this.finalPass.setSize(w, h);
+      this.finalShader.uniforms.resolution.value.set(w, h);
+      this.bloomPass.setSize(w, h);
+      this.rgbPass.setSize(w, h);
+      this.copyPass.setSize(w, h);
+    }
+
+    renderScene(scene, camera) {
+      if (!this.settings.enabled) {
+        this.renderer.render(scene, camera);
+        return;
+      }
+      this.renderer.setRenderTarget(this.sceneTarget);
+      this.renderer.render(scene, camera);
+      this.renderer.setRenderTarget(null);
+      this.render(this.sceneTarget.texture);
+    }
+
+    render(sourceTexture) {
+      if (!this.settings.enabled) {
+        this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.copyPass.render(this.renderer, true);
+        return;
+      }
+
+      this.updateSettings();
+
+      this.bloomPass.source = sourceTexture;
+      this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+      this.bloomPass.render(this.renderer);
+
+      this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+      this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+      this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+      this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+      this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+      const randomTime = Math.random() * 100000;
+      this.finalPass.shader.uniforms.time.value = randomTime;
+      this.rgbPass.shader.uniforms.time.value = randomTime;
+
+      this.finalPass.render(this.renderer);
+      this.rgbPass.render(this.renderer, true);
+    }
+
+    attachGUI(gui, title = "Post Processor Pipeline") {
+      const folder = gui.addFolder(title);
+
+      folder.add(this.settings, "enabled").name("Enable PostProcess");
+      folder.add(this.settings, "bloomStrength", 0.0, 3.0, 0.05).name("Pyramid Bloom").onChange(() => this.updateSettings());
+      folder.add(this.settings, "chromaticAberration", 0.0, 0.3, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+      folder.add(this.settings, "vignetteBoost", 0.0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+      folder.add(this.settings, "vignetteReduction", 0.0, 2.0, 0.05).name("Vignette Reduction").onChange(() => this.updateSettings());
+      folder.add(this.settings, "noiseIntensity", 0.0, 0.1, 0.002).name("Film Noise").onChange(() => this.updateSettings());
+      folder.add(this.settings, "gamma", 0.1, 2.0, 0.05).name("Gamma Level").onChange(() => this.updateSettings());
+      folder.add(this.settings, "minInputLevel", 0.0, 0.5, 0.005).name("Min Input Level").onChange(() => this.updateSettings());
+      folder.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.005).name("Max Input Level").onChange(() => this.updateSettings());
+
+      return folder;
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Scene Setup & Logic
+  // -------------------------------------------------------------
+  const { PI, sin, cos } = Math;
+  const TAU = 2 * PI;
+
+  const map = (value, sMin, sMax, dMin, dMax) => {
+    return dMin + ((value - sMin) / (sMax - sMin)) * (dMax - dMin);
+  };
+
+  const range = (n, m = 0) =>
+    Array(n)
+      .fill(m)
+      .map((i, j) => i + j);
+
+  const rand = (max, min = 0) => min + Math.random() * (max - min);
+  const randInt = (max, min = 0) => Math.floor(min + Math.random() * (max - min));
+  const randChoise = (arr) => arr[randInt(arr.length)];
+  const polar = (ang, r = 1) => [r * cos(ang), r * sin(ang)];
+
+  let scene, camera, renderer, controls, postProcessor;
+  let step = 0;
+  let pointTexture;
+  const fftSize = 2048;
+  const totalPoints = 4000;
+
+  const treeGeometries = [];
+  const snowGeometries = [];
+  const planeGeometries = [];
+
+  const COLOR_SCHEMES = {
+    "Golden Aurora": {
+      treePrimary: "#ffb700",
+      treeSecondary: "#ff3300",
+      snowColor: "#fff3cf",
+      groundColor: "#ffaa00",
+      bgColor: "#120902",
+      bloomStrength: 0.5
+    },
+    "Cyberpunk Neon": {
+      treePrimary: "#00f0ff",
+      treeSecondary: "#ff007f",
+      snowColor: "#d0ffff",
+      groundColor: "#7000ff",
+      bgColor: "#050414",
+      bloomStrength: 0.7
+    },
+    "Emerald Enchantment": {
+      treePrimary: "#00ff88",
+      treeSecondary: "#0099ff",
+      snowColor: "#d4ffe9",
+      groundColor: "#005533",
+      bgColor: "#021008",
+      bloomStrength: 0.4
+    },
+    "Vaporwave Sunset": {
+      treePrimary: "#ff66aa",
+      treeSecondary: "#ffaa44",
+      snowColor: "#ffe4f1",
+      groundColor: "#993377",
+      bgColor: "#16081e",
+      bloomStrength: 0.6
+    },
+    "Cosmic Ice": {
+      treePrimary: "#77ccff",
+      treeSecondary: "#ffffff",
+      snowColor: "#ffffff",
+      groundColor: "#3377bb",
+      bgColor: "#030914",
+      bloomStrength: 0.5
+    }
+  };
+
+  const params = {
+    // Background & Display
+    greenScreen: false,
+    greenScreenColor: "#00ff00",
+    bgColor: COLOR_SCHEMES["Golden Aurora"].bgColor,
+    dpr: Math.min(window.devicePixelRatio || 1, 2),
+
+    // Color Scheme & Styling
+    colorScheme: "Golden Aurora",
+    treePrimary: COLOR_SCHEMES["Golden Aurora"].treePrimary,
+    treeSecondary: COLOR_SCHEMES["Golden Aurora"].treeSecondary,
+    snowColor: COLOR_SCHEMES["Golden Aurora"].snowColor,
+    groundColor: COLOR_SCHEMES["Golden Aurora"].groundColor,
+
+    // Animation & Speed
+    animationPreset: "Static (No Camera Motion)",
+    speed: 1.0,
+
+    // Bloom Strength
+    bloomStrength: COLOR_SCHEMES["Golden Aurora"].bloomStrength,
+
+    // Interactivity
+    clickRandomize: true
+  };
+
+  const uniforms = {
+    time: { type: "f", value: 0.0 },
+    step: { type: "f", value: 0.0 },
+    tAudioData: { value: null }
+  };
+
+  let gui;
+
+  function createPointTexture() {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d");
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,1.0)");
+    grad.addColorStop(0.3, "rgba(255,255,255,0.7)");
+    grad.addColorStop(0.7, "rgba(255,255,255,0.2)");
+    grad.addColorStop(1, "rgba(255,255,255,0.0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    return new THREE.CanvasTexture(canvas);
+  }
+
+  function init() {
+    scene = new THREE.Scene();
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      1,
+      1000
+    );
+    camera.position.set(-0.09397456774197047, -2.5597086635726947, 24.420789670889008);
+    camera.rotation.set(0.10443543723052419, -0.003827152981119352, 0.0004011488708739715);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.screenSpacePanning = true;
+    controls.minDistance = 2;
+    controls.maxDistance = 200;
+    controls.target.set(0, -2, -40);
+
+    pointTexture = createPointTexture();
+
+    // Procedural Audio FFT Data Texture for tree animation
+    const audioData = new Uint8Array(fftSize / 2);
+    const format = renderer.capabilities.isWebGL2
+      ? THREE.RedFormat
+      : THREE.LuminanceFormat;
+    uniforms.tAudioData.value = new THREE.DataTexture(
+      audioData,
+      fftSize / 2,
+      1,
+      format
+    );
+
+    addPlane(scene, uniforms, 3000);
+    addSnow(scene, uniforms);
+
+    range(10).map((i) => {
+      addTree(scene, uniforms, totalPoints, [20, 0, -20 * i]);
+      addTree(scene, uniforms, totalPoints, [-20, 0, -20 * i]);
+    });
+
+    // Initialize custom PostProcessor Suite
+    postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomStrength: params.bloomStrength,
+      vignetteBoost: 1.0,
+      vignetteReduction: 0.5,
+      noiseIntensity: 0.02,
+      chromaticAberration: 0.03,
+      gamma: 0.9,
+      minInputLevel: 0.0,
+      maxInputLevel: 1.0
+    });
+    postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+    setupGUI();
+    applyParams();
+    addListeners();
+    animate();
+  }
+
+  function addTree(scene, uniforms, totalPoints, treePosition) {
+    const vertexShader = `
+    attribute float mIndex;
+    varying vec3 vColor;
+    varying float opacity;
+    uniform sampler2D tAudioData;
+
+    float norm(float value, float min, float max ){
+        return (value - min) / (max - min);
+    }
+    float lerp(float norm, float min, float max){
+        return (max - min) * norm + min;
+    }
+    float map(float value, float sourceMin, float sourceMax, float destMin, float destMax){
+        return lerp(norm(value, sourceMin, sourceMax), destMin, destMax);
+    }
+
+    void main() {
+        vColor = color;
+        vec3 p = position;
+        vec4 mvPosition = modelViewMatrix * vec4( p, 1.0 );
+        float amplitude = texture2D( tAudioData, vec2( mIndex, 0.1 ) ).r;
+        float amplitudeClamped = clamp(amplitude - 0.4, 0.0, 0.6 );
+        float sizeMapped = map(amplitudeClamped, 0.0, 0.6, 0.8, 8.0);
+        opacity = map(mvPosition.z , -200.0, 15.0, 0.0, 0.85);
+        gl_PointSize = sizeMapped * ( 70.0 / -mvPosition.z );
+        gl_Position = projectionMatrix * mvPosition;
+    }
+  `;
+    const fragmentShader = `
+    varying vec3 vColor;
+    varying float opacity;
+    uniform sampler2D pointTexture;
+    void main() {
+        gl_FragColor = vec4( vColor, opacity );
+        gl_FragColor = gl_FragColor * texture2D( pointTexture, gl_PointCoord ); 
+    }
+    `;
+    const shaderMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        ...uniforms,
+        pointTexture: { value: pointTexture }
+      },
+      vertexShader,
+      fragmentShader,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      transparent: true,
+      vertexColors: true
+    });
+
+    const geometry = new THREE.BufferGeometry();
+    const positions = [];
+    const colors = [];
+    const sizes = [];
+    const phases = [];
+    const mIndexs = [];
+
+    const color = new THREE.Color();
+
+    for (let i = 0; i < totalPoints; i++) {
+      const t = Math.random();
+      const y = map(t, 0, 1, -8, 10);
+      const ang = map(t, 0, 1, 0, 6 * TAU) + (TAU / 2) * (i % 2);
+      const [z, x] = polar(ang, map(t, 0, 1, 5, 0));
+
+      const modifier = map(t, 0, 1, 1, 0);
+      positions.push(x + rand(-0.3 * modifier, 0.3 * modifier));
+      positions.push(y + rand(-0.3 * modifier, 0.3 * modifier));
+      positions.push(z + rand(-0.3 * modifier, 0.3 * modifier));
+
+      color.setHSL(map(i, 0, totalPoints, 1.0, 0.0), 1.0, 0.5);
+
+      colors.push(color.r, color.g, color.b);
+      phases.push(rand(1000));
+      sizes.push(1);
+      const mIndex = map(i, 0, totalPoints, 1.0, 0.0);
+      mIndexs.push(mIndex);
+    }
+
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3).setUsage(
+        THREE.DynamicDrawUsage
+      )
+    );
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setAttribute("size", new THREE.Float32BufferAttribute(sizes, 1));
+    geometry.setAttribute("phase", new THREE.Float32BufferAttribute(phases, 1));
+    geometry.setAttribute("mIndex", new THREE.Float32BufferAttribute(mIndexs, 1));
+
+    treeGeometries.push(geometry);
+
+    const tree = new THREE.Points(geometry, shaderMaterial);
+    const [px, py, pz] = treePosition;
+    tree.position.set(px, py, pz);
+    scene.add(tree);
+  }
+
+  function addSnow(scene, uniforms) {
+    const vertexShader = `
+    attribute float size;
+    attribute float phase;
+    attribute float phaseSecondary;
+
+    varying vec3 vColor;
+    varying float opacity;
+
+    uniform float time;
+    uniform float step;
+
+    float norm(float value, float min, float max ){
+        return (value - min) / (max - min);
+    }
+    float lerp(float norm, float min, float max){
+        return (max - min) * norm + min;
+    }
+    float map(float value, float sourceMin, float sourceMax, float destMin, float destMax){
+        return lerp(norm(value, sourceMin, sourceMax), destMin, destMax);
+    }
+    void main() {
+        float t = time * 0.0006;
+        vColor = color;
+        vec3 p = position;
+        p.y = map(mod(phase + step, 1000.0), 0.0, 1000.0, 25.0, -8.0);
+        p.x += sin(t + phase);
+        p.z += sin(t + phaseSecondary);
+        opacity = map(p.z, -150.0, 15.0, 0.0, 1.0);
+        vec4 mvPosition = modelViewMatrix * vec4( p, 1.0 );
+        gl_PointSize = size * ( 100.0 / -mvPosition.z );
+        gl_Position = projectionMatrix * mvPosition;
+    }
+    `;
+
+    const fragmentShader = `
+    uniform sampler2D pointTexture;
+    varying vec3 vColor;
+    varying float opacity;
+
+    void main() {
+        gl_FragColor = vec4( vColor, opacity );
+        gl_FragColor = gl_FragColor * texture2D( pointTexture, gl_PointCoord ); 
+    }
+    `;
+
+    function createSnowSet() {
+      const numPoints = 300;
+      const shaderMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          ...uniforms,
+          pointTexture: { value: pointTexture }
+        },
+        vertexShader,
+        fragmentShader,
+        blending: THREE.AdditiveBlending,
+        depthTest: false,
+        transparent: true,
+        vertexColors: true
+      });
+
+      const geometry = new THREE.BufferGeometry();
+      const positions = [];
+      const colors = [];
+      const sizes = [];
+      const phases = [];
+      const phaseSecondaries = [];
+
+      const color = new THREE.Color();
+
+      for (let i = 0; i < numPoints; i++) {
+        const [x, y, z] = [rand(25, -25), 0, rand(15, -150)];
+        positions.push(x, y, z);
+
+        color.set(randChoise(["#f1d4d4", "#f1f6f9", "#eeeeee", "#f1f1e8"]));
+        colors.push(color.r, color.g, color.b);
+
+        phases.push(rand(1000));
+        phaseSecondaries.push(rand(1000));
+        sizes.push(rand(4, 2));
+      }
+
+      geometry.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(positions, 3)
+      );
+      geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+      geometry.setAttribute("size", new THREE.Float32BufferAttribute(sizes, 1));
+      geometry.setAttribute("phase", new THREE.Float32BufferAttribute(phases, 1));
+      geometry.setAttribute(
+        "phaseSecondary",
+        new THREE.Float32BufferAttribute(phaseSecondaries, 1)
+      );
+
+      snowGeometries.push(geometry);
+
+      const mesh = new THREE.Points(geometry, shaderMaterial);
+      scene.add(mesh);
+    }
+
+    for (let s = 0; s < 5; s++) {
+      createSnowSet();
+    }
+  }
+
+  function addPlane(scene, uniforms, totalPoints) {
+    const vertexShader = `
+    attribute float size;
+    attribute vec3 customColor;
+    varying vec3 vColor;
+
+    void main() {
+        vColor = customColor;
+        vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+        gl_PointSize = size * ( 300.0 / -mvPosition.z );
+        gl_Position = projectionMatrix * mvPosition;
+    }
+    `;
+    const fragmentShader = `
+    uniform vec3 color;
+    uniform sampler2D pointTexture;
+    varying vec3 vColor;
+
+    void main() {
+        gl_FragColor = vec4( vColor, 1.0 );
+        gl_FragColor = gl_FragColor * texture2D( pointTexture, gl_PointCoord );
+    }
+    `;
+    const shaderMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        ...uniforms,
+        pointTexture: { value: pointTexture }
+      },
+      vertexShader,
+      fragmentShader,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      transparent: true,
+      vertexColors: true
+    });
+
+    const geometry = new THREE.BufferGeometry();
+    const positions = [];
+    const colors = [];
+    const sizes = [];
+
+    const color = new THREE.Color();
+
+    for (let i = 0; i < totalPoints; i++) {
+      const [x, y, z] = [rand(-25, 25), 0, rand(-150, 15)];
+      positions.push(x, y, z);
+
+      color.set(randChoise(["#93abd3", "#f2f4c0", "#9ddfd3"]));
+      colors.push(color.r, color.g, color.b);
+      sizes.push(1);
+    }
+
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3).setUsage(
+        THREE.DynamicDrawUsage
+      )
+    );
+    geometry.setAttribute(
+      "customColor",
+      new THREE.Float32BufferAttribute(colors, 3)
+    );
+    geometry.setAttribute("size", new THREE.Float32BufferAttribute(sizes, 1));
+
+    planeGeometries.push(geometry);
+
+    const plane = new THREE.Points(geometry, shaderMaterial);
+    plane.position.y = -8;
+    scene.add(plane);
+  }
+
+  function updateTreeColors(cPrimaryHex, cSecondaryHex) {
+    const c1 = new THREE.Color(cPrimaryHex);
+    const c2 = new THREE.Color(cSecondaryHex);
+    const tempCol = new THREE.Color();
+
+    treeGeometries.forEach((geo) => {
+      const colorAttr = geo.getAttribute("color");
+      if (!colorAttr) return;
+      const count = colorAttr.count;
+      for (let i = 0; i < count; i++) {
+        const t = i / count;
+        tempCol.copy(c1).lerp(c2, t);
+        colorAttr.setXYZ(i, tempCol.r, tempCol.g, tempCol.b);
+      }
+      colorAttr.needsUpdate = true;
+    });
+  }
+
+  function updateSnowColors(snowColorHex) {
+    const baseCol = new THREE.Color(snowColorHex);
+    const tempCol = new THREE.Color();
+
+    snowGeometries.forEach((geo) => {
+      const colorAttr = geo.getAttribute("color");
+      if (!colorAttr) return;
+      const count = colorAttr.count;
+      for (let i = 0; i < count; i++) {
+        const varFactor = 0.8 + (i % 5) * 0.05;
+        tempCol.copy(baseCol).multiplyScalar(varFactor);
+        colorAttr.setXYZ(i, tempCol.r, tempCol.g, tempCol.b);
+      }
+      colorAttr.needsUpdate = true;
+    });
+  }
+
+  function updateGroundColors(groundColorHex) {
+    const baseCol = new THREE.Color(groundColorHex);
+    const tempCol = new THREE.Color();
+
+    planeGeometries.forEach((geo) => {
+      const colorAttr = geo.getAttribute("customColor");
+      if (!colorAttr) return;
+      const count = colorAttr.count;
+      for (let i = 0; i < count; i++) {
+        const varFactor = 0.7 + (i % 7) * 0.06;
+        tempCol.copy(baseCol).multiplyScalar(varFactor);
+        colorAttr.setXYZ(i, tempCol.r, tempCol.g, tempCol.b);
+      }
+      colorAttr.needsUpdate = true;
+    });
+  }
+
+  function applyParams() {
+    // Background / Greenscreen
+    if (params.greenScreen) {
+      renderer.setClearColor(0x00ff00, 1.0);
+      scene.background = new THREE.Color(0x00ff00);
+    } else {
+      renderer.setClearColor(params.bgColor, 1.0);
+      scene.background = new THREE.Color(params.bgColor);
+    }
+
+    // DPR & PostProcessor size update
+    renderer.setPixelRatio(params.dpr);
+    if (postProcessor) {
+      postProcessor.settings.bloomStrength = params.bloomStrength;
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+      postProcessor.updateSettings();
+    }
+
+    // Geometries Color Updates
+    updateTreeColors(params.treePrimary, params.treeSecondary);
+    updateSnowColors(params.snowColor);
+    updateGroundColors(params.groundColor);
+  }
+
+  function selectColorScheme(schemeName) {
+    if (COLOR_SCHEMES[schemeName]) {
+      const s = COLOR_SCHEMES[schemeName];
+      params.treePrimary = s.treePrimary;
+      params.treeSecondary = s.treeSecondary;
+      params.snowColor = s.snowColor;
+      params.groundColor = s.groundColor;
+      params.bgColor = s.bgColor;
+      params.bloomStrength = s.bloomStrength;
+      applyParams();
+      updateGUIControllers();
+    }
+  }
+
+  function setupGUI() {
+    gui = new GUI({ title: "Scene Settings" });
+
+    const fDisplay = gui.addFolder("Display & Greenscreen");
+    fDisplay.add(params, "greenScreen").name("Green Screen (#00ff00)").onChange(applyParams);
+    fDisplay.addColor(params, "bgColor").name("Background Color").onChange(applyParams);
+    fDisplay.add(params, "dpr", 0.5, 2.5, 0.1).name("DPR (Pixel Ratio)").onChange(applyParams);
+
+    const fColors = gui.addFolder("Preset Color Schemes");
+    fColors
+      .add(params, "colorScheme", [
+        "Golden Aurora",
+        "Cyberpunk Neon",
+        "Emerald Enchantment",
+        "Vaporwave Sunset",
+        "Cosmic Ice",
+        "Custom"
+      ])
+      .name("Color Scheme")
+      .onChange((val) => {
+        if (val !== "Custom") selectColorScheme(val);
+      });
+
+    fColors.addColor(params, "treePrimary").name("Tree Primary").onChange(() => {
+      params.colorScheme = "Custom";
+      applyParams();
+      updateGUIControllers();
+    });
+    fColors.addColor(params, "treeSecondary").name("Tree Secondary").onChange(() => {
+      params.colorScheme = "Custom";
+      applyParams();
+      updateGUIControllers();
+    });
+    fColors.addColor(params, "snowColor").name("Snow Color").onChange(() => {
+      params.colorScheme = "Custom";
+      applyParams();
+      updateGUIControllers();
+    });
+    fColors.addColor(params, "groundColor").name("Ground Color").onChange(() => {
+      params.colorScheme = "Custom";
+      applyParams();
+      updateGUIControllers();
+    });
+
+    const fAnim = gui.addFolder("Animation Presets");
+    fAnim
+      .add(params, "animationPreset", [
+        "Static (No Camera Motion)",
+        "Slow Circular Orbit",
+        "Snowy Path Flythrough",
+        "Gentle Pendulum Sway",
+        "Spiral Horizon Ascend"
+      ])
+      .name("Camera Animation");
+
+    fAnim.add(params, "speed", 0.1, 3.0, 0.1).name("Animation Speed");
+
+    if (postProcessor) {
+      postProcessor.attachGUI(gui, "PostProcessor Pipeline");
+    }
+
+    const fInteract = gui.addFolder("Interactivity");
+    fInteract.add(params, "clickRandomize").name("Click Scene Randomize");
+  }
+
+  function updateGUIControllers() {
+    if (!gui) return;
+    gui.controllersRecursive().forEach((c) => c.updateDisplay());
+  }
+
+  function updateCameraAnimation(t) {
+    if (params.animationPreset === "Static (No Camera Motion)") {
+      return;
+    }
+
+    if (params.animationPreset === "Slow Circular Orbit") {
+      const radius = 32;
+      const angle = t * 0.15;
+      camera.position.x = radius * sin(angle);
+      camera.position.z = radius * cos(angle) - 30;
+      camera.position.y = -2.5 + sin(t * 0.2) * 3;
+      controls.target.set(0, -2, -40);
+    } else if (params.animationPreset === "Snowy Path Flythrough") {
+      const progress = (t * 0.06) % 1.0;
+      const zPos = 20 - progress * 160;
+      camera.position.z = zPos;
+      camera.position.x = sin(t * 0.3) * 3.5;
+      camera.position.y = -2.5 + cos(t * 0.4) * 1.2;
+      controls.target.set(0, -2, zPos - 35);
+    } else if (params.animationPreset === "Gentle Pendulum Sway") {
+      camera.position.x = -0.09 + sin(t * 0.35) * 9.0;
+      camera.position.y = -2.56 + cos(t * 0.25) * 3.0;
+      camera.position.z = 24.42 + sin(t * 0.2) * 4.0;
+      controls.target.set(0, -2, -40);
+    } else if (params.animationPreset === "Spiral Horizon Ascend") {
+      const angle = t * 0.18;
+      camera.position.x = sin(angle) * 20.0;
+      camera.position.z = cos(angle) * 20.0 - 20;
+      camera.position.y = 4.0 + sin(t * 0.15) * 8.0;
+      controls.target.set(0, -4, -40);
+    }
+  }
+
+  function randomizeScene() {
+    const baseHue = Math.random();
+    const secHue = (baseHue + 0.2 + Math.random() * 0.6) % 1.0;
+
+    params.colorScheme = "Custom";
+    params.treePrimary = "#" + new THREE.Color().setHSL(baseHue, 0.95, 0.55).getHexString();
+    params.treeSecondary = "#" + new THREE.Color().setHSL(secHue, 0.95, 0.5).getHexString();
+    params.snowColor = "#" + new THREE.Color().setHSL((baseHue + 0.1) % 1.0, 0.4, 0.9).getHexString();
+    params.groundColor = "#" + new THREE.Color().setHSL((baseHue + 0.5) % 1.0, 0.8, 0.4).getHexString();
+    params.bgColor = "#" + new THREE.Color().setHSL((baseHue + 0.6) % 1.0, 0.7, 0.05).getHexString();
+
+    params.speed = parseFloat((0.5 + Math.random() * 1.5).toFixed(1));
+    params.bloomStrength = parseFloat((0.2 + Math.random() * 0.6).toFixed(2));
+
+    if (postProcessor) {
+      postProcessor.settings.chromaticAberration = parseFloat((Math.random() * 0.05).toFixed(3));
+      postProcessor.settings.noiseIntensity = parseFloat((Math.random() * 0.04).toFixed(3));
+      postProcessor.settings.vignetteBoost = parseFloat((0.8 + Math.random() * 0.6).toFixed(2));
+    }
+
+    const presets = [
+      "Static (No Camera Motion)",
+      "Slow Circular Orbit",
+      "Snowy Path Flythrough",
+      "Gentle Pendulum Sway",
+      "Spiral Horizon Ascend"
+    ];
+    params.animationPreset = presets[Math.floor(Math.random() * presets.length)];
+
+    applyParams();
+    updateGUIControllers();
+  }
+
+  function addListeners() {
+    window.addEventListener(
+      "resize",
+      () => {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(width, height);
+        if (postProcessor) {
+          postProcessor.setSize(width, height, params.dpr);
+        }
+      },
+      false
+    );
+
+    // Hide/Show UI on "H" key press
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "h" || e.key === "H") {
+        if (gui && gui.domElement) {
+          gui.domElement.style.display =
+            gui.domElement.style.display === "none" ? "" : "none";
+        }
+      }
+    });
+
+    // Scene Click Randomize
+    let downX = 0, downY = 0;
+    renderer.domElement.addEventListener("pointerdown", (e) => {
+      downX = e.clientX;
+      downY = e.clientY;
+    });
+
+    renderer.domElement.addEventListener("pointerup", (e) => {
+      const dist = Math.hypot(e.clientX - downX, e.clientY - downY);
+      if (dist < 5 && params.clickRandomize) {
+        randomizeScene();
+      }
+    });
+  }
+
+  let lastTime = performance.now();
+  let accumulatedTime = 0;
+
+  function animate(currentTime) {
+    requestAnimationFrame(animate);
+
+    const now = currentTime || performance.now();
+    const delta = Math.min((now - lastTime) * 0.001, 0.1);
+    lastTime = now;
+
+    accumulatedTime += delta * params.speed * 1000;
+    step = (step + params.speed) % 1000;
+
+    uniforms.time.value = accumulatedTime;
+    uniforms.step.value = step;
+
+    // Synthetic FFT audio frequency simulation
+    if (uniforms.tAudioData.value && uniforms.tAudioData.value.image) {
+      const data = uniforms.tAudioData.value.image.data;
+      const t = accumulatedTime * 0.001;
+      const len = data.length;
+      for (let i = 0; i < len; i++) {
+        const normI = i / len;
+        const v1 = Math.sin(t * 3.5 + normI * 12.0);
+        const v2 = Math.cos(t * 6.0 - normI * 24.0);
+        const v3 = Math.sin(t * 1.5 + normI * 6.0);
+        const amp = v1 * 0.35 + v2 * 0.35 + v3 * 0.3 + 0.5;
+        data[i] = Math.floor(Math.max(0, Math.min(1, amp)) * 255);
+      }
+      uniforms.tAudioData.value.needsUpdate = true;
+    }
+
+    updateCameraAnimation(accumulatedTime * 0.001);
+    controls.update();
+
+    if (postProcessor) {
+      postProcessor.renderScene(scene, camera);
+    } else {
+      renderer.render(scene, camera);
+    }
+  }
+
+  init();
+</script>
+</body>
+</html>
