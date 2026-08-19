@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Simplex Chromatic Scanlines</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: grab;
+      touch-action: none;
+    }
+    canvas:active {
+      cursor: grabbing;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+
+  <script type="x-shader/vertex" id="vertexShader">#version 300 es
+    in vec2 position;
+    out vec2 v_uv;
+
+    void main() {
+      v_uv = position * 0.5 + 0.5;
+      gl_Position = vec4(position, 0.0, 1.0);
+    }
+  </script>
+
+  <script type="x-shader/fragment" id="fragmentShader">#version 300 es
+    precision highp float;
+
+    uniform vec2 u_resolution;
+    uniform float u_time;
+    uniform float u_frame;
+    uniform vec2 u_offset;
+    uniform float u_zoom;
+    uniform float u_cells;
+    uniform float u_stripes;
+    uniform float u_noise_scale;
+    uniform float u_noise_speed;
+    uniform float u_aberration;
+    uniform float u_blend_width;
+    uniform int u_anim_mode;
+    uniform int u_greenscreen;
+    uniform vec3 u_color_bg;
+    uniform vec3 u_color1;
+    uniform vec3 u_color2;
+    uniform vec3 u_color3;
+
+    in vec2 v_uv;
+    out vec4 colour;
+
+    // Simplex 3D Noise by Ian McEwan, Stefan Gustavson (https://github.com/stegu/webgl-noise)
+    vec4 permute(vec4 x) {
+      return mod(((x * 34.0) + 1.0) * x, 289.0);
+    }
+
+    vec4 taylorInvSqrt(vec4 r) {
+      return 1.79284291400159 - 0.85373472095314 * r;
+    }
+
+    float snoise(vec3 v) {
+      const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
+      const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+
+      // First corner
+      vec3 i  = floor(v + dot(v, C.yyy));
+      vec3 x0 = v - i + dot(i, C.xxx);
+
+      // Other corners
+      vec3 g = step(x0.yzx, x0.xyz);
+      vec3 l = 1.0 - g;
+      vec3 i1 = min(g.xyz, l.zxy);
+      vec3 i2 = max(g.xyz, l.zxy);
+
+      vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+      vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+      vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+
+      // Permutations
+      i = mod(i, 289.0);
+      vec4 p = permute(permute(permute(
+                 i.z + vec4(0.0, i1.z, i2.z, 1.0))
+               + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+               + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+
+      // Gradients
+      float n_ = 1.0 / 7.0; // N=7
+      vec3  ns = n_ * D.wyz - D.xzx;
+
+      vec4 j = p - 49.0 * floor(p * ns.z * ns.z); // mod(p, N*N)
+
+      vec4 x_ = floor(j * ns.z);
+      vec4 y_ = floor(j - 7.0 * x_); // mod(j, N)
+
+      vec4 x = x_ * ns.x + ns.yyyy;
+      vec4 y = y_ * ns.x + ns.yyyy;
+      vec4 h = 1.0 - abs(x) - abs(y);
+
+      vec4 b0 = vec4(x.xy, y.xy);
+      vec4 b1 = vec4(x.zw, y.zw);
+
+      vec4 s0 = floor(b0) * 2.0 + 1.0;
+      vec4 s1 = floor(b1) * 2.0 + 1.0;
+      vec4 sh = -step(h, vec4(0.0));
+
+      vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+      vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+      vec3 p0 = vec3(a0.xy, h.x);
+      vec3 p1 = vec3(a0.zw, h.y);
+      vec3 p2 = vec3(a1.xy, h.z);
+      vec3 p3 = vec3(a1.zw, h.w);
+
+      // Normalise gradients
+      vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+      p0 *= norm.x;
+      p1 *= norm.y;
+      p2 *= norm.z;
+      p3 *= norm.w;
+
+      // Mix final noise value
+      vec4 m = max(0.6 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+      m = m * m;
+      return 42.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+    }
+
+    vec2 getScreenSpace() {
+      return (gl_FragCoord.xy - 0.5 * u_resolution.xy) / min(u_resolution.y, u_resolution.x);
+    }
+
+    void main() {
+      vec2 baseUv = getScreenSpace();
+
+      // Pan & Zoom coordinate transformation
+      vec2 uv = (baseUv - u_offset) / max(u_zoom, 0.001);
+
+      float t = u_time;
+      vec2 motion = vec2(0.0);
+
+      // Animation Motion Presets
+      if (u_anim_mode == 0) {
+        // 1. Horizontal Drift (Original feel)
+        motion = vec2(t * 0.4, 0.0);
+      } else if (u_anim_mode == 1) {
+        // 2. Vertical Flow (Gentle upward cascade)
+        motion = vec2(0.0, t * 0.35);
+      } else if (u_anim_mode == 2) {
+        // 3. Orbital Swirl (Smooth slow circular motion)
+        motion = vec2(cos(t * 0.35) * 0.25, sin(t * 0.35) * 0.25);
+      } else if (u_anim_mode == 3) {
+        // 4. Breathing Pulse (Harmonic wave distortion)
+        motion = vec2(sin(t * 0.2) * 0.15, cos(t * 0.25) * 0.15);
+        uv *= (1.0 + sin(t * 0.3) * 0.1);
+      } else if (u_anim_mode == 4) {
+        // 5. Static (No Movement)
+        motion = vec2(0.0);
+      }
+
+      uv += motion;
+
+      // Setup the grid and noise scale
+      float cells = u_cells;
+      float stripes = u_stripes;
+      float x_scaled = uv.x * cells;
+
+      // Get integer ID and fractional part
+      float id = floor(x_scaled);
+      float local_x = fract(x_scaled);
+
+      // Blend mask based on local_x
+      float blend = smoothstep(1.0 - u_blend_width, 1.0, local_x);
+
+      // Continuous ID for smooth cell transitions
+      float smooth_id = (id + blend) * 0.15;
+
+      // Noise z-slice
+      float noise_t = (u_anim_mode == 4) ? 0.0 : (t * u_noise_speed);
+      float noise_z = noise_t + smooth_id;
+
+      // Layered simplex noise
+      float n = snoise(vec3(uv * (u_noise_scale * 2.0), noise_z)) * 0.5
+              + snoise(vec3(uv * (u_noise_scale * 0.5) + vec2(1.0), noise_z));
+
+      // Noise frequency increase
+      float ng = n * stripes;
+      float aa = fwidth(sin(ng));
+      aa = max(aa, 0.0005);
+
+      // Chromatic phase offsets
+      float aber = u_aberration;
+      float rVal = smoothstep(0.0, aa, sin(ng));
+      float gVal = smoothstep(0.0, aa, sin(ng + aber));
+      float bVal = smoothstep(0.0, aa, sin(ng + aber * 2.0));
+
+      // Color composition
+      vec3 fgColor = rVal * u_color1 + gVal * u_color2 + bVal * u_color3;
+
+      // Background color & Greenscreen support
+      vec3 activeBg = (u_greenscreen == 1) ? vec3(0.0, 1.0, 0.0) : u_color_bg;
+
+      // Composite foreground pattern over background
+      float mask = clamp(max(rVal, max(gVal, bVal)), 0.0, 1.0);
+      vec3 finalColor = mix(activeBg, fgColor, mask);
+
+      colour = vec4(finalColor, 1.0);
+    }
+  </script>
+
+  <script type="module">
+    import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+    // Color Presets
+    const COLOR_PRESETS = {
+      'Original Chromatic': {
+        bg: '#000000',
+        c1: '#ff0000',
+        c2: '#00ff00',
+        c3: '#0000ff',
+        aberration: 0.10,
+        cells: 4.0,
+        stripes: 40.0
+      },
+      'Cyberpunk Prism': {
+        bg: '#080812',
+        c1: '#00f0ff',
+        c2: '#ff007f',
+        c3: '#7928ca',
+        aberration: 0.16,
+        cells: 4.5,
+        stripes: 45.0
+      },
+      'Solar Flare': {
+        bg: '#0f0502',
+        c1: '#ffb700',
+        c2: '#ff4500',
+        c3: '#d90429',
+        aberration: 0.08,
+        cells: 3.5,
+        stripes: 36.0
+      },
+      'Emerald Aurora': {
+        bg: '#01120a',
+        c1: '#00ff88',
+        c2: '#00e5ff',
+        c3: '#0066ff',
+        aberration: 0.12,
+        cells: 4.0,
+        stripes: 42.0
+      },
+      'Amethyst Nebula': {
+        bg: '#090312',
+        c1: '#e0aaff',
+        c2: '#9d4edd',
+        c3: '#3c096c',
+        aberration: 0.15,
+        cells: 5.0,
+        stripes: 38.0
+      }
+    };
+
+    const ANIMATION_MODES = {
+      'Horizontal Drift': 0,
+      'Vertical Flow': 1,
+      'Orbital Swirl': 2,
+      'Breathing Pulse': 3,
+      'Static (No Movement)': 4
+    };
+
+    // Application Parameters
+    const params = {
+      // Color & Theme
+      colorPreset: 'Original Chromatic',
+      greenscreen: false,
+      bgColor: '#000000',
+      color1: '#ff0000',
+      color2: '#00ff00',
+      color3: '#0000ff',
+
+      // Animation
+      animationPreset: 'Horizontal Drift',
+      speed: 1.0,
+
+      // Display & Quality
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+
+      // Geometric & Noise Structure
+      cells: 4.0,
+      stripes: 40.0,
+      noiseScale: 1.0,
+      noiseSpeed: 0.5,
+      aberration: 0.10,
+      blendWidth: 0.15,
+
+      // Interaction
+      clickToRandomize: true,
+
+      // Utility Actions
+      resetView: () => {
+        targetZoom = 1.0;
+        targetPanX = 0.0;
+        targetPanY = 0.0;
+      },
+      randomize: () => {
+        triggerRandomize();
+      }
+    };
+
+    // WebGL2 Initialization
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl2', {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      powerPreference: 'high-performance'
+    });
+
+    if (!gl) {
+      console.error('WebGL 2 is not supported by your browser.');
+    }
+
+    // Helper: Compile Shader
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source.trim());
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Shader compilation error:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    // Helper: Create Program
+    function createProgram(gl, vertexSrc, fragmentSrc) {
+      const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexSrc);
+      const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentSrc);
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Program linking error:', gl.getProgramInfoLog(program));
+        return null;
+      }
+      return program;
+    }
+
+    const vertSource = document.getElementById('vertexShader').textContent;
+    const fragSource = document.getElementById('fragmentShader').textContent;
+    const program = createProgram(gl, vertSource, fragSource);
+
+    // Full-screen Quad Buffer
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([
+        -1, -1,
+         1, -1,
+        -1,  1,
+        -1,  1,
+         1, -1,
+         1,  1
+      ]),
+      gl.STATIC_DRAW
+    );
+
+    const positionLoc = gl.getAttribLocation(program, 'position');
+    gl.enableVertexAttribArray(positionLoc);
+    gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // Cache Uniform Locations
+    const uniforms = {
+      u_resolution: gl.getUniformLocation(program, 'u_resolution'),
+      u_time: gl.getUniformLocation(program, 'u_time'),
+      u_frame: gl.getUniformLocation(program, 'u_frame'),
+      u_offset: gl.getUniformLocation(program, 'u_offset'),
+      u_zoom: gl.getUniformLocation(program, 'u_zoom'),
+      u_cells: gl.getUniformLocation(program, 'u_cells'),
+      u_stripes: gl.getUniformLocation(program, 'u_stripes'),
+      u_noise_scale: gl.getUniformLocation(program, 'u_noise_scale'),
+      u_noise_speed: gl.getUniformLocation(program, 'u_noise_speed'),
+      u_aberration: gl.getUniformLocation(program, 'u_aberration'),
+      u_blend_width: gl.getUniformLocation(program, 'u_blend_width'),
+      u_anim_mode: gl.getUniformLocation(program, 'u_anim_mode'),
+      u_greenscreen: gl.getUniformLocation(program, 'u_greenscreen'),
+      u_color_bg: gl.getUniformLocation(program, 'u_color_bg'),
+      u_color1: gl.getUniformLocation(program, 'u_color1'),
+      u_color2: gl.getUniformLocation(program, 'u_color2'),
+      u_color3: gl.getUniformLocation(program, 'u_color3')
+    };
+
+    // Color conversion helper
+    function hexToVec3(hex) {
+      let c = hex.replace('#', '');
+      if (c.length === 3) c = c.split('').map(x => x + x).join('');
+      const num = parseInt(c, 16);
+      return [
+        ((num >> 16) & 255) / 255,
+        ((num >> 8) & 255) / 255,
+        (num & 255) / 255
+      ];
+    }
+
+    // View Transform State (Pan & Zoom)
+    let currentZoom = 1.0;
+    let targetZoom = 1.0;
+    let currentPanX = 0.0;
+    let currentPanY = 0.0;
+    let targetPanX = 0.0;
+    let targetPanY = 0.0;
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let dragDistance = 0;
+
+    // Resize & DPR Handling
+    function resize() {
+      const dpr = params.dpr || window.devicePixelRatio || 1;
+      const width = Math.round(window.innerWidth * dpr);
+      const height = Math.round(window.innerHeight * dpr);
+
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Wheel Zoom Handling
+    window.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY > 0 ? 0.88 : 1.14;
+      targetZoom = Math.max(0.1, Math.min(targetZoom * zoomFactor, 20.0));
+    }, { passive: false });
+
+    // Pointer Drag & Click Handling
+    canvas.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      isDragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      dragDistance = 0;
+      canvas.setPointerCapture(e.pointerId);
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      startX = e.clientX;
+      startY = e.clientY;
+
+      dragDistance += Math.hypot(dx, dy);
+
+      const minDim = Math.min(window.innerWidth, window.innerHeight);
+      targetPanX += (dx / minDim) * (1.0 / targetZoom);
+      targetPanY -= (dy / minDim) * (1.0 / targetZoom);
+    });
+
+    function endPointer(e) {
+      if (!isDragging) return;
+      isDragging = false;
+      try {
+        canvas.releasePointerCapture(e.pointerId);
+      } catch (err) {}
+
+      // Click detection: If user clicked without dragging, trigger randomization
+      if (dragDistance < 6 && params.clickToRandomize) {
+        triggerRandomize();
+      }
+    }
+
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+
+    // Procedural Randomization Engine
+    function triggerRandomize() {
+      const presetKeys = Object.keys(COLOR_PRESETS);
+      const randomPresetKey = presetKeys[Math.floor(Math.random() * presetKeys.length)];
+      const preset = COLOR_PRESETS[randomPresetKey];
+
+      // Procedural color variations
+      const hueShift = Math.random() * 360;
+      function hslToHex(h, s, l) {
+        l /= 100;
+        const a = s * Math.min(l, 1 - l) / 100;
+        const f = n => {
+          const k = (n + h / 30) % 12;
+          const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+          return Math.round(255 * color).toString(16).padStart(2, '0');
+        };
+        return `#${f(0)}${f(8)}${f(4)}`;
+      }
+
+      const useProceduralColors = Math.random() > 0.4;
+      if (useProceduralColors) {
+        params.colorPreset = 'Custom';
+        params.bgColor = hslToHex((hueShift + 180) % 360, 40 + Math.random() * 30, 4 + Math.random() * 8);
+        params.color1 = hslToHex(hueShift, 85 + Math.random() * 15, 55 + Math.random() * 20);
+        params.color2 = hslToHex((hueShift + 60 + Math.random() * 60) % 360, 85 + Math.random() * 15, 55 + Math.random() * 20);
+        params.color3 = hslToHex((hueShift + 180 + Math.random() * 60) % 360, 85 + Math.random() * 15, 55 + Math.random() * 20);
+      } else {
+        params.colorPreset = randomPresetKey;
+        params.bgColor = preset.bg;
+        params.color1 = preset.c1;
+        params.color2 = preset.c2;
+        params.color3 = preset.c3;
+      }
+
+      // Re-roll geometric and motion parameters
+      params.cells = +(1.8 + Math.random() * 6.5).toFixed(2);
+      params.stripes = +(18.0 + Math.random() * 55.0).toFixed(1);
+      params.noiseScale = +(0.5 + Math.random() * 1.5).toFixed(2);
+      params.noiseSpeed = +(0.2 + Math.random() * 0.9).toFixed(2);
+      params.aberration = +(0.04 + Math.random() * 0.22).toFixed(3);
+      params.blendWidth = +(0.08 + Math.random() * 0.2).toFixed(2);
+
+      // Randomize animation mode
+      const animKeys = Object.keys(ANIMATION_MODES);
+      params.animationPreset = animKeys[Math.floor(Math.random() * (animKeys.length - 1))]; // Exclude static for dynamic clicks
+
+      // Synchronize GUI
+      gui.controllersRecursive().forEach(controller => controller.updateDisplay());
+    }
+
+    // Apply Color Preset
+    function applyColorPreset(presetName) {
+      if (COLOR_PRESETS[presetName]) {
+        const p = COLOR_PRESETS[presetName];
+        params.bgColor = p.bg;
+        params.color1 = p.c1;
+        params.color2 = p.c2;
+        params.color3 = p.c3;
+        params.aberration = p.aberration;
+        params.cells = p.cells;
+        params.stripes = p.stripes;
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    // Initialize Lil-GUI
+    const gui = new GUI({ title: 'Shader Controls' });
+
+    // Presets & Color Folder
+    const fTheme = gui.addFolder('Theme & Colors');
+    fTheme.add(params, 'colorPreset', ['Original Chromatic', 'Cyberpunk Prism', 'Solar Flare', 'Emerald Aurora', 'Amethyst Nebula', 'Custom'])
+      .name('Color Preset')
+      .onChange(val => {
+        if (val !== 'Custom') applyColorPreset(val);
+      });
+
+    fTheme.add(params, 'greenscreen')
+      .name('Green Screen (#00ff00)');
+
+    fTheme.addColor(params, 'bgColor')
+      .name('Background Color')
+      .onChange(() => { params.colorPreset = 'Custom'; });
+
+    fTheme.addColor(params, 'color1')
+      .name('Primary Color')
+      .onChange(() => { params.colorPreset = 'Custom'; });
+
+    fTheme.addColor(params, 'color2')
+      .name('Secondary Color')
+      .onChange(() => { params.colorPreset = 'Custom'; });
+
+    fTheme.addColor(params, 'color3')
+      .name('Accent Color')
+      .onChange(() => { params.colorPreset = 'Custom'; });
+
+    // Animation Folder
+    const fAnim = gui.addFolder('Animation & Motion');
+    fAnim.add(params, 'animationPreset', Object.keys(ANIMATION_MODES))
+      .name('Animation Mode');
+
+    fAnim.add(params, 'speed', 0.0, 4.0, 0.05)
+      .name('Animation Speed');
+
+    // Geometry & Noise Folder
+    const fGeom = gui.addFolder('Geometry & Optics');
+    fGeom.add(params, 'cells', 0.5, 12.0, 0.1).name('Grid Cells');
+    fGeom.add(params, 'stripes', 5.0, 90.0, 0.5).name('Stripe Frequency');
+    fGeom.add(params, 'noiseScale', 0.1, 4.0, 0.05).name('Noise Scale');
+    fGeom.add(params, 'noiseSpeed', 0.0, 2.5, 0.05).name('Noise Speed');
+    fGeom.add(params, 'aberration', 0.0, 0.5, 0.005).name('Aberration Split');
+    fGeom.add(params, 'blendWidth', 0.01, 0.5, 0.01).name('Cell Blend Width');
+
+    // Rendering & Quality Folder
+    const fRender = gui.addFolder('Rendering & Quality');
+    fRender.add(params, 'dpr', 0.5, 3.0, 0.25)
+      .name('Pixel Ratio (DPR)')
+      .onChange(resize);
+
+    // Interaction & Procedural Folder
+    const fInteractive = gui.addFolder('Procedural & View');
+    fInteractive.add(params, 'clickToRandomize').name('Click to Randomize');
+    fInteractive.add(params, 'randomize').name('🎲 Randomize Scene');
+    fInteractive.add(params, 'resetView').name('↺ Reset View');
+
+    // Keyboard shortcut 'H' to toggle UI visibility
+    let isGuiVisible = true;
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        if (e.target.tagName === 'INPUT') return;
+        isGuiVisible = !isGuiVisible;
+        if (typeof gui.show === 'function') {
+          gui.show(isGuiVisible);
+        } else {
+          gui.domElement.style.display = isGuiVisible ? '' : 'none';
+        }
+      }
+    });
+
+    // Animation & Render Loop
+    let lastTime = performance.now();
+    let accumulatedTime = 0.0;
+    let frameNumber = 0.0;
+
+    function render(currentTime) {
+      requestAnimationFrame(render);
+
+      const dt = Math.min((currentTime - lastTime) / 1000.0, 0.1);
+      lastTime = currentTime;
+
+      accumulatedTime += dt * params.speed;
+      frameNumber += 1.0;
+
+      // Smooth pan and zoom interpolation
+      currentZoom += (targetZoom - currentZoom) * 0.12;
+      currentPanX += (targetPanX - currentPanX) * 0.12;
+      currentPanY += (targetPanY - currentPanY) * 0.12;
+
+      gl.useProgram(program);
+
+      // Pass Uniforms
+      gl.uniform2f(uniforms.u_resolution, canvas.width, canvas.height);
+      gl.uniform1f(uniforms.u_time, accumulatedTime);
+      gl.uniform1f(uniforms.u_frame, frameNumber);
+      gl.uniform2f(uniforms.u_offset, currentPanX, currentPanY);
+      gl.uniform1f(uniforms.u_zoom, currentZoom);
+      gl.uniform1f(uniforms.u_cells, params.cells);
+      gl.uniform1f(uniforms.u_stripes, params.stripes);
+      gl.uniform1f(uniforms.u_noise_scale, params.noiseScale);
+      gl.uniform1f(uniforms.u_noise_speed, params.noiseSpeed);
+      gl.uniform1f(uniforms.u_aberration, params.aberration);
+      gl.uniform1f(uniforms.u_blend_width, params.blendWidth);
+      gl.uniform1i(uniforms.u_anim_mode, ANIMATION_MODES[params.animationPreset] ?? 0);
+      gl.uniform1i(uniforms.u_greenscreen, params.greenscreen ? 1 : 0);
+
+      const bgRgb = hexToVec3(params.bgColor);
+      const c1Rgb = hexToVec3(params.color1);
+      const c2Rgb = hexToVec3(params.color2);
+      const c3Rgb = hexToVec3(params.color3);
+
+      gl.uniform3f(uniforms.u_color_bg, bgRgb[0], bgRgb[1], bgRgb[2]);
+      gl.uniform3f(uniforms.u_color1, c1Rgb[0], c1Rgb[1], c1Rgb[2]);
+      gl.uniform3f(uniforms.u_color2, c2Rgb[0], c2Rgb[1], c2Rgb[2]);
+      gl.uniform3f(uniforms.u_color3, c3Rgb[0], c3Rgb[1], c3Rgb[2]);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

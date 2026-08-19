@@ -197,6 +197,38 @@ Use this library of standard maritime and logistical choke points to build custo
 
 ---
 
+### 5. The Antimeridian ($180^\circ$ Date Line) Boundary Rule & Planar Continuity
+
+```
+[2D Mercator Map Boundary at -180° / +180°]
+-180° (West) <───────────────────────────────────────────────────> +180° (East)
+  │                                                                 │
+  │    [Target: US East -86°W]                 [Origin: East Asia +110°E]
+  │              ▲                                      │
+  │              │                                      ▼
+  │       (Waypoint: -150°W)                     (Waypoint: +165°E)
+  │              ▲                                      │
+  └──────────────┼─── [ Interpolates backwards across ] ┼───────────┘
+                 └─── [ the whole map: -315° of lon   ] ◄── [ FATAL WRAPPING BUG ]
+```
+
+#### The Antimeridian Problem:
+In 2D Planar and Mercator projections (`geoMercator`), the map coordinate system is bounded from $-180^\circ$ to $+180^\circ$.
+When a route transits across the Pacific from the Eastern Hemisphere (e.g. $+120^\circ \dots +165^\circ$) to the Western Hemisphere (e.g. $-150^\circ \dots -80^\circ$), vector spline and polygon generators (like `MapSankeySeries`) linearly interpolate between consecutive coordinates.
+Jumping directly from $+165^\circ$ to $-150^\circ$ evaluates to $\Delta \lambda = -150 - (+165) = -315^\circ$. Instead of a $45^\circ$ eastward hop across the Pacific Date Line, the engine renders a ribbon stretching **$315^\circ$ westward across all of Asia, Europe, and the Atlantic Ocean**, producing horizontal visual "boomerangs" and hairpin loops in 2D map views.
+
+#### The Golden Engineering Rules for Global Routing:
+1. **Monotonic Longitude Continuity**: Ensure that longitude values in any waypoint sequence progress in a continuous directional sequence without jumping across the $\pm 180^\circ$ date line boundary.
+2. **Continuous Westbound Maritime Highway for Asia $\leftrightarrow$ Americas**:
+   - For intercontinental routes connecting East Asia / Oceania and North / South America, route westbound along the standard commercial maritime container highway:
+     $$\text{East Asia} \to \text{Strait of Malacca} \to \text{Suez / Mediterranean} \to \text{Gibraltar} \to \text{Atlantic Ocean} \to \text{Americas}$$
+     or via the **Cape of Good Hope** corridor for Southern Hemisphere flows.
+   - Longitude decreases continuously from positive to negative:
+     $$+110^\circ \to +101^\circ \to +78^\circ \to +34^\circ \to +13^\circ \to -5.5^\circ \to -45^\circ \to -86^\circ$$
+   - **Guarantees $100\%$ mathematical and visual stability** in both 3D Orthographic Globe and 2D Mercator Map views with zero geometry artifacts.
+
+---
+
 ## 4. Visual Representation & Glowing Ship Bullet Particle System
 
 ```
@@ -618,15 +650,101 @@ var importerIds = ["US", "DE", "JP"];
 
 ---
 
+### Case Study 5: Global Rare Earths & Permanent Magnet Supply Chain
+* **Reference File**: [213.html](file:///f:/Front/18-codepen/213.html)
+* **Origins (Mining & Processing)**:
+  * China: Baotou (`baotou`: $109.83^\circ\text{ E}, 41.57^\circ\text{ N}$), Ganzhou (`ganzhou`: $114.93^\circ\text{ E}, 25.83^\circ\text{ N}$).
+  * Allied Alternative Chain: MP Materials Mountain Pass (`mountainPass`: $-115.53^\circ\text{ E}, 35.48^\circ\text{ N}$), MP Independence Magnet Plant Fort Worth (`fortWorth`: $-97.33^\circ\text{ E}, 32.75^\circ\text{ N}$), Lynas Mt Weld (`mtWeld`: $122.53^\circ\text{ E}, -28.87^\circ\text{ S}$), Lynas Kuantan (`kuantan`: $103.33^\circ\text{ E}, 3.80^\circ\text{ N}$), Iluka Eneabba (`eneabba`: $115.27^\circ\text{ E}, -29.83^\circ\text{ S}$).
+* **Destinations (Industrial & Defense Consumers)**:
+  * Huntsville (`huntsville`: $-86.59^\circ\text{ E}, 34.73^\circ\text{ N}$), Nagoya (`nagoya`: $136.91^\circ\text{ E}, 35.18^\circ\text{ N}$), Wolfsburg (`wolfsburg`: $10.79^\circ\text{ E}, 52.42^\circ\text{ N}$), Ulsan (`ulsan`: $129.31^\circ\text{ E}, 35.54^\circ\text{ N}$).
+* **Geopolitical Classification**:
+  * `producerIds = ["CN"]` (China — dominant heavy & light REE monopoly).
+  * `alternativeIds = ["US", "AU", "MY"]` (Allied Alternative Supply Chain).
+  * `importerIds = ["JP", "DE", "KR", "US"]` (Major industrial/defense consumers).
+* **Key Innovations**:
+  * **Two-Tone Dominance vs Fragility**: China network rendered with thick glowing crimson/amber ribbons (~98% share), contrasted with ultra-thin, dashed, electric cyan allied ribbons (~2% share).
+  * **Truce Countdown & Scenario Toggle**: Live countdown to November 1, 2026 US-China export truce expiration, paired with binary scenario toggle ("Current Flows" vs "Post-Truce Restriction Scenario") simulating bilateral dual-use restrictions, buffer depletion, and allied supply acceleration.
+
+---
+
+### Case Study 6: AI Data Center Grid Demand vs. Local Friction & Opposition Map
+* **Reference File**: [214.html](file:///f:/Front/18-codepen/214.html)
+* **Architecture Paradigm**: Dual `MapPointSeries` Capacity + Friction Model (no Sankey flow routing required).
+* **Layer 1 — Hub Layer (DC Capacity Bubbles)**:
+  * Bubble radius proportional to power demand: $\text{radius} = \sqrt{\text{GW}_{2026}} \times \text{SCALE\_FACTOR}$ (with fallback emerging size for unreleased metrics).
+  * Major Clusters: Northern Virginia (16.6 GW / 33 GW 2030 proj), Texas (13 GW / 28 GW 2030 proj / ~474 GW ERCOT review), Phoenix AZ (tax-pause hub), Dublin Ireland (2.0 GW / 20% national load), Abu Dhabi UAE (Stargate UAE AI campus).
+* **Layer 2 — Friction Layer (Local Opposition & Policy Taxonomy)**:
+  * 9 Visual Outcome Classifications: `rejected` (red ✕), `moratorium` (orange ⏸), `moratorium-failed` (coral hollow pause), `paused` (amber ⏳), `escalated` (crimson ⚖), `referendum` (yellow 🗳), `protest` (rose 📢), `state-policy` (slate-blue 📜), `proceeding` (green ✓).
+  * 13 Active Events: Palm Beach FL ($2B Project Tango rejected), Prince George's MD (moratorium extended), Little Rock AR (4-4 tie vote), Genesee NY (statewide fight), Boulder City NV (federal litigation), Cheyenne WY (referendum drive), Fayetteville NC (wastewater protest), Texas statewide (Gov. Abbott grid pause), Virginia statewide (SCC cost-shift order), Arizona statewide (3-yr tax pause), New Jersey (Fair Share Act), Loudoun VA & Conshohocken PA (economic impact / proceeding).
+* **Key Innovations**:
+  * **Interactive Multi-Level Filtering**: Real-time filtering via `lil-gui` dropdown and clickable HUD taxonomy chips.
+  * **Live Active Telemetry Counter**: Dynamic HUD badge updating visible event count, state coverage, ERCOT queue review metric, and federal S.4214 bill tracking.
+  * **Regional Camera Presets**: One-click orbital transitions between North America Hubs, Transatlantic / Dublin, Abu Dhabi AI Campus, and Global Overview.
+
+---
+
+### Case Study 7: The Great Chip Bifurcation (AI Semiconductor Supply Chains)
+* **Reference File**: [215.html](file:///f:/Front/18-codepen/215.html)
+* **Origins & Foundries**:
+  * Western Chain: ASML Veldhoven (`veldhoven`: $5.40^\circ\text{ E}, 52.40^\circ\text{ N}$), TSMC Hsinchu (`hsinchu`: $120.97^\circ\text{ E}, 24.80^\circ\text{ N}$), TSMC Kaohsiung (`kaohsiung`: $120.31^\circ\text{ E}, 22.63^\circ\text{ N}$), TSMC Fab 21 Arizona (`phoenixFab`: $-112.07^\circ\text{ E}, 33.45^\circ\text{ N}$).
+  * Chinese Chain: SMIC Shanghai (`smicShanghai`: $121.47^\circ\text{ E}, 31.23^\circ\text{ N}$), SMIC Beijing (`smicBeijing`: $116.40^\circ\text{ E}, 39.90^\circ\text{ N}$).
+* **Design, Packaging & Hyperscale AI Destinations**:
+  * Nvidia HQ Santa Clara (`santaClara`: $-121.97^\circ\text{ E}, 37.35^\circ\text{ N}$), Oak Ridge National Laboratory (`oakRidge`: $-84.31^\circ\text{ E}, 35.93^\circ\text{ N}$), Northern Virginia (`nVirginia`: $-77.44^\circ\text{ E}, 39.03^\circ\text{ N}$), Texas Hub (`texasHub`: $-97.09^\circ\text{ E}, 32.78^\circ\text{ N}$).
+  * Domestic Packaging Shenzhen (`shenzhenPack`: $114.06^\circ\text{ E}, 22.54^\circ\text{ N}$), Guizhou AI Compute Cluster Guiyang (`guiyang`: $106.71^\circ\text{ E}, 26.57^\circ\text{ N}$).
+* **Geopolitical Classification**:
+  * `westernFabIds = ["TW", "US", "NL"]` (Western Allied AI Hardware Network).
+  * `chineseFabIds = ["CN"]` (Chinese Domestic Semiconductor Network).
+* **Key Innovations**:
+  * **Two-Network Parallel Globe Architecture**: Highlighting the contrast between the massive, advanced Western network (TSMC >60% foundry share, $265B total US commitment) and China's constrained but growing 7nm multi-patterning domestic alternative.
+  * **2-State Market-Share Shift Toggle**: Binary toggle switching between `Early 2026 Baseline` (Nvidia >90% China share) and `Aug 2026 Shift` (50/50 bifurcation due to tariffs and Beijing domestic preference push), with live ribbon scaling, custom dashed textures, and telemetry badges.
+  * **Monotonic Global Highway Routing (Zero Antimeridian Wrap)**: Continuous westbound maritime & overland transit for Asia-to-Americas corridors (Taiwan $\to$ Malacca $\to$ Suez $\to$ Atlantic $\to$ US) that eliminates $\pm 180^\circ$ Date Line geometry tears in both 3D Orthographic and 2D Planar modes.
+
+
+---
+
+### Case Study 8: Global AI Regulatory Landscape & US State Patchwork (Choropleth & Status Map)
+* **Reference File**: [216.html](file:///f:/Front/18-codepen/216.html)
+* **Architecture Paradigm**: Dual `MapPolygonSeries` Categorical Choropleth Engine with Slide-in HTML Legal Detail Drawer and Point-Series Federal Overlays (structurally distinct departure from the Sankey flow engine).
+* **Layer 0 — World Jurisdictions (`am5geodata_worldLow`)**:
+  * **Categorical Fill Model**: 5 distinct philosophical models mapped across sovereign nations (not a single-hue continuous heat gradient):
+    * `comprehensive-binding` (`#2E5EAA`): All 27 EU Member States (EU AI Act - Regulation 2024/1689: risk tiers, banned practices, GPAI systemic risk mandates) and South Korea (`KR` - AI Basic Act effective Jan 22, 2026).
+    * `state-content-control` (`#B5342A`): China (`CN` - Cybersecurity Law AI Amendments Jan 1, 2026, CAC algorithm filing, pre-deployment security review, socialist core values alignment, dual synthetic watermarking).
+    * `fragmented-patchwork` (`#C98A2E`): United States (`US` - No omnibus federal statute; mosaic of state statutes + sectoral agency guidance).
+    * `voluntary-pending` (`#8A8A8A`): United Kingdom (`GB` - AISI voluntary red-teaming, binding frontier legislation delayed into 2026/2027), Japan (`JP`), Switzerland (`CH`).
+    * `sector-emerging` (`#4E9C6E`): Singapore (`SG` - World's first Model AI Governance Framework for Generative & Agentic AI Jan 2026, AI Verify testing foundation), Australia (`AU` - AI Safety Institute, mandatory guardrails), UAE (`AE` - DIFC/ADGM sandbox regimes), Saudi Arabia (`SA` - 'Year of AI' PDPL enforcement), Canada (`CA` - AIDA Bill C-27).
+    * `no-data` (`#252d3a`): ~120 unclassified nations with neutral slate fill.
+* **Layer 1 — US Sub-National State Patchwork (`am5geodata_usaLow`)**:
+  * Activated on View Scope toggle to `us-detail` or camera zoom to the US.
+  * Rendered with high-contrast distinct borders (`strokeWidth: 1.2`, `#ffffff` / theme accent).
+  * State Legal Taxonomy:
+    * `two-law-state` (`#3b82f6`): Colorado (`US-CO` - Colorado AI Act SB 24-205 amended May 2026 to push effective date to Jan 1, 2027 and streamline scope + HB 26-1014 Chatbot Safety Act protecting minors).
+    * `multi-law-state` (`#06b6d4`): California (`US-CA` - AI Transparency Act SB 942, Training Data Transparency AB 2013, AI Companion Safety SB 243).
+    * `narrowed-law` (`#f59e0b`): Texas (`US-TX` - TRAIGA HB 1840 effective Jan 1, 2026: stripped affirmative assessments, categorical bans on manipulation/biometric capture, exclusive AG enforcement).
+    * `adjacent-law` (`#a855f7`): Illinois (`US-IL` - BIPA 740 ILCS 14 biometric consent acting as de facto AI restriction + AIVIA hiring video audits).
+    * `narrow-local-law` (`#ec4899`): New York (`US-NY` - NYC Local Law 144 automated employment decision tool bias audits).
+    * `emerging-state` (`#10b981`): Utah (`US-UT` - AI Policy Act SB 149, Office of AI Policy sandbox), Connecticut (`US-CT`), Indiana (`US-IN`), Virginia (`US-VA`), Florida (`US-FL`).
+    * `no-specific-law` (`#1e293b`): Remaining states governed by general consumer protection / UDAP acts.
+* **Layer 2 — Federal Defense & Scientific Point Markers**:
+  * Distinct glowing badge pins over Washington, DC $(-77.04^\circ\text{ E}, 38.91^\circ\text{ N})$:
+    * `GOLD EAGLE Initiative` (Treasury / DHS CISA / DOD): Frontier AI model swarms for automated vulnerability detection across critical energy, water, and financial infrastructure.
+    * `Genesis Mission` (EO 14363): Aggregating NIH biomedical data and DOE exascale supercomputing (Frontier/Aurora/El Capitan) for sovereign scientific AI discovery.
+* **Key Innovations**:
+  * **Interactive Slide-in HTML Legal Drawer**: Full slide-in panel (not a cramped tooltip) delivering comprehensive narrative text, statutory citations, key compliance checklists, effective dates, enforcement authorities, and strategic impact callouts.
+  * **Context-Aware Dynamic HUD Legend**: Interactive category chips displaying live counts and isolating matching national/state jurisdictions on click.
+  * **Seamless 3D Globe to 2D Planar & Projection Switching**: Supports `3D Orthographic Globe`, `2D Mercator`, and `2D Natural Earth`.
+  * **Full Keyboard & Broadcast Integration**: Hotkeys `H` (clean HUD toggle), `Esc` (close drawer), `1` (World Scope), `2` (US Scope), and Greenscreen (`#00ff00`) mode.
+
+---
+
 ## 10. Master Step-by-Step Creation Checklist
 
 To build any new visualization from scratch:
 
 1. **Assemble Coordinates**: Collect `lon` and `lat` for all source and target hubs.
-2. **Select Choke Points**: Choose intermediate waypoints from the [Global Waypoint Library](#4-global-navigational-waypoint-reference-library) to route around land.
+2. **Select Choke Points & Enforce Planar Continuity**: Choose intermediate waypoints from the [Global Waypoint Library](#4-global-navigational-waypoint-reference-library) to route around land. **Verify Monotonic Longitude Continuity** (per [Section 3.5](#5-the-antimeridian-180-date-line-boundary-rule--planar-continuity)) to prevent Antimeridian $\pm 180^\circ$ wrapping bugs in 2D map views.
 3. **Build Multi-Lane Offsets**: For shared corridors with $>3$ routes, create parallel lanes by varying intermediate latitudes $(\pm 2^\circ \dots 4^\circ)$.
 4. **Configure Glowing Circle Ships**: Adjust `shipSize` and `shipGlow` for your network scale.
-5. **Set Highlighted ISO Codes**: Update `producerIds` and `importerIds` with the 2-letter country ISO codes of your trade network.
+5. **Set Highlighted ISO Codes**: Update `producerIds`, `alternativeIds`, and `importerIds` with the 2-letter country ISO codes of your trade network.
 6. **Calibrate Camera & Title**:
    * Set `homeRotationX` and `homeRotationY` to frame your primary theater.
    * Update title and subtitle strings in `titleLabel` and `subtitleLabel`.
