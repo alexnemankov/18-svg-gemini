@@ -4,7 +4,7 @@
  * =========================================================================================
  * Description:
  * A high-performance, modular post-processing pipeline for Three.js. It features:
- *   - Multi-pass pyramid Gaussian Bloom (5 blur levels)
+ *   - Universal 3-Parameter Gaussian Bloom (Strength, Radius, Threshold)
  *   - Radial Chromatic Aberration distortion
  *   - Dynamic Film Grain Noise
  *   - Adjustable Vignette (Boost & Reduction)
@@ -37,9 +37,31 @@ void main() {
 }
 `;
 
+const brightFragmentShader = `
+precision highp float;
+uniform sampler2D inputTexture;
+uniform float bloomThreshold;
+in vec2 vUv;
+out vec4 fragColor;
+
+void main() {
+  vec4 color = texture(inputTexture, vUv);
+  // Calculate relative luminance (Rec. 709)
+  float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+  // Soft knee thresholding
+  float knee = 0.1;
+  float soft = luminance - bloomThreshold + knee;
+  soft = clamp(soft, 0.0, 2.0 * knee);
+  soft = (soft * soft) / (4.0 * knee + 0.00001);
+  float contribution = max(soft, luminance - bloomThreshold);
+  contribution /= max(luminance, 0.00001);
+  fragColor = vec4(color.rgb * contribution, color.a);
+}
+`;
+
 const blur13ShaderChunk = `
 vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
-  vec2 resolution = vec2(textureSize(image,0));
+  vec2 resolution = vec2(textureSize(image, 0));
   vec4 color = vec4(0.0);
   vec2 off1 = vec2(1.411764705882353) * direction;
   vec2 off2 = vec2(3.2941176470588234) * direction;
@@ -76,6 +98,8 @@ uniform sampler2D blur1Texture;
 uniform sampler2D blur2Texture;
 uniform sampler2D blur3Texture;
 uniform sampler2D blur4Texture;
+uniform bool bloomEnabled;
+uniform float bloomStrength;
 uniform float vignetteBoost;
 uniform float vignetteReduction;
 uniform float noiseIntensity;
@@ -94,37 +118,28 @@ float hash1(uint n) {
   return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
 }
 
-float noise(in vec2 uv, in float time) {
+float noise(in vec2 uv, in float timeVal) {
   uvec2 p = uvec2(uv);
-  return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(time));
-}
-
-vec4 screen(vec4 base, vec4 blend, float opacity) {
-  vec4 color = 1.0 - (1.0 - base) * (1.0 - blend);
-  return color * opacity + base * (1.0 - opacity);
+  return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
 }
 
 void main() {
-  vec4 b0 = texture(blur0Texture, vUv);
-  vec4 b1 = texture(blur1Texture, vUv);
-  vec4 b2 = texture(blur2Texture, vUv);
-  vec4 b3 = texture(blur3Texture, vUv);
-  vec4 b4 = texture(blur4Texture, vUv);
-  
   vec4 color = texture(inputTexture, vUv);
-  float factor = 40.0;
-  vec4 b = b0 / factor;
-  b += 2.0 * b1 / factor;
-  b += 4.0 * b2 / factor;
-  b += 8.0 * b3 / factor;
-  b += 16.0 * b4 / factor;
-  fragColor = color + b;
-  float f = 0.25;
-  b = clamp(b - f, vec4(0.0), vec4(1.0)) * (1.0 / (1.0 - f));
-  fragColor = screen(color, b, 1.0);
-  fragColor *= vignette(vUv, vignetteBoost, vignetteReduction);
-  fragColor += noiseIntensity * noise(gl_FragCoord.xy, time);
-  fragColor.a = 1.0;
+
+  if (bloomEnabled && bloomStrength > 0.001) {
+    vec4 b0 = texture(blur0Texture, vUv);
+    vec4 b1 = texture(blur1Texture, vUv);
+    vec4 b2 = texture(blur2Texture, vUv);
+    vec4 b3 = texture(blur3Texture, vUv);
+    vec4 b4 = texture(blur4Texture, vUv);
+
+    vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+    color += bloomSum * bloomStrength;
+  }
+
+  color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+  color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+  fragColor = vec4(color.rgb, 1.0);
 }
 `;
 
@@ -167,24 +182,37 @@ uniform float chromaticAberrationAmount;
 uniform float minInputLevel;
 uniform float maxInputLevel;
 uniform float gammaLevel;
+uniform float fisheyeStrength;
+uniform float fisheyeRadius;
 uniform float time;
 in vec2 vUv;
 out vec4 fragColor;
 
 ${chromaticAberrationShaderChunk}
 
+vec2 applyFisheye(vec2 uv, float strength, float radius) {
+  if (abs(strength) < 0.0001) return uv;
+  vec2 p = uv - 0.5;
+  float d = length(p);
+  if (d > radius * 1.5) return uv;
+  float r = d / max(radius, 0.001);
+  float theta = atan(p.y, p.x);
+  float rDist = r + strength * (r * r * r);
+  return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+}
+
 vec3 gammaCorrect(vec3 color, vec3 gamma) {
-  return pow(color, 1.0 / gamma);
+  return pow(max(color, vec3(0.0)), 1.0 / gamma);
 }
 vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
-  return min(max(color - minInput, vec3(0.0)) / (maxInput - minInput), vec3(1.0));
+  return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
 }
 vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
   return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
 }
 void main() {
-  vec2 uv = 0.8 * (vUv - 0.5) + 0.5;
-  fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (vUv - 0.5));
+  vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+  fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
   fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
   fragColor.a = 1.0;
 }
@@ -210,9 +238,9 @@ function createFBO(w, h, options = {}) {
     minFilter: options.minFilter || THREE.LinearFilter,
     magFilter: options.magFilter || THREE.LinearFilter,
     format: options.format || THREE.RGBAFormat,
-    type: options.type || THREE.UnsignedByteType,
+    type: options.type || THREE.HalfFloatType,
     stencilBuffer: options.stencilBuffer || false,
-    depthBuffer: options.depthBuffer || true,
+    depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
     samples: options.samples || 0,
   });
 }
@@ -270,10 +298,27 @@ class ShaderPingPongPass {
 }
 
 class BloomPass {
-  constructor(strength = 3, levels = 5) {
+  constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
     this.strength = strength;
+    this.radius = radius;
+    this.threshold = threshold;
+    this.enabled = true;
     this.levels = levels;
-    this.blurPasses = [];
+
+    this.brightShader = new THREE.RawShaderMaterial({
+      uniforms: {
+        inputTexture: { value: null },
+        bloomThreshold: { value: this.threshold },
+      },
+      vertexShader: orthoVertexShader,
+      fragmentShader: brightFragmentShader,
+      glslVersion: THREE.GLSL3,
+    });
+    this.brightPass = new ShaderPass(this.brightShader, {
+      format: THREE.RGBAFormat,
+      type: THREE.HalfFloatType,
+    });
+
     this.blurShader = new THREE.RawShaderMaterial({
       uniforms: {
         inputTexture: { value: null },
@@ -283,35 +328,53 @@ class BloomPass {
       fragmentShader: blurFragmentShader,
       glslVersion: THREE.GLSL3,
     });
+
+    this.blurPasses = [];
     for (let i = 0; i < this.levels; i++) {
       this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
         format: THREE.RGBAFormat,
+        type: THREE.HalfFloatType,
       }));
     }
   }
+
   setSize(w, h) {
     let tw = Math.max(1, w);
     let th = Math.max(1, h);
+    this.brightPass.setSize(tw, th);
     for (let i = 0; i < this.levels; i++) {
       tw = Math.max(1, Math.round(tw / 2));
       th = Math.max(1, Math.round(th / 2));
       this.blurPasses[i].setSize(tw, th);
     }
   }
+
   set source(texture) {
-    this.blurShader.uniforms.inputTexture.value = texture;
+    this.brightShader.uniforms.inputTexture.value = texture;
   }
+
   render(renderer) {
-    const offset = this.strength;
+    if (!this.enabled || this.strength <= 0.001) return;
+
+    this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+    this.brightPass.render(renderer);
+
+    const baseOffset = Math.max(0.1, this.radius * 2.0);
     const u = this.blurShader.uniforms;
+
     for (let j = 0; j < this.levels; j++) {
       const blurPass = this.blurPasses[j];
-      u.direction.value.set(offset, 0);
+      const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+      // Horizontal blur pass
+      u.direction.value.set(stepOffset, 0);
+      u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
       blurPass.render(renderer);
+
+      // Vertical blur pass
+      u.direction.value.set(0, stepOffset * 0.5);
       u.inputTexture.value = blurPass.current.texture;
-      u.direction.value.set(0, offset / 2);
       blurPass.render(renderer);
-      u.inputTexture.value = blurPass.current.texture;
     }
   }
 }
@@ -324,22 +387,43 @@ export class PostProcessor {
     this.renderer = renderer;
 
     this.settings = {
+      // Global Switch
       enabled: params.enabled !== undefined ? params.enabled : true,
-      bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 3.0,
+
+      // 1. Universal 3-Param Bloom Engine
+      bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+      bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.8,
+      bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+      bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.2,
+
+      // 2. Lens & Camera Optics
+      fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+      fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+      chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.04,
       vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
       vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.5,
-      noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.05,
-      chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.1,
-      gamma: params.gamma !== undefined ? params.gamma : 0.85,
-      minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 9.0 / 255.0,
-      maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 237.0 / 255.0,
+      noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.02,
+
+      // 3. Color Grading & Tone
+      gamma: params.gamma !== undefined ? params.gamma : 1.0,
+      minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+      maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
     };
 
-    this.sceneTarget = createFBO(1, 1);
+    this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+    this.bloomPass = new BloomPass(
+      this.settings.bloomStrength,
+      this.settings.bloomRadius,
+      this.settings.bloomThreshold,
+      5
+    );
 
     this.finalShader = new THREE.RawShaderMaterial({
       uniforms: {
         resolution: { value: new THREE.Vector2(1, 1) },
+        bloomEnabled: { value: this.settings.bloomEnabled },
+        bloomStrength: { value: this.settings.bloomStrength },
         vignetteBoost: { value: this.settings.vignetteBoost },
         vignetteReduction: { value: this.settings.vignetteReduction },
         noiseIntensity: { value: this.settings.noiseIntensity },
@@ -360,6 +444,8 @@ export class PostProcessor {
     this.rgbShader = new THREE.RawShaderMaterial({
       uniforms: {
         inputTexture: { value: this.finalPass.texture },
+        fisheyeStrength: { value: this.settings.fisheyeStrength },
+        fisheyeRadius: { value: this.settings.fisheyeRadius },
         chromaticAberrationAmount: { value: this.settings.chromaticAberration },
         minInputLevel: { value: this.settings.minInputLevel },
         maxInputLevel: { value: this.settings.maxInputLevel },
@@ -381,15 +467,22 @@ export class PostProcessor {
       glslVersion: THREE.GLSL3,
     });
     this.copyPass = new ShaderPass(this.copyShader);
-
-    this.bloomPass = new BloomPass(this.settings.bloomStrength, 5);
   }
 
   updateSettings() {
+    this.bloomPass.enabled = this.settings.bloomEnabled;
     this.bloomPass.strength = this.settings.bloomStrength;
+    this.bloomPass.radius = this.settings.bloomRadius;
+    this.bloomPass.threshold = this.settings.bloomThreshold;
+
+    this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+    this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
     this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
     this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
     this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+    this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+    this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
     this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
     this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
     this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
@@ -445,19 +538,29 @@ export class PostProcessor {
     this.rgbPass.render(this.renderer, true);
   }
 
-  attachGUI(gui, title = "Post Processor Settings") {
-    const folder = gui.addFolder(title);
+  attachGUI(gui, title = "Post-Processing Suite") {
+    const root = gui.addFolder(title);
+    root.add(this.settings, "enabled").name("Enable Suite");
 
-    folder.add(this.settings, "enabled").name("Enable PostProcess");
-    folder.add(this.settings, "bloomStrength", 0, 10, 0.1).name("Bloom Strength").onChange(() => this.updateSettings());
-    folder.add(this.settings, "chromaticAberration", 0, 0.5, 0.01).name("Chromatic Aberration").onChange(() => this.updateSettings());
-    folder.add(this.settings, "vignetteBoost", 0, 2, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
-    folder.add(this.settings, "vignetteReduction", 0, 2, 0.05).name("Vignette Reduction").onChange(() => this.updateSettings());
-    folder.add(this.settings, "noiseIntensity", 0, 0.2, 0.005).name("Noise Intensity").onChange(() => this.updateSettings());
-    folder.add(this.settings, "gamma", 0.1, 2.0, 0.05).name("Gamma Level").onChange(() => this.updateSettings());
-    folder.add(this.settings, "minInputLevel", 0, 0.5, 0.005).name("Min Input Level").onChange(() => this.updateSettings());
-    folder.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.005).name("Max Input Level").onChange(() => this.updateSettings());
+    // Folder 1: Bloom (Standard 3-Param Optical Engine)
+    const bloom = root.addFolder("Bloom");
+    bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+    bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+    bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+    bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
 
-    return folder;
+    // Folder 2: Lens & Cinematic Effects
+    const lens = root.addFolder("Lens, Optics & Fisheye");
+    lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+    lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+    lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+    lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+    lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+    lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+    lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+    lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+    lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+    return root;
   }
 }

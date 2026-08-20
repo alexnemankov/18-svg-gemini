@@ -1,0 +1,1698 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Right-Angle Circuit Traces — PCB Motherboard</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background-color: #030c08;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        outline: none;
+      }
+      .lil-gui.autoPlace {
+        position: absolute;
+        top: auto;
+        bottom: 10px;
+        right: 10px;
+      }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+          "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+      import GUI from 'lil-gui';
+
+      // =========================================================================
+      // 1. PostProcessor Suite (Bloom, Fisheye, Optics & Color Grading)
+      // =========================================================================
+
+      const orthoVertexShader = `
+        precision highp float;
+        in vec3 position;
+        out vec2 vUv;
+        void main() {
+          vUv = position.xy * 0.5 + 0.5;
+          gl_Position = vec4(position, 1.0);
+        }
+      `;
+
+      const brightFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float bloomThreshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float knee = 0.1;
+          float soft = luminance - bloomThreshold + knee;
+          soft = clamp(soft, 0.0, 2.0 * knee);
+          soft = (soft * soft) / (4.0 * knee + 0.00001);
+          float contribution = max(soft, luminance - bloomThreshold);
+          contribution /= max(luminance, 0.00001);
+          fragColor = vec4(color.rgb * contribution, color.a);
+        }
+      `;
+
+      const blur13ShaderChunk = `
+        vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+          vec2 resolution = vec2(textureSize(image, 0));
+          vec4 color = vec4(0.0);
+          vec2 off1 = vec2(1.411764705882353) * direction;
+          vec2 off2 = vec2(3.2941176470588234) * direction;
+          vec2 off3 = vec2(5.176470588235294) * direction;
+          color += texture(image, uv) * 0.1964825501511404;
+          color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+          color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+          return color;
+        }
+      `;
+
+      const blurFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 direction;
+        in vec2 vUv;
+        out vec4 color;
+        ${blur13ShaderChunk}
+        void main() {
+          color = blur13(inputTexture, vUv, direction);
+        }
+      `;
+
+      const finalFragmentShader = `
+        precision highp float;
+        uniform vec2 resolution;
+        uniform sampler2D inputTexture;
+        uniform sampler2D blur0Texture;
+        uniform sampler2D blur1Texture;
+        uniform sampler2D blur2Texture;
+        uniform sampler2D blur3Texture;
+        uniform sampler2D blur4Texture;
+        uniform bool bloomEnabled;
+        uniform float bloomStrength;
+        uniform float vignetteBoost;
+        uniform float vignetteReduction;
+        uniform float noiseIntensity;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        float vignette(vec2 uv, float boost, float reduction) {
+          vec2 position = vUv - 0.5;
+          return boost - length(position) * reduction;
+        }
+
+        float hash1(uint n) {
+          n = (n << 13U) ^ n;
+          n = n * (n * n * 15731U + 789221U) + 1376312589U;
+          return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+        }
+
+        float noise(in vec2 uv, in float timeVal) {
+          uvec2 p = uvec2(uv);
+          return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+        }
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+
+          if (bloomEnabled && bloomStrength > 0.001) {
+            vec4 b0 = texture(blur0Texture, vUv);
+            vec4 b1 = texture(blur1Texture, vUv);
+            vec4 b2 = texture(blur2Texture, vUv);
+            vec4 b3 = texture(blur3Texture, vUv);
+            vec4 b4 = texture(blur4Texture, vUv);
+
+            vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+            color += bloomSum * bloomStrength;
+          }
+
+          color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+          color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+          fragColor = vec4(color.rgb, 1.0);
+        }
+      `;
+
+      const chromaticAberrationShaderChunk = `
+        vec2 barrelDistortion(vec2 coord, float amt) {
+          vec2 cc = coord - 0.5;
+          float dist = dot(cc, cc);
+          return coord + cc * dist * amt;
+        }
+        float sat(float t) { return clamp(t, 0.0, 1.0); }
+        float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+        float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+        vec4 spectrum_offset(float t) {
+          float lo = step(t, 0.5);
+          float hi = 1.0 - lo;
+          float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+          vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+          return pow(ret, vec4(1.0 / 2.2));
+        }
+        const float max_distort = 2.2;
+        const int num_iter = 8;
+        const float reci_num_iter_f = 1.0 / float(num_iter);
+        vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount) {
+          vec4 sumcol = vec4(0.0);
+          vec4 sumw = vec4(0.0);
+          for (int i = 0; i < num_iter; ++i) {
+            float t = float(i) * reci_num_iter_f;
+            vec4 w = spectrum_offset(t);
+            sumw += w;
+            sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+          }
+          return sumcol / sumw;
+        }
+      `;
+
+      const colorFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float chromaticAberrationAmount;
+        uniform float fisheyeStrength;
+        uniform float fisheyeRadius;
+        uniform float minInputLevel;
+        uniform float maxInputLevel;
+        uniform float gammaLevel;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        ${chromaticAberrationShaderChunk}
+
+        vec2 applyFisheye(vec2 uv, float strength, float radius) {
+          if (abs(strength) < 0.0001) return uv;
+          vec2 p = uv - 0.5;
+          float d = length(p);
+          if (d > radius * 1.5) return uv;
+          float r = d / max(radius, 0.001);
+          float theta = atan(p.y, p.x);
+          float rDist = r + strength * (r * r * r);
+          return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+        }
+
+        vec3 gammaCorrect(vec3 color, vec3 gamma) {
+          return pow(max(color, vec3(0.0)), 1.0 / gamma);
+        }
+        vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+          return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+        }
+        vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+          return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+        }
+        void main() {
+          vec2 distortedUv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+
+          if (distortedUv.x < 0.0 || distortedUv.x > 1.0 || distortedUv.y < 0.0 || distortedUv.y > 1.0) {
+            fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+          }
+
+          fragColor = chromaticAberration(inputTexture, distortedUv, chromaticAberrationAmount);
+          fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+          fragColor.a = 1.0;
+        }
+      `;
+
+      const copyFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        in vec2 vUv;
+        out vec4 fragColor;
+        void main() {
+          fragColor = texture(inputTexture, vUv);
+        }
+      `;
+
+      function createFBO(w, h, options = {}) {
+        return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+          wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+          wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+          minFilter: options.minFilter || THREE.LinearFilter,
+          magFilter: options.magFilter || THREE.LinearFilter,
+          format: options.format || THREE.RGBAFormat,
+          type: options.type || THREE.HalfFloatType,
+          stencilBuffer: options.stencilBuffer || false,
+          depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+          samples: options.samples || 0,
+        });
+      }
+
+      class ShaderPass {
+        constructor(shader, options = {}) {
+          this.shader = shader;
+          this.orthoScene = new THREE.Scene();
+          this.fbo = createFBO(1, 1, options);
+          this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+          this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+          this.orthoScene.add(this.orthoQuad);
+          this.texture = this.fbo.texture;
+        }
+        render(renderer, toScreen = false) {
+          if (!toScreen) {
+            renderer.setRenderTarget(this.fbo);
+          }
+          renderer.render(this.orthoScene, this.orthoCamera);
+          if (!toScreen) {
+            renderer.setRenderTarget(null);
+          }
+        }
+        setSize(width, height) {
+          this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+          this.orthoQuad.scale.set(width, height, 1);
+        }
+      }
+
+      class ShaderPingPongPass {
+        constructor(shader, options = {}) {
+          this.shader = shader;
+          this.orthoScene = new THREE.Scene();
+          this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+          this.currentFBO = 0;
+          this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+          this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+          this.orthoScene.add(this.orthoQuad);
+        }
+        render(renderer) {
+          renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+          renderer.render(this.orthoScene, this.orthoCamera);
+          renderer.setRenderTarget(null);
+          this.currentFBO = 1 - this.currentFBO;
+        }
+        get current() { return this.fbos[this.currentFBO]; }
+        get texture() { return this.current.texture; }
+        setSize(width, height) {
+          const w = Math.max(1, width);
+          const h = Math.max(1, height);
+          this.orthoQuad.scale.set(w, h, 1);
+          this.fbos[0].setSize(w, h);
+          this.fbos[1].setSize(w, h);
+        }
+      }
+
+      class BloomPass {
+        constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+          this.strength = strength;
+          this.radius = radius;
+          this.threshold = threshold;
+          this.enabled = true;
+          this.levels = levels;
+
+          this.brightShader = new THREE.RawShaderMaterial({
+            uniforms: {
+              inputTexture: { value: null },
+              bloomThreshold: { value: this.threshold },
+            },
+            vertexShader: orthoVertexShader,
+            fragmentShader: brightFragmentShader,
+            glslVersion: THREE.GLSL3,
+          });
+          this.brightPass = new ShaderPass(this.brightShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          });
+
+          this.blurShader = new THREE.RawShaderMaterial({
+            uniforms: {
+              inputTexture: { value: null },
+              direction: { value: new THREE.Vector2(0, 1) },
+            },
+            vertexShader: orthoVertexShader,
+            fragmentShader: blurFragmentShader,
+            glslVersion: THREE.GLSL3,
+          });
+
+          this.blurPasses = [];
+          for (let i = 0; i < this.levels; i++) {
+            this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            }));
+          }
+        }
+
+        setSize(w, h) {
+          let tw = Math.max(1, w);
+          let th = Math.max(1, h);
+          this.brightPass.setSize(tw, th);
+          for (let i = 0; i < this.levels; i++) {
+            tw = Math.max(1, Math.round(tw / 2));
+            th = Math.max(1, Math.round(th / 2));
+            this.blurPasses[i].setSize(tw, th);
+          }
+        }
+
+        set source(texture) {
+          this.brightShader.uniforms.inputTexture.value = texture;
+        }
+
+        render(renderer) {
+          if (!this.enabled || this.strength <= 0.001) return;
+
+          this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+          this.brightPass.render(renderer);
+
+          const baseOffset = Math.max(0.1, this.radius * 2.0);
+          const u = this.blurShader.uniforms;
+
+          for (let j = 0; j < this.levels; j++) {
+            const blurPass = this.blurPasses[j];
+            const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+            u.direction.value.set(stepOffset, 0);
+            u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+            blurPass.render(renderer);
+
+            u.direction.value.set(0, stepOffset * 0.5);
+            u.inputTexture.value = blurPass.current.texture;
+            blurPass.render(renderer);
+          }
+        }
+      }
+
+      class PostProcessor {
+        constructor(renderer, params = {}) {
+          this.renderer = renderer;
+
+          this.settings = {
+            enabled: params.enabled !== undefined ? params.enabled : false, // Default is OFF as requested
+
+            bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+            bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.2,
+            bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.6,
+            bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.15,
+
+            fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+            fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+            chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.03,
+            vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+            vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.6,
+            noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.015,
+
+            gamma: params.gamma !== undefined ? params.gamma : 1.0,
+            minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+            maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+          };
+
+          this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+          this.bloomPass = new BloomPass(
+            this.settings.bloomStrength,
+            this.settings.bloomRadius,
+            this.settings.bloomThreshold,
+            5
+          );
+
+          this.finalShader = new THREE.RawShaderMaterial({
+            uniforms: {
+              resolution: { value: new THREE.Vector2(1, 1) },
+              bloomEnabled: { value: this.settings.bloomEnabled },
+              bloomStrength: { value: this.settings.bloomStrength },
+              vignetteBoost: { value: this.settings.vignetteBoost },
+              vignetteReduction: { value: this.settings.vignetteReduction },
+              noiseIntensity: { value: this.settings.noiseIntensity },
+              inputTexture: { value: null },
+              blur0Texture: { value: null },
+              blur1Texture: { value: null },
+              blur2Texture: { value: null },
+              blur3Texture: { value: null },
+              blur4Texture: { value: null },
+              time: { value: 0 },
+            },
+            vertexShader: orthoVertexShader,
+            fragmentShader: finalFragmentShader,
+            glslVersion: THREE.GLSL3,
+          });
+          this.finalPass = new ShaderPass(this.finalShader);
+
+          this.rgbShader = new THREE.RawShaderMaterial({
+            uniforms: {
+              inputTexture: { value: this.finalPass.texture },
+              chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+              fisheyeStrength: { value: this.settings.fisheyeStrength },
+              fisheyeRadius: { value: this.settings.fisheyeRadius },
+              minInputLevel: { value: this.settings.minInputLevel },
+              maxInputLevel: { value: this.settings.maxInputLevel },
+              gammaLevel: { value: this.settings.gamma },
+              time: { value: 0 },
+            },
+            vertexShader: orthoVertexShader,
+            fragmentShader: colorFragmentShader,
+            glslVersion: THREE.GLSL3,
+          });
+          this.rgbPass = new ShaderPass(this.rgbShader);
+
+          this.copyShader = new THREE.RawShaderMaterial({
+            uniforms: {
+              inputTexture: { value: null },
+            },
+            vertexShader: orthoVertexShader,
+            fragmentShader: copyFragmentShader,
+            glslVersion: THREE.GLSL3,
+          });
+          this.copyPass = new ShaderPass(this.copyShader);
+        }
+
+        updateSettings() {
+          this.bloomPass.enabled = this.settings.bloomEnabled;
+          this.bloomPass.strength = this.settings.bloomStrength;
+          this.bloomPass.radius = this.settings.bloomRadius;
+          this.bloomPass.threshold = this.settings.bloomThreshold;
+
+          this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+          this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+          this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+          this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+          this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+          this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+          this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+          this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+          this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+          this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+          this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        }
+
+        setSize(w0, h0, dpr = 1) {
+          const w = Math.max(1, Math.floor(w0 * dpr));
+          const h = Math.max(1, Math.floor(h0 * dpr));
+          this.sceneTarget.setSize(w, h);
+          this.finalPass.setSize(w, h);
+          this.finalShader.uniforms.resolution.value.set(w, h);
+          this.bloomPass.setSize(w, h);
+          this.rgbPass.setSize(w, h);
+          this.copyPass.setSize(w, h);
+        }
+
+        renderScene(scene, camera) {
+          if (!this.settings.enabled) {
+            this.renderer.render(scene, camera);
+            return;
+          }
+          this.renderer.setRenderTarget(this.sceneTarget);
+          this.renderer.render(scene, camera);
+          this.renderer.setRenderTarget(null);
+          this.render(this.sceneTarget.texture);
+        }
+
+        render(sourceTexture) {
+          if (!this.settings.enabled) {
+            this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+            this.copyPass.render(this.renderer, true);
+            return;
+          }
+
+          this.updateSettings();
+
+          this.bloomPass.source = sourceTexture;
+          this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.bloomPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+          this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+          this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+          this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+          this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+          const randomTime = Math.random() * 100000;
+          this.finalPass.shader.uniforms.time.value = randomTime;
+          this.rgbPass.shader.uniforms.time.value = randomTime;
+
+          this.finalPass.render(this.renderer);
+          this.rgbPass.render(this.renderer, true);
+        }
+
+        attachGUI(gui, title = "Post-Processing & Fisheye") {
+          const root = gui.addFolder(title);
+          root.add(this.settings, "enabled").name("Enable Suite");
+
+          const bloom = root.addFolder("Bloom");
+          bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+          bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+          bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+          bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+          const lens = root.addFolder("Lens & Fisheye");
+          lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+          lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+          lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+          lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+          lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+          lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+          lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+          lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+          lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+          return root;
+        }
+      }
+
+      // =========================================================================
+      // 2. 5 Presetupped Color Schemes (PCB / Motherboard Aesthetic)
+      // =========================================================================
+
+      const COLOR_PALETTES = {
+        'Cyberpunk Neon PCB': {
+          colorBg: '#030c08',
+          colorBoard: '#05160e',
+          colorLine: '#0d4a36',
+          colorSignal: '#00f5ff',
+          colorSignal2: '#00ff66',
+          colorSignal3: '#ffb700',
+          colorVias: '#00f0ff',
+          colorChip: '#0a2417',
+          colorSilkscreen: '#175c43'
+        },
+        'Silicon Gold Edition': {
+          colorBg: '#09090c',
+          colorBoard: '#111218',
+          colorLine: '#3a2b14',
+          colorSignal: '#ffd700',
+          colorSignal2: '#ff9100',
+          colorSignal3: '#fff2b2',
+          colorVias: '#ffd700',
+          colorChip: '#1c1b22',
+          colorSilkscreen: '#544225'
+        },
+        'Crimson Overclock': {
+          colorBg: '#090204',
+          colorBoard: '#140508',
+          colorLine: '#450d18',
+          colorSignal: '#ff003c',
+          colorSignal2: '#ff5500',
+          colorSignal3: '#f0a6ff',
+          colorVias: '#ff003c',
+          colorChip: '#20080d',
+          colorSilkscreen: '#661626'
+        },
+        'Quantum Superconductor': {
+          colorBg: '#020514',
+          colorBoard: '#060d24',
+          colorLine: '#14285c',
+          colorSignal: '#b026ff',
+          colorSignal2: '#0077ff',
+          colorSignal3: '#00ffd5',
+          colorVias: '#b026ff',
+          colorChip: '#0c1538',
+          colorSilkscreen: '#233d80'
+        },
+        'Ghost Schematic Blueprint': {
+          colorBg: '#060b12',
+          colorBoard: '#0c1524',
+          colorLine: '#1f3854',
+          colorSignal: '#ffffff',
+          colorSignal2: '#70b5ff',
+          colorSignal3: '#00e1d9',
+          colorVias: '#ffffff',
+          colorChip: '#142136',
+          colorSilkscreen: '#2e4f73'
+        }
+      };
+
+      // =========================================================================
+      // 3. Settings & Parameters
+      // =========================================================================
+
+      const settings = {
+        // Presets & Modes
+        colorPreset: 'Cyberpunk Neon PCB',
+        animationPreset: 'Static Schematic',
+        clickToRandomize: true,
+
+        // Display & Environment
+        dpr: Math.min(window.devicePixelRatio || 1, 2.0),
+        greenScreen: false,
+
+        // Colors
+        colorBg: COLOR_PALETTES['Cyberpunk Neon PCB'].colorBg,
+        colorBoard: COLOR_PALETTES['Cyberpunk Neon PCB'].colorBoard,
+        colorLine: COLOR_PALETTES['Cyberpunk Neon PCB'].colorLine,
+        colorSignal: COLOR_PALETTES['Cyberpunk Neon PCB'].colorSignal,
+        useColor2: true,
+        colorSignal2: COLOR_PALETTES['Cyberpunk Neon PCB'].colorSignal2,
+        useColor3: true,
+        colorSignal3: COLOR_PALETTES['Cyberpunk Neon PCB'].colorSignal3,
+        colorVias: COLOR_PALETTES['Cyberpunk Neon PCB'].colorVias,
+        colorChip: COLOR_PALETTES['Cyberpunk Neon PCB'].colorChip,
+        colorSilkscreen: COLOR_PALETTES['Cyberpunk Neon PCB'].colorSilkscreen,
+
+        // Board & Circuit Geometry
+        lineCount: 120,
+        lineOpacity: 0.6,
+        gridSize: 120,
+        gridStep: 3.0,
+        boardElevation: -0.2,
+        layerOffset: 0.4,
+        showBoard: true,
+        showSilkscreen: true,
+        showChips: true,
+        showVias: true,
+
+        // Signals & Motion
+        signalCount: 110,
+        speedGlobal: 0.6,
+        animationSpeed: 1.0,
+        trailLength: 14,
+        signalHeadSize: 2.2,
+        pulseSpeed: 1.0,
+
+        // Camera Placement and Lens Settings
+        camPosX: 0.0,
+        camPosY: 75.0,
+        camPosZ: 45.0,
+        targetX: 0.0,
+        targetY: 0.0,
+        targetZ: 0.0,
+        polarAngle: 45.0,
+        azimuthAngle: 0.0,
+        camDistance: 87.5,
+        fov: 45.0,
+
+        // Interaction parameters
+        rotateSpeed: 1.0,
+        panSpeed: 1.0,
+        zoomSpeed: 1.0,
+        dampingFactor: 0.05,
+        enableRotate: true,
+        enablePan: true,
+        enableZoom: true,
+        autoRotate: false,
+        autoRotateSpeed: 0.5
+      };
+
+      // =========================================================================
+      // 4. Three.js Scene, Camera, Renderer & OrbitControls
+      // =========================================================================
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(settings.colorBg);
+      scene.fog = new THREE.FogExp2(settings.colorBg, 0.003);
+
+      const perspectiveCamera = new THREE.PerspectiveCamera(
+        settings.fov,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        2000.0
+      );
+      perspectiveCamera.position.set(settings.camPosX, settings.camPosY, settings.camPosZ);
+
+      const renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        powerPreference: 'high-performance'
+      });
+      renderer.setPixelRatio(settings.dpr);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const controls = new OrbitControls(perspectiveCamera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = settings.dampingFactor;
+      controls.target.set(settings.targetX, settings.targetY, settings.targetZ);
+      controls.rotateSpeed = settings.rotateSpeed;
+      controls.panSpeed = settings.panSpeed;
+      controls.zoomSpeed = settings.zoomSpeed;
+      controls.autoRotate = settings.autoRotate;
+      controls.autoRotateSpeed = settings.autoRotateSpeed;
+      controls.update();
+      perspectiveCamera.updateMatrixWorld(true);
+
+      const postProcessor = new PostProcessor(renderer, { enabled: false });
+      postProcessor.setSize(window.innerWidth, window.innerHeight, settings.dpr);
+
+      // Top-level Content Group
+      const contentGroup = new THREE.Group();
+      scene.add(contentGroup);
+
+      // Shader Uniforms for Camera Synchronization
+      const cameraUniforms = {
+        uCameraPos: { value: new THREE.Vector3() },
+        uCameraWorldMatrix: { value: new THREE.Matrix4() },
+        uCameraFov: { value: settings.fov }
+      };
+
+      // =========================================================================
+      // 5. Procedural 90-Degree Orthogonal PCB Motherboard Generator
+      // =========================================================================
+
+      let tracesData = []; // Array of { points: Vector3[], length: number, cumulativeDist: number[] }
+      let traceLines = [];
+      let signals = [];
+      let viasMesh = null;
+      let padsMesh = null;
+      let chipsGroup = new THREE.Group();
+      let boardMesh = null;
+      let silkscreenLines = null;
+
+      contentGroup.add(chipsGroup);
+
+      // Materials
+      const traceMaterial = new THREE.LineBasicMaterial({
+        color: settings.colorLine,
+        transparent: true,
+        opacity: settings.lineOpacity,
+        depthWrite: false
+      });
+
+      const signalMaterial = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: true,
+        transparent: true,
+        linewidth: 2
+      });
+
+      const signalColorObj1 = new THREE.Color(settings.colorSignal);
+      const signalColorObj2 = new THREE.Color(settings.colorSignal2);
+      const signalColorObj3 = new THREE.Color(settings.colorSignal3);
+
+      function pickSignalColor() {
+        const choices = [signalColorObj1];
+        if (settings.useColor2) choices.push(signalColorObj2);
+        if (settings.useColor3) choices.push(signalColorObj3);
+        return choices[Math.floor(Math.random() * choices.length)];
+      }
+
+      // Helper: build polyline arc-length parameterization
+      function buildTracePath(points) {
+        let length = 0;
+        const cumulativeDist = [0];
+        for (let i = 0; i < points.length - 1; i++) {
+          const segLen = points[i].distanceTo(points[i + 1]);
+          length += segLen;
+          cumulativeDist.push(length);
+        }
+        return { points, length, cumulativeDist };
+      }
+
+      // Helper: sample point along orthogonal trace at progress t in [0, 1]
+      function getTracePoint(trace, t) {
+        if (!trace || trace.points.length === 0) return new THREE.Vector3();
+        if (trace.points.length === 1) return trace.points[0].clone();
+
+        const clampedT = Math.max(0, Math.min(1, t));
+        const targetDist = clampedT * trace.length;
+
+        for (let i = 0; i < trace.cumulativeDist.length - 1; i++) {
+          const d0 = trace.cumulativeDist[i];
+          const d1 = trace.cumulativeDist[i + 1];
+          if (targetDist >= d0 && targetDist <= d1) {
+            const segLen = d1 - d0;
+            const factor = segLen > 0.0001 ? (targetDist - d0) / segLen : 0;
+            return new THREE.Vector3().lerpVectors(trace.points[i], trace.points[i + 1], factor);
+          }
+        }
+        return trace.points[trace.points.length - 1].clone();
+      }
+
+      // Generate all 90-degree orthogonal traces and hardware layout
+      function buildMotherboardGeometry() {
+        // Clear previous traces
+        traceLines.forEach((line) => {
+          contentGroup.remove(line);
+          line.geometry.dispose();
+        });
+        traceLines = [];
+        tracesData = [];
+
+        // Clear previous chips & board & vias
+        while (chipsGroup.children.length > 0) {
+          const obj = chipsGroup.children[0];
+          chipsGroup.remove(obj);
+          if (obj.geometry) obj.geometry.dispose();
+        }
+        if (viasMesh) {
+          contentGroup.remove(viasMesh);
+          viasMesh.geometry.dispose();
+          viasMesh = null;
+        }
+        if (padsMesh) {
+          contentGroup.remove(padsMesh);
+          padsMesh.geometry.dispose();
+          padsMesh = null;
+        }
+        if (boardMesh) {
+          contentGroup.remove(boardMesh);
+          boardMesh.geometry.dispose();
+          boardMesh = null;
+        }
+        if (silkscreenLines) {
+          contentGroup.remove(silkscreenLines);
+          silkscreenLines.geometry.dispose();
+          silkscreenLines = null;
+        }
+
+        const gridStep = settings.gridStep;
+        const halfSize = settings.gridSize * 0.5;
+        const viaPositions = [];
+        const padPositions = [];
+
+        // -------------------------------------------------------------
+        // 1. Central CPU / SoC Socket at (0, 0, 0)
+        // -------------------------------------------------------------
+        const cpuSize = 22;
+        const cpuGeom = new THREE.BoxGeometry(cpuSize, 0.8, cpuSize);
+        const cpuMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(settings.colorChip),
+          metalness: 0.85,
+          roughness: 0.25
+        });
+        const cpuMesh = new THREE.Mesh(cpuGeom, cpuMat);
+        cpuMesh.position.set(0, 0.4, 0);
+        cpuMesh.receiveShadow = true;
+        chipsGroup.add(cpuMesh);
+
+        // CPU Die / Heatspreader Core
+        const dieGeom = new THREE.BoxGeometry(cpuSize * 0.55, 0.4, cpuSize * 0.55);
+        const dieMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(settings.colorLine).multiplyScalar(1.5),
+          metalness: 0.95,
+          roughness: 0.15
+        });
+        const dieMesh = new THREE.Mesh(dieGeom, dieMat);
+        dieMesh.position.set(0, 0.8, 0);
+        chipsGroup.add(dieMesh);
+
+        // -------------------------------------------------------------
+        // 2. Peripheral IC Chipsets (Memory Banks, GPU/NPU, I/O Controller)
+        // -------------------------------------------------------------
+        const chipsConfig = [
+          { name: 'RAM_Bank_A', x: 36, z: 24, w: 10, d: 24, h: 0.6 },
+          { name: 'RAM_Bank_B', x: 36, z: -24, w: 10, d: 24, h: 0.6 },
+          { name: 'NPU_Coprocessor', x: -36, z: 20, w: 16, d: 16, h: 0.7 },
+          { name: 'PCIe_Bridge', x: -36, z: -24, w: 14, d: 14, h: 0.6 },
+          { name: 'VRM_Power_1', x: 0, z: -38, w: 26, d: 8, h: 0.9 },
+          { name: 'Audio_DAC', x: -44, z: -44, w: 10, d: 10, h: 0.5 }
+        ];
+
+        chipsConfig.forEach(c => {
+          const cGeom = new THREE.BoxGeometry(c.w, c.h, c.d);
+          const cMat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(settings.colorChip),
+            metalness: 0.7,
+            roughness: 0.35
+          });
+          const cMesh = new THREE.Mesh(cGeom, cMat);
+          cMesh.position.set(c.x, c.h * 0.5, c.z);
+          chipsGroup.add(cMesh);
+        });
+
+        // -------------------------------------------------------------
+        // 3. Multi-Lane Orthogonal Bus Traces (Strict 90-Degree Routing)
+        // -------------------------------------------------------------
+        function addTrace(points) {
+          const trace = buildTracePath(points);
+          tracesData.push(trace);
+
+          // Add via at start, end, and 90° corners
+          points.forEach((p, idx) => {
+            if (idx === 0 || idx === points.length - 1 || Math.random() < 0.35) {
+              viaPositions.push(p.clone());
+            }
+          });
+
+          // Build Three.js Line Geometry
+          const positions = new Float32Array(points.length * 3);
+          for (let i = 0; i < points.length; i++) {
+            positions[i * 3] = points[i].x;
+            positions[i * 3 + 1] = points[i].y;
+            positions[i * 3 + 2] = points[i].z;
+          }
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          const line = new THREE.Line(geometry, traceMaterial);
+          line.renderOrder = 0;
+          contentGroup.add(line);
+          traceLines.push(line);
+        }
+
+        // Bus 1: CPU East Side -> RAM Bank A (Parallel Ribbon with 90° jogs)
+        const bus1Count = 14;
+        for (let i = 0; i < bus1Count; i++) {
+          const offsetZ = (i - bus1Count * 0.5) * 1.2;
+          const startX = cpuSize * 0.5;
+          const startZ = offsetZ;
+          const jogX = 22 + i * 0.4;
+          const targetZ = 16 + i * 1.1;
+          const endX = 31;
+          const y = (i % 3 === 0) ? -settings.layerOffset : 0.0;
+
+          addTrace([
+            new THREE.Vector3(startX, y, startZ),
+            new THREE.Vector3(jogX, y, startZ),
+            new THREE.Vector3(jogX, y, targetZ),
+            new THREE.Vector3(endX, y, targetZ)
+          ]);
+        }
+
+        // Bus 2: CPU East Side -> RAM Bank B (Parallel Ribbon with 90° jogs)
+        const bus2Count = 14;
+        for (let i = 0; i < bus2Count; i++) {
+          const offsetZ = (i - bus2Count * 0.5) * 1.2;
+          const startX = cpuSize * 0.5;
+          const startZ = offsetZ;
+          const jogX = 22 + i * 0.4;
+          const targetZ = -16 - i * 1.1;
+          const endX = 31;
+          const y = (i % 2 === 0) ? -settings.layerOffset : 0.0;
+
+          addTrace([
+            new THREE.Vector3(startX, y, startZ),
+            new THREE.Vector3(jogX, y, startZ),
+            new THREE.Vector3(jogX, y, targetZ),
+            new THREE.Vector3(endX, y, targetZ)
+          ]);
+        }
+
+        // Bus 3: CPU West Side -> NPU Coprocessor (High-Speed Multi-Lane Bus)
+        const bus3Count = 16;
+        for (let i = 0; i < bus3Count; i++) {
+          const offsetZ = (i - bus3Count * 0.5) * 1.1;
+          const startX = -cpuSize * 0.5;
+          const startZ = offsetZ;
+          const jogX = -20 - i * 0.5;
+          const targetZ = 12 + (i - bus3Count * 0.5) * 0.9;
+          const endX = -28;
+          const y = 0.0;
+
+          addTrace([
+            new THREE.Vector3(startX, y, startZ),
+            new THREE.Vector3(jogX, y, startZ),
+            new THREE.Vector3(jogX, y, targetZ),
+            new THREE.Vector3(endX, y, targetZ)
+          ]);
+        }
+
+        // Bus 4: CPU South Side -> VRM Power Delivery System
+        const bus4Count = 12;
+        for (let i = 0; i < bus4Count; i++) {
+          const offsetX = (i - bus4Count * 0.5) * 1.6;
+          const startZ = -cpuSize * 0.5;
+          const jogZ = -22 - (i % 4) * 1.5;
+          const targetX = offsetX * 1.2;
+          const endZ = -34;
+          const y = 0.0;
+
+          addTrace([
+            new THREE.Vector3(offsetX, y, startZ),
+            new THREE.Vector3(offsetX, y, jogZ),
+            new THREE.Vector3(targetX, y, jogZ),
+            new THREE.Vector3(targetX, y, endZ)
+          ]);
+        }
+
+        // Bus 5: PCIe Express Lanes (Long multi-track highway across bottom)
+        const pcieCount = 10;
+        for (let i = 0; i < pcieCount; i++) {
+          const startX = -halfSize + 8;
+          const targetZ = 38 + i * 1.4;
+          const jogX1 = -24 + i * 1.2;
+          const jogX2 = 14 + i * 1.2;
+          const endX = halfSize - 8;
+          const y = (i % 2 === 0) ? 0.0 : -settings.layerOffset;
+
+          addTrace([
+            new THREE.Vector3(startX, y, targetZ),
+            new THREE.Vector3(jogX1, y, targetZ),
+            new THREE.Vector3(jogX1, y, targetZ - 4),
+            new THREE.Vector3(jogX2, y, targetZ - 4),
+            new THREE.Vector3(jogX2, y, targetZ),
+            new THREE.Vector3(endX, y, targetZ)
+          ]);
+        }
+
+        // -------------------------------------------------------------
+        // 4. Procedural Orthogonal Logic & Interconnect Traces
+        // -------------------------------------------------------------
+        const remainingCount = Math.max(10, settings.lineCount - tracesData.length);
+        for (let i = 0; i < remainingCount; i++) {
+          // Snap start & end to discrete grid
+          const sx = Math.floor((Math.random() * (halfSize * 1.8) - halfSize * 0.9) / gridStep) * gridStep;
+          const sz = Math.floor((Math.random() * (halfSize * 1.8) - halfSize * 0.9) / gridStep) * gridStep;
+          const ex = Math.floor((Math.random() * (halfSize * 1.8) - halfSize * 0.9) / gridStep) * gridStep;
+          const ez = Math.floor((Math.random() * (halfSize * 1.8) - halfSize * 0.9) / gridStep) * gridStep;
+
+          const y = (Math.random() < 0.25) ? -settings.layerOffset : 0.0;
+          const turnMode = Math.random();
+
+          let pts = [];
+          if (turnMode < 0.33) {
+            // 1-turn 90° L-bend: (sx, sz) -> (ex, sz) -> (ex, ez)
+            pts = [
+              new THREE.Vector3(sx, y, sz),
+              new THREE.Vector3(ex, y, sz),
+              new THREE.Vector3(ex, y, ez)
+            ];
+          } else if (turnMode < 0.66) {
+            // 2-turn 90° Z-bend: (sx, sz) -> (midX, sz) -> (midX, ez) -> (ex, ez)
+            const midX = Math.floor(((sx + ex) * 0.5) / gridStep) * gridStep;
+            pts = [
+              new THREE.Vector3(sx, y, sz),
+              new THREE.Vector3(midX, y, sz),
+              new THREE.Vector3(midX, y, ez),
+              new THREE.Vector3(ex, y, ez)
+            ];
+          } else {
+            // Multi-layer 90° step with vertical via drop
+            const midZ = Math.floor(((sz + ez) * 0.5) / gridStep) * gridStep;
+            const y2 = y === 0.0 ? -settings.layerOffset : 0.0;
+            pts = [
+              new THREE.Vector3(sx, y, sz),
+              new THREE.Vector3(sx, y, midZ),
+              new THREE.Vector3(sx, y2, midZ), // Vertical via 90° shift
+              new THREE.Vector3(ex, y2, midZ),
+              new THREE.Vector3(ex, y2, ez)
+            ];
+          }
+          addTrace(pts);
+        }
+
+        // -------------------------------------------------------------
+        // 5. Instanced Vias & Solder Pads
+        // -------------------------------------------------------------
+        if (settings.showVias && viaPositions.length > 0) {
+          const viaGeom = new THREE.CylinderGeometry(0.5, 0.5, 0.15, 12);
+          const viaMat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(settings.colorVias),
+            metalness: 0.9,
+            roughness: 0.15,
+            emissive: new THREE.Color(settings.colorVias),
+            emissiveIntensity: 0.4
+          });
+          viasMesh = new THREE.InstancedMesh(viaGeom, viaMat, viaPositions.length);
+          const dummy = new THREE.Object3D();
+
+          viaPositions.forEach((pos, idx) => {
+            dummy.position.copy(pos);
+            dummy.position.y += 0.05;
+            dummy.scale.set(1, 1, 1);
+            dummy.updateMatrix();
+            viasMesh.setMatrixAt(idx, dummy.matrix);
+          });
+          viasMesh.instanceMatrix.needsUpdate = true;
+          contentGroup.add(viasMesh);
+        }
+
+        // -------------------------------------------------------------
+        // 6. Substrate Board & Silkscreen Graphics
+        // -------------------------------------------------------------
+        if (settings.showBoard) {
+          const boardGeom = new THREE.BoxGeometry(settings.gridSize, 1.2, settings.gridSize);
+          const boardMat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(settings.colorBoard),
+            roughness: 0.8,
+            metalness: 0.15
+          });
+          boardMesh = new THREE.Mesh(boardGeom, boardMat);
+          boardMesh.position.set(0, -0.6 + settings.boardElevation, 0);
+          boardMesh.receiveShadow = true;
+          contentGroup.add(boardMesh);
+        }
+
+        // Silkscreen Lines & Technical Grid Markings
+        if (settings.showSilkscreen) {
+          const silkPoints = [];
+          const numGridLines = 14;
+          const step = settings.gridSize / numGridLines;
+
+          for (let i = 0; i <= numGridLines; i++) {
+            const coord = -halfSize + i * step;
+            // Crosshair markers & corner brackets
+            silkPoints.push(new THREE.Vector3(coord, 0.02, -halfSize + 2));
+            silkPoints.push(new THREE.Vector3(coord, 0.02, -halfSize + 6));
+
+            silkPoints.push(new THREE.Vector3(coord, 0.02, halfSize - 6));
+            silkPoints.push(new THREE.Vector3(coord, 0.02, halfSize - 2));
+
+            silkPoints.push(new THREE.Vector3(-halfSize + 2, 0.02, coord));
+            silkPoints.push(new THREE.Vector3(-halfSize + 6, 0.02, coord));
+
+            silkPoints.push(new THREE.Vector3(halfSize - 6, 0.02, coord));
+            silkPoints.push(new THREE.Vector3(halfSize - 2, 0.02, coord));
+          }
+
+          // Chip Boundary Silkscreen Boxes
+          chipsConfig.forEach(c => {
+            const pad = 1.2;
+            const x0 = c.x - c.w * 0.5 - pad;
+            const x1 = c.x + c.w * 0.5 + pad;
+            const z0 = c.z - c.d * 0.5 - pad;
+            const z1 = c.z + c.d * 0.5 + pad;
+
+            silkPoints.push(new THREE.Vector3(x0, 0.02, z0), new THREE.Vector3(x1, 0.02, z0));
+            silkPoints.push(new THREE.Vector3(x1, 0.02, z0), new THREE.Vector3(x1, 0.02, z1));
+            silkPoints.push(new THREE.Vector3(x1, 0.02, z1), new THREE.Vector3(x0, 0.02, z1));
+            silkPoints.push(new THREE.Vector3(x0, 0.02, z1), new THREE.Vector3(x0, 0.02, z0));
+          });
+
+          const silkGeom = new THREE.BufferGeometry().setFromPoints(silkPoints);
+          const silkMat = new THREE.LineBasicMaterial({
+            color: new THREE.Color(settings.colorSilkscreen),
+            transparent: true,
+            opacity: 0.45,
+            depthWrite: false
+          });
+          silkscreenLines = new THREE.LineSegments(silkGeom, silkMat);
+          contentGroup.add(silkscreenLines);
+        }
+
+        rebuildSignals();
+      }
+
+      // =========================================================================
+      // 6. Dynamic Circuit Pulses & Glowing Data Signals
+      // =========================================================================
+
+      function rebuildSignals() {
+        signals.forEach((s) => {
+          contentGroup.remove(s.mesh);
+          s.mesh.geometry.dispose();
+        });
+        signals = [];
+
+        if (tracesData.length === 0) return;
+
+        for (let i = 0; i < settings.signalCount; i++) {
+          createSignal();
+        }
+      }
+
+      function createSignal() {
+        const maxTrail = 80;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(maxTrail * 3);
+        const colors = new Float32Array(maxTrail * 3);
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const mesh = new THREE.Line(geometry, signalMaterial);
+        mesh.frustumCulled = false;
+        mesh.renderOrder = 2;
+        contentGroup.add(mesh);
+
+        const traceIdx = Math.floor(Math.random() * tracesData.length);
+        const signalColor = pickSignalColor();
+
+        signals.push({
+          mesh,
+          traceIndex: traceIdx,
+          speed: 0.15 + Math.random() * 0.45,
+          progress: Math.random(),
+          history: [],
+          assignedColor: signalColor
+        });
+      }
+
+      // =========================================================================
+      // 7. Greenscreen & Resolution Management
+      // =========================================================================
+
+      function setBackgroundColor(value) {
+        document.body.style.backgroundColor = value;
+        scene.background.set(value);
+        scene.fog.color.set(value);
+        renderer.setClearColor(value, 1);
+      }
+
+      function setGreenScreen(enabled) {
+        if (enabled) {
+          setBackgroundColor('#00ff00');
+          scene.fog.density = 0.0;
+        } else {
+          setBackgroundColor(settings.colorBg);
+          scene.fog.density = 0.003;
+        }
+      }
+
+      function updateResolution() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        perspectiveCamera.aspect = width / height;
+        perspectiveCamera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+        postProcessor.setSize(width, height, renderer.getPixelRatio());
+      }
+
+      window.addEventListener('resize', updateResolution);
+
+      // =========================================================================
+      // 8. Palette & Theme Management
+      // =========================================================================
+
+      function applyPalette(paletteName) {
+        const pal = COLOR_PALETTES[paletteName];
+        if (!pal) return;
+
+        settings.colorBg = pal.colorBg;
+        settings.colorBoard = pal.colorBoard;
+        settings.colorLine = pal.colorLine;
+        settings.colorSignal = pal.colorSignal;
+        settings.colorSignal2 = pal.colorSignal2;
+        settings.colorSignal3 = pal.colorSignal3;
+        settings.colorVias = pal.colorVias;
+        settings.colorChip = pal.colorChip;
+        settings.colorSilkscreen = pal.colorSilkscreen;
+
+        updateColorsFromSettings();
+        if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+
+      function updateColorsFromSettings() {
+        if (!settings.greenScreen) {
+          setBackgroundColor(settings.colorBg);
+        }
+
+        traceMaterial.color.set(settings.colorLine);
+        signalColorObj1.set(settings.colorSignal);
+        signalColorObj2.set(settings.colorSignal2);
+        signalColorObj3.set(settings.colorSignal3);
+
+        signals.forEach(s => {
+          s.assignedColor = pickSignalColor();
+        });
+
+        buildMotherboardGeometry();
+      }
+
+      // =========================================================================
+      // 9. Procedural Scene Randomizer
+      // =========================================================================
+
+      function randomizeScene() {
+        const paletteKeys = Object.keys(COLOR_PALETTES);
+        const randomPaletteKey = paletteKeys[Math.floor(Math.random() * paletteKeys.length)];
+        settings.colorPreset = randomPaletteKey;
+        applyPalette(randomPaletteKey);
+
+        // Re-roll geometric & motion parameters
+        settings.lineCount = Math.floor(80 + Math.random() * 80);
+        settings.signalCount = Math.floor(80 + Math.random() * 80);
+        settings.speedGlobal = parseFloat((0.3 + Math.random() * 0.8).toFixed(2));
+        settings.trailLength = Math.floor(8 + Math.random() * 18);
+        settings.gridStep = parseFloat((2.0 + Math.random() * 2.5).toFixed(1));
+
+        buildMotherboardGeometry();
+        if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+
+      // Pointer Click vs Drag Handler (distinguish OrbitControls drag from clean click)
+      let pointerDownX = 0;
+      let pointerDownY = 0;
+      let pointerDownTime = 0;
+
+      window.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.lil-gui')) return;
+        pointerDownX = e.clientX;
+        pointerDownY = e.clientY;
+        pointerDownTime = performance.now();
+      });
+
+      window.addEventListener('pointerup', (e) => {
+        if (e.target.closest('.lil-gui')) return;
+        const dx = e.clientX - pointerDownX;
+        const dy = e.clientY - pointerDownY;
+        const dist = Math.hypot(dx, dy);
+        const duration = performance.now() - pointerDownTime;
+
+        if (dist < 6 && duration < 300 && settings.clickToRandomize) {
+          randomizeScene();
+        }
+      });
+
+      // =========================================================================
+      // 10. 5 Presetupped Animations (Smooth, Slow & Static)
+      // =========================================================================
+
+      const ANIMATION_PRESETS = [
+        'Static Schematic',
+        'Orthogonal Circuit Orbit',
+        'Trace Bus Flyover (Low Angle)',
+        'Diagonal Isometric Sweep',
+        'Macro Chip Inspection'
+      ];
+
+      function updateCameraAnimation(time) {
+        const anim = settings.animationPreset;
+        const speed = settings.animationSpeed * 0.25;
+
+        if (anim === 'Static Schematic') {
+          // Static animation: user retains full OrbitControls freedom
+          return;
+        }
+
+        if (anim === 'Orthogonal Circuit Orbit') {
+          const radius = 88.0;
+          const angle = time * speed;
+          perspectiveCamera.position.x = Math.sin(angle) * radius;
+          perspectiveCamera.position.z = Math.cos(angle) * radius;
+          perspectiveCamera.position.y = 55.0 + Math.sin(angle * 0.5) * 12.0;
+          controls.target.set(0.0, 0.0, 0.0);
+        } else if (anim === 'Trace Bus Flyover (Low Angle)') {
+          const t = time * speed;
+          perspectiveCamera.position.x = Math.sin(t * 0.6) * 35.0;
+          perspectiveCamera.position.y = 12.0 + Math.sin(t * 0.4) * 4.0;
+          perspectiveCamera.position.z = 25.0 + Math.cos(t * 0.5) * 30.0;
+          controls.target.set(Math.sin(t * 0.6) * 20.0, 0.0, Math.cos(t * 0.5) * 10.0);
+        } else if (anim === 'Diagonal Isometric Sweep') {
+          const t = time * speed;
+          const baseX = Math.sin(t * 0.5) * 30.0;
+          const baseZ = Math.cos(t * 0.5) * 30.0;
+          perspectiveCamera.position.set(baseX + 45.0, 55.0, baseZ + 45.0);
+          controls.target.set(baseX, 0.0, baseZ);
+        } else if (anim === 'Macro Chip Inspection') {
+          const t = time * speed;
+          perspectiveCamera.position.x = Math.sin(t * 0.8) * 25.0;
+          perspectiveCamera.position.y = 22.0 + Math.cos(t * 0.4) * 8.0;
+          perspectiveCamera.position.z = Math.cos(t * 0.8) * 25.0;
+          controls.target.set(Math.sin(t * 0.4) * 6.0, 0.5, Math.cos(t * 0.4) * 6.0);
+        }
+
+        controls.update();
+        perspectiveCamera.updateMatrixWorld(true);
+      }
+
+      // =========================================================================
+      // 11. Camera Synchronization Helpers
+      // =========================================================================
+
+      function updateCameraFromAngles() {
+        const r = settings.camDistance;
+        const phi = THREE.MathUtils.degToRad(settings.polarAngle);
+        const theta = THREE.MathUtils.degToRad(settings.azimuthAngle);
+
+        perspectiveCamera.position.x = settings.targetX + r * Math.sin(phi) * Math.sin(theta);
+        perspectiveCamera.position.y = settings.targetY + r * Math.cos(phi);
+        perspectiveCamera.position.z = settings.targetZ + r * Math.sin(phi) * Math.cos(theta);
+
+        perspectiveCamera.lookAt(controls.target);
+        controls.update();
+        perspectiveCamera.updateMatrixWorld(true);
+
+        settings.camPosX = parseFloat(perspectiveCamera.position.x.toFixed(2));
+        settings.camPosY = parseFloat(perspectiveCamera.position.y.toFixed(2));
+        settings.camPosZ = parseFloat(perspectiveCamera.position.z.toFixed(2));
+      }
+
+      function updateCameraFromPosition() {
+        perspectiveCamera.position.set(settings.camPosX, settings.camPosY, settings.camPosZ);
+        controls.target.set(settings.targetX, settings.targetY, settings.targetZ);
+        perspectiveCamera.lookAt(controls.target);
+        controls.update();
+        perspectiveCamera.updateMatrixWorld(true);
+
+        const offset = new THREE.Vector3().subVectors(perspectiveCamera.position, controls.target);
+        settings.camDistance = parseFloat(offset.length().toFixed(2));
+        settings.polarAngle = parseFloat(THREE.MathUtils.radToDeg(controls.getPolarAngle()).toFixed(2));
+        settings.azimuthAngle = parseFloat(THREE.MathUtils.radToDeg(controls.getAzimuthalAngle()).toFixed(2));
+      }
+
+      // =========================================================================
+      // 12. GUI Configuration (lil-gui)
+      // =========================================================================
+
+      const gui = new GUI({ title: 'PCB Motherboard Schematic' });
+
+      // Folder 1: Presets & Modes
+      const fPresets = gui.addFolder('Presets & Modes');
+      fPresets
+        .add(settings, 'colorPreset', Object.keys(COLOR_PALETTES))
+        .name('Color Scheme')
+        .onChange(applyPalette);
+      fPresets
+        .add(settings, 'animationPreset', ANIMATION_PRESETS)
+        .name('Animation Mode')
+        .onChange((val) => {
+          if (val === 'Static Schematic') {
+            settings.camPosX = 0.0;
+            settings.camPosY = 75.0;
+            settings.camPosZ = 45.0;
+            settings.targetX = 0.0;
+            settings.targetY = 0.0;
+            settings.targetZ = 0.0;
+            updateCameraFromPosition();
+          }
+        });
+      fPresets
+        .add(settings, 'clickToRandomize')
+        .name('Click to Randomize');
+      fPresets
+        .add({ randomize: randomizeScene }, 'randomize')
+        .name('Re-Roll Circuit Now');
+
+      // Folder 2: Rendering & Display
+      const fRender = gui.addFolder('Rendering & Display');
+      fRender
+        .add(settings, 'dpr', 0.5, 3.0, 0.1)
+        .name('Pixel Ratio (DPR)')
+        .onChange((val) => {
+          renderer.setPixelRatio(val);
+          updateResolution();
+        });
+      fRender
+        .add(settings, 'greenScreen')
+        .name('Green Screen (#00ff00)')
+        .onChange(setGreenScreen);
+
+      // Folder 3: Colors
+      const fColors = gui.addFolder('Colors');
+      fColors.addColor(settings, 'colorBg').name('Background').onChange((v) => {
+        if (!settings.greenScreen) setBackgroundColor(v);
+      });
+      fColors.addColor(settings, 'colorBoard').name('PCB Substrate').onChange(updateColorsFromSettings);
+      fColors.addColor(settings, 'colorLine').name('Circuit Traces').onChange((v) => {
+        traceMaterial.color.set(v);
+      });
+      fColors.addColor(settings, 'colorSignal').name('Signal Main').onChange((v) => {
+        signalColorObj1.set(v);
+      });
+      fColors.add(settings, 'useColor2').name('Use Extra Color 1');
+      fColors.addColor(settings, 'colorSignal2').name('Signal Extra 1').onChange((v) => {
+        signalColorObj2.set(v);
+      });
+      fColors.add(settings, 'useColor3').name('Use Extra Color 2');
+      fColors.addColor(settings, 'colorSignal3').name('Signal Extra 2').onChange((v) => {
+        signalColorObj3.set(v);
+      });
+      fColors.addColor(settings, 'colorVias').name('Vias & Solder Pads').onChange(updateColorsFromSettings);
+      fColors.addColor(settings, 'colorChip').name('IC Chips').onChange(updateColorsFromSettings);
+
+      // Folder 4: Circuit Geometry
+      const fGeo = gui.addFolder('Circuit Geometry');
+      fGeo.add(settings, 'lineCount', 20, 250, 1).name('Trace Count').onFinishChange(buildMotherboardGeometry);
+      fGeo.add(settings, 'lineOpacity', 0.05, 1.0, 0.05).name('Trace Opacity').onChange((v) => {
+        traceMaterial.opacity = v;
+      });
+      fGeo.add(settings, 'gridStep', 1.0, 6.0, 0.5).name('Grid Snap Step').onFinishChange(buildMotherboardGeometry);
+      fGeo.add(settings, 'showBoard').name('Show PCB Board').onChange(buildMotherboardGeometry);
+      fGeo.add(settings, 'showSilkscreen').name('Show Silkscreen').onChange(buildMotherboardGeometry);
+      fGeo.add(settings, 'showChips').name('Show IC Chips').onChange((v) => {
+        chipsGroup.visible = v;
+      });
+      fGeo.add(settings, 'showVias').name('Show Solder Vias').onChange(buildMotherboardGeometry);
+
+      // Folder 5: Signals & Data Flow
+      const fSignals = gui.addFolder('Signals & Data Flow');
+      fSignals.add(settings, 'signalCount', 0, 300, 1).name('Signal Count').onFinishChange(rebuildSignals);
+      fSignals.add(settings, 'speedGlobal', 0.0, 3.0, 0.05).name('Signal Speed');
+      fSignals.add(settings, 'trailLength', 2, 50, 1).name('Trail Length');
+      fSignals.add(settings, 'animationSpeed', 0.0, 3.0, 0.05).name('Camera Anim Speed');
+
+      // Folder 6: Camera Placement and Lens Settings
+      const fCam = gui.addFolder('Camera Placement and Lens Settings');
+      fCam.add(settings, 'camPosX', -200.0, 200.0, 0.5).name('Camera Pos X').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'camPosY', 1.0, 250.0, 0.5).name('Camera Pos Y').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'camPosZ', -200.0, 200.0, 0.5).name('Camera Pos Z').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'polarAngle', 1.0, 179.0, 0.5).name('Polar Angle (Pitch °)').listen().onChange(updateCameraFromAngles);
+      fCam.add(settings, 'azimuthAngle', -180.0, 180.0, 0.5).name('Azimuth Angle (Yaw °)').listen().onChange(updateCameraFromAngles);
+      fCam.add(settings, 'camDistance', 5.0, 350.0, 0.5).name('Camera Distance').listen().onChange(updateCameraFromAngles);
+      fCam.add(settings, 'targetX', -80.0, 80.0, 0.5).name('Target X (LookAt)').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'targetY', -40.0, 40.0, 0.5).name('Target Y (LookAt)').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'targetZ', -80.0, 80.0, 0.5).name('Target Z (LookAt)').listen().onChange(updateCameraFromPosition);
+      fCam.add(settings, 'fov', 15.0, 110.0, 1.0).name('Camera FOV').listen().onChange((v) => {
+        perspectiveCamera.fov = v;
+        perspectiveCamera.updateProjectionMatrix();
+        cameraUniforms.uCameraFov.value = v;
+      });
+
+      // Mouse & Drag View Interaction Settings
+      const fMouse = fCam.addFolder('Mouse & Drag View Controls');
+      fMouse.add(settings, 'rotateSpeed', 0.1, 3.0, 0.1).name('Rotate / Drag Speed').onChange((v) => (controls.rotateSpeed = v));
+      fMouse.add(settings, 'panSpeed', 0.1, 3.0, 0.1).name('Pan Speed').onChange((v) => (controls.panSpeed = v));
+      fMouse.add(settings, 'zoomSpeed', 0.1, 3.0, 0.1).name('Zoom Speed').onChange((v) => (controls.zoomSpeed = v));
+      fMouse.add(settings, 'dampingFactor', 0.01, 0.2, 0.01).name('Damping (Inertia)').onChange((v) => (controls.dampingFactor = v));
+      fMouse.add(settings, 'enableRotate').name('Enable Mouse Orbit').onChange((v) => (controls.enableRotate = v));
+      fMouse.add(settings, 'enablePan').name('Enable Mouse Pan').onChange((v) => (controls.enablePan = v));
+      fMouse.add(settings, 'enableZoom').name('Enable Wheel Zoom').onChange((v) => (controls.enableZoom = v));
+      fMouse.add(settings, 'autoRotate').name('Auto-Rotate View').onChange((v) => (controls.autoRotate = v));
+      fMouse.add(settings, 'autoRotateSpeed', -10.0, 10.0, 0.5).name('Auto-Rotate Speed').onChange((v) => (controls.autoRotateSpeed = v));
+      fMouse.add({ reset: () => {
+        settings.camPosX = 0.0;
+        settings.camPosY = 75.0;
+        settings.camPosZ = 45.0;
+        settings.targetX = 0.0;
+        settings.targetY = 0.0;
+        settings.targetZ = 0.0;
+        settings.fov = 45.0;
+        perspectiveCamera.fov = 45.0;
+        perspectiveCamera.updateProjectionMatrix();
+        updateCameraFromPosition();
+      }}, 'reset').name('Reset Camera View');
+
+      // Folder 7: Post-Processing & Fisheye
+      postProcessor.attachGUI(gui, 'Post-Processing & Fisheye');
+
+      // Close GUI by default
+      gui.close();
+
+      // Keyboard 'H' key to toggle GUI visibility
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'h' || e.key === 'H') {
+          if (gui._hidden) {
+            gui.show();
+          } else {
+            gui.hide();
+          }
+        }
+      });
+
+      // Initialize Scene & Camera
+      buildMotherboardGeometry();
+      updateCameraFromPosition();
+      updateResolution();
+      setGreenScreen(settings.greenScreen);
+
+      // =========================================================================
+      // 13. Main Animation & Render Loop
+      // =========================================================================
+
+      const clock = new THREE.Clock();
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        const delta = clock.getDelta();
+        const elapsedTime = clock.getElapsedTime();
+
+        // Update Camera Animation Presets
+        updateCameraAnimation(elapsedTime);
+
+        // Update OrbitControls
+        controls.update();
+        perspectiveCamera.updateMatrixWorld(true);
+
+        // Synchronize Camera Uniforms
+        cameraUniforms.uCameraPos.value.copy(perspectiveCamera.position);
+        cameraUniforms.uCameraWorldMatrix.value.copy(perspectiveCamera.matrixWorld);
+        cameraUniforms.uCameraFov.value = perspectiveCamera.fov;
+
+        // Keep GUI sliders synchronized with camera
+        const offset = new THREE.Vector3().subVectors(perspectiveCamera.position, controls.target);
+        settings.camDistance = parseFloat(offset.length().toFixed(2));
+        settings.polarAngle = parseFloat(THREE.MathUtils.radToDeg(controls.getPolarAngle()).toFixed(2));
+        settings.azimuthAngle = parseFloat(THREE.MathUtils.radToDeg(controls.getAzimuthalAngle()).toFixed(2));
+
+        settings.camPosX = parseFloat(perspectiveCamera.position.x.toFixed(2));
+        settings.camPosY = parseFloat(perspectiveCamera.position.y.toFixed(2));
+        settings.camPosZ = parseFloat(perspectiveCamera.position.z.toFixed(2));
+        settings.targetX = parseFloat(controls.target.x.toFixed(2));
+        settings.targetY = parseFloat(controls.target.y.toFixed(2));
+        settings.targetZ = parseFloat(controls.target.z.toFixed(2));
+        settings.fov = parseFloat(perspectiveCamera.fov.toFixed(1));
+
+        // Update Signals along 90-degree orthogonal traces
+        const numTraces = tracesData.length;
+        if (numTraces > 0) {
+          const drawCount = Math.max(2, settings.trailLength);
+
+          signals.forEach((signal) => {
+            signal.progress += signal.speed * 0.006 * settings.speedGlobal;
+
+            if (signal.progress > 1.0) {
+              signal.progress = 0.0;
+              signal.traceIndex = Math.floor(Math.random() * numTraces);
+              signal.history = [];
+              signal.assignedColor = pickSignalColor();
+            }
+
+            const currentTrace = tracesData[signal.traceIndex];
+            if (!currentTrace) return;
+
+            const pos = getTracePoint(currentTrace, signal.progress);
+            signal.history.push(pos);
+
+            if (signal.history.length > drawCount + 1) {
+              signal.history.shift();
+            }
+
+            const positions = signal.mesh.geometry.attributes.position.array;
+            const colors = signal.mesh.geometry.attributes.color.array;
+            const histLen = signal.history.length;
+
+            for (let i = 0; i < drawCount; i++) {
+              let idx = histLen - 1 - i;
+              if (idx < 0) idx = 0;
+
+              const point = signal.history[idx] || pos;
+
+              positions[i * 3] = point.x;
+              positions[i * 3 + 1] = point.y + 0.12; // Slight vertical offset to hover over traces
+              positions[i * 3 + 2] = point.z;
+
+              let alpha = 1.0;
+              if (drawCount > 1) {
+                alpha = Math.max(0, 1.0 - i / drawCount);
+                alpha = Math.pow(alpha, 1.5);
+              }
+
+              colors[i * 3] = signal.assignedColor.r * alpha * 1.8;
+              colors[i * 3 + 1] = signal.assignedColor.g * alpha * 1.8;
+              colors[i * 3 + 2] = signal.assignedColor.b * alpha * 1.8;
+            }
+
+            signal.mesh.geometry.setDrawRange(0, Math.min(drawCount, histLen));
+            signal.mesh.geometry.attributes.position.needsUpdate = true;
+            signal.mesh.geometry.attributes.color.needsUpdate = true;
+          });
+        }
+
+        // Render Scene via PostProcessor or Direct
+        postProcessor.renderScene(scene, perspectiveCamera);
+      }
+
+      animate();
+    </script>
+  </body>
+</html>
