@@ -1,0 +1,2213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Orbital Stillness</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #090612;
+        }
+        #webgl-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            outline: none;
+        }
+    </style>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="webgl-canvas"></canvas>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+
+        // =========================================================================
+        // POST-PROCESSING SUITE (PostProcessor.js Pipeline)
+        // =========================================================================
+        const orthoVertexShader = `
+        precision highp float;
+        in vec3 position;
+        out vec2 vUv;
+        void main() {
+          vUv = position.xy * 0.5 + 0.5;
+          gl_Position = vec4(position, 1.0);
+        }
+        `;
+
+        const brightFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float bloomThreshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float knee = 0.1;
+          float soft = luminance - bloomThreshold + knee;
+          soft = clamp(soft, 0.0, 2.0 * knee);
+          soft = (soft * soft) / (4.0 * knee + 0.00001);
+          float contribution = max(soft, luminance - bloomThreshold);
+          contribution /= max(luminance, 0.00001);
+          fragColor = vec4(color.rgb * contribution, color.a);
+        }
+        `;
+
+        const blur13ShaderChunk = `
+        vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+          vec2 resolution = vec2(textureSize(image, 0));
+          vec4 color = vec4(0.0);
+          vec2 off1 = vec2(1.411764705882353) * direction;
+          vec2 off2 = vec2(3.2941176470588234) * direction;
+          vec2 off3 = vec2(5.176470588235294) * direction;
+          color += texture(image, uv) * 0.1964825501511404;
+          color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+          color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+          return color;
+        }
+        `;
+
+        const blurFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 direction;
+        in vec2 vUv;
+        out vec4 color;
+        ${blur13ShaderChunk}
+        void main() {
+          color = blur13(inputTexture, vUv, direction);
+        }
+        `;
+
+        const finalFragmentShader = `
+        precision highp float;
+        uniform vec2 resolution;
+        uniform sampler2D inputTexture;
+        uniform sampler2D blur0Texture;
+        uniform sampler2D blur1Texture;
+        uniform sampler2D blur2Texture;
+        uniform sampler2D blur3Texture;
+        uniform sampler2D blur4Texture;
+        uniform bool bloomEnabled;
+        uniform float bloomStrength;
+        uniform float vignetteBoost;
+        uniform float vignetteReduction;
+        uniform float noiseIntensity;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        float vignette(vec2 uv, float boost, float reduction) {
+          vec2 position = vUv - 0.5;
+          return boost - length(position) * reduction;
+        }
+
+        float hash1(uint n) {
+          n = (n << 13U) ^ n;
+          n = n * (n * n * 15731U + 789221U) + 1376312589U;
+          return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+        }
+
+        float noise(in vec2 uv, in float timeVal) {
+          uvec2 p = uvec2(uv);
+          return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+        }
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+
+          if (bloomEnabled && bloomStrength > 0.001) {
+            vec4 b0 = texture(blur0Texture, vUv);
+            vec4 b1 = texture(blur1Texture, vUv);
+            vec4 b2 = texture(blur2Texture, vUv);
+            vec4 b3 = texture(blur3Texture, vUv);
+            vec4 b4 = texture(blur4Texture, vUv);
+
+            vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+            color += bloomSum * bloomStrength;
+          }
+
+          color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+          color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+          fragColor = vec4(color.rgb, 1.0);
+        }
+        `;
+
+        const chromaticAberrationShaderChunk = `
+        vec2 barrelDistortion(vec2 coord, float amt) {
+          vec2 cc = coord - 0.5;
+          float dist = dot(cc, cc);
+          return coord + cc * dist * amt;
+        }
+        float sat(float t) { return clamp(t, 0.0, 1.0); }
+        float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+        float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+        vec4 spectrum_offset(float t) {
+          float lo = step(t, 0.5);
+          float hi = 1.0 - lo;
+          float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+          vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+          return pow(ret, vec4(1.0 / 2.2));
+        }
+        const float max_distort = 2.2;
+        const int num_iter = 8;
+        const float reci_num_iter_f = 1.0 / float(num_iter);
+        vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+          vec4 sumcol = vec4(0.0);
+          vec4 sumw = vec4(0.0);
+          for (int i = 0; i < num_iter; ++i) {
+            float t = float(i) * reci_num_iter_f;
+            vec4 w = spectrum_offset(t);
+            sumw += w;
+            sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+          }
+          return sumcol / sumw;
+        }
+        `;
+
+        const colorFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float chromaticAberrationAmount;
+        uniform float minInputLevel;
+        uniform float maxInputLevel;
+        uniform float gammaLevel;
+        uniform float fisheyeStrength;
+        uniform float fisheyeRadius;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        ${chromaticAberrationShaderChunk}
+
+        vec2 applyFisheye(vec2 uv, float strength, float radius) {
+          if (abs(strength) < 0.0001) return uv;
+          vec2 p = uv - 0.5;
+          float d = length(p);
+          if (d > radius * 1.5) return uv;
+          float r = d / max(radius, 0.001);
+          float theta = atan(p.y, p.x);
+          float rDist = r + strength * (r * r * r);
+          return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+        }
+
+        vec3 gammaCorrect(vec3 color, vec3 gamma) {
+          return pow(max(color, vec3(0.0)), 1.0 / gamma);
+        }
+        vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+          return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+        }
+        vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+          return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+        }
+        void main() {
+          vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+          fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+          fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+          fragColor.a = 1.0;
+        }
+        `;
+
+        const copyFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        in vec2 vUv;
+        out vec4 fragColor;
+        void main() {
+          fragColor = texture(inputTexture, vUv);
+        }
+        `;
+
+        function createFBO(w, h, options = {}) {
+          return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+            wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+            wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+            minFilter: options.minFilter || THREE.LinearFilter,
+            magFilter: options.magFilter || THREE.LinearFilter,
+            format: options.format || THREE.RGBAFormat,
+            type: options.type || THREE.HalfFloatType,
+            stencilBuffer: options.stencilBuffer || false,
+            depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+            samples: options.samples || 0,
+          });
+        }
+
+        class ShaderPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbo = createFBO(1, 1, options);
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+            this.texture = this.fbo.texture;
+          }
+          render(renderer, toScreen = false) {
+            if (!toScreen) {
+              renderer.setRenderTarget(this.fbo);
+            }
+            renderer.render(this.orthoScene, this.orthoCamera);
+            if (!toScreen) {
+              renderer.setRenderTarget(null);
+            }
+          }
+          setSize(width, height) {
+            this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+            this.orthoQuad.scale.set(width, height, 1);
+          }
+        }
+
+        class ShaderPingPongPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+            this.currentFBO = 0;
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+          }
+          render(renderer) {
+            renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+            renderer.render(this.orthoScene, this.orthoCamera);
+            renderer.setRenderTarget(null);
+            this.currentFBO = 1 - this.currentFBO;
+          }
+          get current() { return this.fbos[this.currentFBO]; }
+          get texture() { return this.current.texture; }
+          setSize(width, height) {
+            const w = Math.max(1, width);
+            const h = Math.max(1, height);
+            this.orthoQuad.scale.set(w, h, 1);
+            this.fbos[0].setSize(w, h);
+            this.fbos[1].setSize(w, h);
+          }
+        }
+
+        class BloomPass {
+          constructor(strength = 1.95, radius = 1.65, threshold = 0.15, levels = 5) {
+            this.strength = strength;
+            this.radius = radius;
+            this.threshold = threshold;
+            this.enabled = true;
+            this.levels = levels;
+
+            this.brightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                bloomThreshold: { value: this.threshold },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: brightFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.brightPass = new ShaderPass(this.brightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.blurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                direction: { value: new THREE.Vector2(0, 1) },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: blurFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+
+            this.blurPasses = [];
+            for (let i = 0; i < this.levels; i++) {
+              this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+                format: THREE.RGBAFormat,
+                type: THREE.HalfFloatType,
+              }));
+            }
+          }
+
+          setSize(w, h) {
+            let tw = Math.max(1, w);
+            let th = Math.max(1, h);
+            this.brightPass.setSize(tw, th);
+            for (let i = 0; i < this.levels; i++) {
+              tw = Math.max(1, Math.round(tw / 2));
+              th = Math.max(1, Math.round(th / 2));
+              this.blurPasses[i].setSize(tw, th);
+            }
+          }
+
+          set source(texture) {
+            this.brightShader.uniforms.inputTexture.value = texture;
+          }
+
+          render(renderer) {
+            if (!this.enabled || this.strength <= 0.001) return;
+
+            this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+            this.brightPass.render(renderer);
+
+            const baseOffset = Math.max(0.1, this.radius * 2.0);
+            const u = this.blurShader.uniforms;
+
+            for (let j = 0; j < this.levels; j++) {
+              const blurPass = this.blurPasses[j];
+              const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+              u.direction.value.set(stepOffset, 0);
+              u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+              blurPass.render(renderer);
+
+              u.direction.value.set(0, stepOffset * 0.5);
+              u.inputTexture.value = blurPass.current.texture;
+              blurPass.render(renderer);
+            }
+          }
+        }
+
+        class PostProcessor {
+          constructor(renderer, params = {}) {
+            this.renderer = renderer;
+
+            this.settings = {
+              enabled: params.enabled !== undefined ? params.enabled : true,
+              bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+              bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.95,
+              bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 1.65,
+              bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.15,
+              fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : -0.23,
+              fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+              chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.07,
+              vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+              vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.0,
+              noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.035,
+              gamma: params.gamma !== undefined ? params.gamma : 0.95,
+              minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+              maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+            };
+
+            this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+            this.bloomPass = new BloomPass(
+              this.settings.bloomStrength,
+              this.settings.bloomRadius,
+              this.settings.bloomThreshold,
+              5
+            );
+
+            this.finalShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                resolution: { value: new THREE.Vector2(1, 1) },
+                bloomEnabled: { value: this.settings.bloomEnabled },
+                bloomStrength: { value: this.settings.bloomStrength },
+                vignetteBoost: { value: this.settings.vignetteBoost },
+                vignetteReduction: { value: this.settings.vignetteReduction },
+                noiseIntensity: { value: this.settings.noiseIntensity },
+                inputTexture: { value: null },
+                blur0Texture: { value: null },
+                blur1Texture: { value: null },
+                blur2Texture: { value: null },
+                blur3Texture: { value: null },
+                blur4Texture: { value: null },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: finalFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.finalPass = new ShaderPass(this.finalShader);
+
+            this.rgbShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: this.finalPass.texture },
+                fisheyeStrength: { value: this.settings.fisheyeStrength },
+                fisheyeRadius: { value: this.settings.fisheyeRadius },
+                chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+                minInputLevel: { value: this.settings.minInputLevel },
+                maxInputLevel: { value: this.settings.maxInputLevel },
+                gammaLevel: { value: this.settings.gamma },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: colorFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.rgbPass = new ShaderPass(this.rgbShader);
+
+            this.copyShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: copyFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.copyPass = new ShaderPass(this.copyShader);
+          }
+
+          updateSettings() {
+            this.bloomPass.enabled = this.settings.bloomEnabled;
+            this.bloomPass.strength = this.settings.bloomStrength;
+            this.bloomPass.radius = this.settings.bloomRadius;
+            this.bloomPass.threshold = this.settings.bloomThreshold;
+
+            this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+            this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+            this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+            this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+            this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+            this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+            this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+            this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+            this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+            this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+            this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+          }
+
+          setSize(w0, h0, dpr = 1) {
+            const w = Math.max(1, Math.floor(w0 * dpr));
+            const h = Math.max(1, Math.floor(h0 * dpr));
+            this.sceneTarget.setSize(w, h);
+            this.finalPass.setSize(w, h);
+            this.finalShader.uniforms.resolution.value.set(w, h);
+            this.bloomPass.setSize(w, h);
+            this.rgbPass.setSize(w, h);
+            this.copyPass.setSize(w, h);
+          }
+
+          renderScene(scene, camera) {
+            if (!this.settings.enabled) {
+              this.renderer.render(scene, camera);
+              return;
+            }
+            this.renderer.setRenderTarget(this.sceneTarget);
+            this.renderer.render(scene, camera);
+            this.renderer.setRenderTarget(null);
+            this.render(this.sceneTarget.texture);
+          }
+
+          render(sourceTexture) {
+            if (!this.settings.enabled) {
+              this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+              this.copyPass.render(this.renderer, true);
+              return;
+            }
+
+            this.updateSettings();
+
+            this.bloomPass.source = sourceTexture;
+            this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+            this.bloomPass.render(this.renderer);
+
+            this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+            this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+            this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+            this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+            this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+            const randomTime = Math.random() * 100000;
+            this.finalPass.shader.uniforms.time.value = randomTime;
+            this.rgbPass.shader.uniforms.time.value = randomTime;
+
+            this.finalPass.render(this.renderer);
+            this.rgbPass.render(this.renderer, true);
+          }
+
+          attachGUI(gui, title = "✨ Post-Processing Suite") {
+            const root = gui.addFolder(title);
+            root.add(this.settings, "enabled").name("Enable Suite");
+
+            const bloom = root.addFolder("Bloom");
+            bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomRadius", 0, 3.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+            const lens = root.addFolder("Lens, Optics & Grade");
+            lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye").onChange(() => this.updateSettings());
+            lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberr.").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+            lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+            lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+            lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+            lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+            return root;
+          }
+        }
+
+        // --- 18 PRECONFIGURED COLOR SCHEMES ---
+        const COLOR_SCHEMES = {
+            'Monochromatic': {
+                bg: '#030813',
+                starCore: '#d8f0ff',
+                starGlow: '#4895ef',
+                planets: ['#8ecae6', '#219ebc', '#48cae4', '#0077b6', '#90e0ef', '#023e8a'],
+                rim: '#e0f7ff',
+                trail: '#48cae4',
+                bokeh: '#1e6091'
+            },
+            'Analogous': {
+                bg: '#050716',
+                starCore: '#e0fbff',
+                starGlow: '#00f5d4',
+                planets: ['#00f5d4', '#00bbf9', '#4361ee', '#3f37c9', '#7209b7', '#4cc9f0'],
+                rim: '#bbf2f6',
+                trail: '#00bbf9',
+                bokeh: '#4361ee'
+            },
+            'Complementary': {
+                bg: '#0a0812',
+                starCore: '#fff3d1',
+                starGlow: '#ffb703',
+                planets: ['#023047', '#219ebc', '#fb8500', '#8ecae6', '#ffb703', '#126782'],
+                rim: '#ffe3a8',
+                trail: '#fb8500',
+                bokeh: '#219ebc'
+            },
+            'Split-complementary': {
+                bg: '#090614',
+                starCore: '#fff8db',
+                starGlow: '#fad02c',
+                planets: ['#7209b7', '#4361ee', '#fad02c', '#f72585', '#4cc9f0', '#b5179e'],
+                rim: '#ffe79a',
+                trail: '#f72585',
+                bokeh: '#4361ee'
+            },
+            'Triadic': {
+                bg: '#060a12',
+                starCore: '#fff6e0',
+                starGlow: '#ffd166',
+                planets: ['#06d6a0', '#118ab2', '#ef476f', '#ffd166', '#073b4c', '#f78c6b'],
+                rim: '#ffffff',
+                trail: '#06d6a0',
+                bokeh: '#ef476f'
+            },
+            'Tetradic': {
+                bg: '#0b0512',
+                starCore: '#fff9db',
+                starGlow: '#ffbe0b',
+                planets: ['#ff006e', '#8338ec', '#3a86ff', '#ffbe0b', '#06d6a0', '#fb5607'],
+                rim: '#ffffff',
+                trail: '#8338ec',
+                bokeh: '#3a86ff'
+            },
+            'Double split-complementary': {
+                bg: '#050a14',
+                starCore: '#fff2d6',
+                starGlow: '#ff9e00',
+                planets: ['#00e5ff', '#00b0ff', '#ff0055', '#ff5252', '#76ff03', '#b388ff'],
+                rim: '#ffffff',
+                trail: '#00e5ff',
+                bokeh: '#ff0055'
+            },
+            'Achromatic (Black & White)': {
+                bg: '#000000',
+                starCore: '#ffffff',
+                starGlow: '#cccccc',
+                planets: ['#ffffff', '#e0e0e0', '#b0b0b0', '#888888', '#d0d0d0', '#f5f5f5'],
+                rim: '#ffffff',
+                trail: '#ffffff',
+                bokeh: '#777777'
+            },
+            'Achromatic (White & Black)': {
+                bg: '#e8eaed',
+                starCore: '#111111',
+                starGlow: '#333333',
+                planets: ['#1e1e1e', '#383838', '#505050', '#2a2a2a', '#444444', '#606060'],
+                rim: '#ffffff',
+                trail: '#222222',
+                bokeh: '#999999'
+            },
+            'Neutral + Accent': {
+                bg: '#0e1116',
+                starCore: '#fff4eb',
+                starGlow: '#ff6b35',
+                planets: ['#2b2d42', '#8d99ae', '#edf2f4', '#ff6b35', '#4a4e69', '#9a8c98'],
+                rim: '#ff9f1c',
+                trail: '#ff6b35',
+                bokeh: '#4a4e69'
+            },
+            'Pallet 1 (Warm Ember)': {
+                bg: '#220901',
+                starCore: '#fff0d0',
+                starGlow: '#F6AA1C',
+                planets: ['#F6AA1C', '#BC3908', '#941B0C', '#F6AA1C', '#E2711D', '#621708'],
+                rim: '#FFE29A',
+                trail: '#F6AA1C',
+                bokeh: '#BC3908'
+            },
+            'Pallet 2 (Deep Teal)': {
+                bg: '#000000',
+                starCore: '#e0ffff',
+                starGlow: '#63D1CF',
+                planets: ['#63D1CF', '#5BC0BE', '#4BAD9E', '#3A506B', '#1C2541', '#0B132B'],
+                rim: '#A9FFF7',
+                trail: '#63D1CF',
+                bokeh: '#4BAD9E'
+            },
+            'Pallet 3 (Amethyst Veil)': {
+                bg: '#0D001D',
+                starCore: '#fdedff',
+                starGlow: '#D69ADE',
+                planets: ['#AA60C8', '#D69ADE', '#C9A3C6', '#CFB5C2', '#E8C5E5', '#7B287D'],
+                rim: '#F7D6FA',
+                trail: '#AA60C8',
+                bokeh: '#C9A3C6'
+            },
+            'Pallet 4 (Gold & Emerald)': {
+                bg: '#061210',
+                starCore: '#fffef0',
+                starGlow: '#FFBA00',
+                planets: ['#FEF1BE', '#FFBA00', '#008189', '#00474D', '#037971', '#D4AF37'],
+                rim: '#FFFDF0',
+                trail: '#008189',
+                bokeh: '#FFBA00'
+            },
+            'Pallet 5 (Aurora Mint)': {
+                bg: '#05140A',
+                starCore: '#f6ffeb',
+                starGlow: '#7FFF00',
+                planets: ['#D4FFB0', '#7FFF00', '#00B894', '#0A3322', '#55EFC4', '#006266'],
+                rim: '#EAFFD9',
+                trail: '#7FFF00',
+                bokeh: '#00B894'
+            },
+            'Pallet 6 (Twilight Amber)': {
+                bg: '#0E0618',
+                starCore: '#fff5e6',
+                starGlow: '#FF8C00',
+                planets: ['#FFE8CC', '#FF8C00', '#C7501A', '#3D1050', '#8F2D56', '#5C1D8F'],
+                rim: '#FFF2E0',
+                trail: '#FF8C00',
+                bokeh: '#C7501A'
+            },
+            'Pallet 7 (Cosmic Iris)': {
+                bg: '#090612',
+                starCore: '#f6f2ff',
+                starGlow: '#b38fff',
+                planets: ['#E8E0FF', '#b38fff', '#6A3DE8', '#1A1250', '#4D179A', '#9B5DE5'],
+                rim: '#f4f0ff',
+                trail: '#b38fff',
+                bokeh: '#6a3de8'
+            },
+            'Pallet 8 (Cyber Nebula)': {
+                bg: '#05020F',
+                starCore: '#f0feff',
+                starGlow: '#00F0FF',
+                planets: ['#E0FBFF', '#00F0FF', '#D40078', '#1E0A3D', '#7928CA', '#FF0080'],
+                rim: '#C4F9FF',
+                trail: '#00F0FF',
+                bokeh: '#D40078'
+            }
+        };
+
+        // --- MASTER SETTINGS (DEFAULT EXACTLY CONFIGURED FROM USER PRESET) ---
+        const settings = {
+            // Theme: Pallet 7 (Cosmic Iris)
+            colorScheme: 'Pallet 7 (Cosmic Iris)',
+            greenscreen: false,
+            backgroundColor: '#090612',
+            starCoreColor: '#f6f2ff',
+            starGlowColor: '#b38fff',
+            rimLightColor: '#f4f0ff',
+            trailColor: '#b38fff',
+            bokehColor: '#6a3de8',
+
+            // Animation
+            animationSpeed: 1.21,
+            cameraAnimation: 'Slow Dolly-In',
+            autoOrbitSpeed: 0.15,
+
+            // System Parameters
+            dpr: 1.0,
+            clickToRandomize: true,
+
+            // Orbit & Planets (Exact user defaults)
+            planetCount: 8,
+            systemRadius: 200,
+            orbitEccentricity: 0.28,
+            orbitTilt: 0.36,
+            rimPower: 2.6,
+            rimIntensity: 2.4,
+            starRadius: 7.5,
+            showOrbitGuides: true,
+            trailLength: 140,
+            trailOpacity: 0.75,
+
+            // Stars Background
+            showStars: true,
+            starCount: 2200,
+            starBrightness: 1.15,
+
+            // Cosmic Dust
+            showDust: true,
+            dustCount: 450,
+            dustSize: 65.0,
+            dustOpacity: 0.4,
+
+            // Comets
+            showComets: true,
+            cometCount: 3,
+            cometSpeed: 1.0,
+            cometTailLength: 90,
+
+            // Bokeh Atmosphere (Exact user defaults)
+            showBokeh: true,
+            bokehCount: 325,
+            bokehSize: 34.0,
+            bokehSpread: 600
+        };
+
+        // --- SCENE, RENDERER, CAMERA SETUP ---
+        const canvas = document.getElementById('webgl-canvas');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(settings.backgroundColor);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 3500);
+        camera.position.set(0, 120, 260);
+
+        const renderer = new THREE.WebGLRenderer({
+            canvas,
+            antialias: true,
+            powerPreference: 'high-performance',
+            alpha: false
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(settings.dpr);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.05;
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.04;
+        controls.minDistance = 25;
+        controls.maxDistance = 1400;
+        controls.target.set(0, 0, 0);
+
+        // --- INITIALIZE POST PROCESSOR (EXACT USER DEFAULTS) ---
+        const postProcessor = new PostProcessor(renderer, {
+            enabled: true,
+            bloomEnabled: true,
+            bloomStrength: 1.95,
+            bloomRadius: 1.65,
+            bloomThreshold: 0.15,
+            fisheyeStrength: -0.23,
+            fisheyeRadius: 1.0,
+            chromaticAberration: 0.07,
+            vignetteBoost: 1.05,
+            vignetteReduction: 0.0,
+            noiseIntensity: 0.035,
+            gamma: 0.95,
+            minInputLevel: 0.0,
+            maxInputLevel: 1.0
+        });
+        postProcessor.setSize(window.innerWidth, window.innerHeight, settings.dpr);
+
+        // --- SHADER DEFINITIONS ---
+
+        // 1. Planet Rim-Light Shader
+        const PlanetShader = {
+            vertexShader: `
+                varying vec3 vNormal;
+                varying vec3 vWorldPosition;
+                varying vec2 vUv;
+
+                void main() {
+                    vUv = uv;
+                    vNormal = normalize(normalMatrix * normal);
+                    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                    vWorldPosition = worldPos.xyz;
+                    gl_Position = projectionMatrix * viewMatrix * worldPos;
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uColor;
+                uniform vec3 uRimColor;
+                uniform vec3 uLightPos;
+                uniform float uRimPower;
+                uniform float uRimIntensity;
+                uniform float uAtmosphere;
+                uniform float uTime;
+                uniform float uPatternSeed;
+
+                varying vec3 vNormal;
+                varying vec3 vWorldPosition;
+                varying vec2 vUv;
+
+                void main() {
+                    vec3 N = normalize(vNormal);
+                    vec3 L = normalize(uLightPos - vWorldPosition);
+                    vec3 V = normalize(cameraPosition - vWorldPosition);
+
+                    // Diffuse day/night terminator from central star
+                    float NdotL = dot(N, L);
+                    float diff = smoothstep(-0.25, 0.75, NdotL);
+                    float ambient = 0.07;
+                    float lightIntensity = ambient + (1.0 - ambient) * diff;
+
+                    // Subtle planetary surface bands & tonal variation
+                    float band = sin(vUv.y * 18.0 + uPatternSeed + uTime * 0.08) * 0.06
+                               + sin(vUv.x * 10.0 - uTime * 0.04) * 0.03;
+                    vec3 surfaceColor = uColor * (1.0 + band);
+
+                    // Rim-Light Fresnel Calculation
+                    float NdotV = max(dot(N, V), 0.0);
+                    float rim = pow(1.0 - NdotV, uRimPower) * uRimIntensity;
+
+                    // Soft directional wrap: rim is strongest on sunlit & grazing limb
+                    float sunLitLimb = max(dot(N, L) * 0.6 + 0.4, 0.25);
+                    vec3 rimEffect = uRimColor * rim * sunLitLimb;
+
+                    // Subtle atmospheric limb glow
+                    vec3 atmosphereGlow = uRimColor * pow(1.0 - NdotV, uRimPower * 0.55) * uAtmosphere * 0.25;
+
+                    vec3 finalColor = surfaceColor * lightIntensity + rimEffect + atmosphereGlow;
+                    gl_FragColor = vec4(finalColor, 1.0);
+                }
+            `
+        };
+
+        // 2. Central Star Shader
+        const StarShader = {
+            vertexShader: `
+                varying vec3 vNormal;
+                varying vec3 vWorldPosition;
+                varying vec2 vUv;
+
+                void main() {
+                    vUv = uv;
+                    vNormal = normalize(normalMatrix * normal);
+                    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                    vWorldPosition = worldPos.xyz;
+                    gl_Position = projectionMatrix * viewMatrix * worldPos;
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uColor;
+                uniform vec3 uGlowColor;
+                uniform float uTime;
+
+                varying vec3 vNormal;
+                varying vec3 vWorldPosition;
+                varying vec2 vUv;
+
+                void main() {
+                    vec3 V = normalize(cameraPosition - vWorldPosition);
+                    vec3 N = normalize(vNormal);
+                    float NdotV = max(dot(N, V), 0.0);
+
+                    float pulse = 0.96 + 0.04 * sin(uTime * 1.8);
+                    
+                    float centerGlow = pow(NdotV, 0.65);
+                    vec3 col = mix(uGlowColor * 1.6, uColor * 2.2, centerGlow) * pulse;
+
+                    float limb = pow(1.0 - NdotV, 2.2) * 1.8;
+                    col += uGlowColor * limb;
+
+                    gl_FragColor = vec4(col, 1.0);
+                }
+            `
+        };
+
+        // 3. Central Star Corona Flare (Soft billboard glow)
+        const CoronaShader = {
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    vec4 mvPosition = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+                    mvPosition.xy += position.xy;
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uColor;
+                uniform float uOpacity;
+                uniform float uTime;
+                varying vec2 vUv;
+
+                void main() {
+                    vec2 p = vUv - vec2(0.5);
+                    float d = length(p) * 2.0;
+                    if (d > 1.0) discard;
+                    
+                    float pulse = 0.95 + 0.05 * sin(uTime * 1.2);
+                    float core = exp(-d * 3.8);
+                    float halo = smoothstep(1.0, 0.0, d) * 0.4;
+                    float alpha = (core + halo) * uOpacity * pulse;
+
+                    gl_FragColor = vec4(uColor * 2.0, alpha);
+                }
+            `
+        };
+
+        // 4. Distant Twinkling Starfield Shader
+        const StarfieldShader = {
+            vertexShader: `
+                uniform float uTime;
+                uniform float uPixelRatio;
+                uniform float uBrightness;
+
+                attribute float aSize;
+                attribute float aTwinkleSpeed;
+                attribute float aPhase;
+                attribute vec3 aColor;
+
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                void main() {
+                    vColor = aColor;
+                    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                    
+                    float twinkle = 0.45 + 0.55 * sin(uTime * aTwinkleSpeed + aPhase);
+                    vAlpha = twinkle * uBrightness;
+                    
+                    float dist = -mvPosition.z;
+                    gl_PointSize = aSize * uPixelRatio * (600.0 / max(dist, 100.0));
+                    gl_PointSize = clamp(gl_PointSize, 1.0, 8.0);
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                void main() {
+                    vec2 uv = gl_PointCoord - vec2(0.5);
+                    float d = length(uv);
+                    if (d > 0.5) discard;
+                    float intensity = smoothstep(0.5, 0.08, d) * vAlpha;
+                    gl_FragColor = vec4(vColor * 1.6, intensity);
+                }
+            `
+        };
+
+        // 5. Cosmic Dust / Volumetric Nebula Clouds Shader
+        const CosmicDustShader = {
+            vertexShader: `
+                uniform float uTime;
+                uniform float uPixelRatio;
+                uniform float uBaseSize;
+
+                attribute float aScale;
+                attribute float aPhase;
+                attribute vec3 aColor;
+
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                void main() {
+                    vColor = aColor;
+                    vec3 pos = position;
+                    
+                    pos.x += sin(uTime * 0.06 + aPhase) * 14.0;
+                    pos.y += cos(uTime * 0.05 + aPhase * 1.3) * 10.0;
+                    pos.z += sin(uTime * 0.04 + aPhase * 0.7) * 12.0;
+                    
+                    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                    float dist = -mvPosition.z;
+                    
+                    gl_PointSize = uBaseSize * aScale * (420.0 / max(dist, 80.0)) * uPixelRatio;
+                    gl_PointSize = clamp(gl_PointSize, 6.0, 200.0);
+                    
+                    vAlpha = 0.35 + 0.35 * sin(uTime * 0.2 + aPhase);
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vColor;
+                varying float vAlpha;
+                uniform float uGlobalOpacity;
+
+                void main() {
+                    vec2 uv = gl_PointCoord - vec2(0.5);
+                    float d = length(uv);
+                    if (d > 0.5) discard;
+                    
+                    float falloff = exp(-d * d * 7.5) * (1.0 - smoothstep(0.28, 0.5, d));
+                    gl_FragColor = vec4(vColor * 1.3, falloff * vAlpha * uGlobalOpacity);
+                }
+            `
+        };
+
+        // 6. Sparse Bokeh Background Points Shader
+        const BokehShader = {
+            vertexShader: `
+                uniform float uTime;
+                uniform float uPixelRatio;
+                uniform float uBaseSize;
+
+                attribute float aScale;
+                attribute float aPhase;
+                attribute vec3 aColor;
+
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                void main() {
+                    vColor = aColor;
+                    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                    
+                    float driftY = sin(uTime * 0.15 + aPhase) * 2.5;
+                    float driftX = cos(uTime * 0.12 + aPhase * 1.3) * 2.0;
+                    mvPosition.x += driftX;
+                    mvPosition.y += driftY;
+                    
+                    float dist = -mvPosition.z;
+                    float pointSize = uBaseSize * aScale * (400.0 / max(dist, 100.0)) * uPixelRatio;
+                    gl_PointSize = clamp(pointSize, 2.5, 110.0);
+                    
+                    vAlpha = 0.35 + 0.35 * sin(uTime * 0.25 + aPhase * 2.0);
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                void main() {
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    float dist = length(coord);
+                    if (dist > 0.5) discard;
+                    
+                    float core = exp(-dist * dist * 10.0);
+                    float disc = smoothstep(0.5, 0.32, dist) * 0.55;
+                    float ring = smoothstep(0.32, 0.48, dist) * smoothstep(0.5, 0.47, dist) * 0.75;
+                    
+                    float intensity = (core + disc + ring) * vAlpha;
+                    gl_FragColor = vec4(vColor * 1.5, intensity);
+                }
+            `
+        };
+
+        // --- SYSTEM INSTANCES & OBJECT HOLDERS ---
+        let starMesh, coronaMesh;
+        let starMaterial, coronaMaterial;
+        let starfieldPoints, starfieldMaterial;
+        let cosmicDustPoints, cosmicDustMaterial;
+        let bokehPoints, bokehMaterial;
+
+        let planetsGroup = new THREE.Group();
+        let orbitGuidesGroup = new THREE.Group();
+        let trailsGroup = new THREE.Group();
+        let cometsGroup = new THREE.Group();
+
+        scene.add(starfieldPoints);
+        scene.add(cosmicDustPoints);
+        scene.add(bokehPoints);
+        scene.add(planetsGroup);
+        scene.add(orbitGuidesGroup);
+        scene.add(trailsGroup);
+        scene.add(cometsGroup);
+
+        const planetObjects = [];
+        const cometInstances = [];
+
+        // --- CREATE CENTRAL STAR ---
+        function createCentralStar() {
+            if (starMesh) scene.remove(starMesh);
+            if (coronaMesh) scene.remove(coronaMesh);
+
+            const starGeo = new THREE.SphereGeometry(settings.starRadius, 64, 64);
+            starMaterial = new THREE.ShaderMaterial({
+                vertexShader: StarShader.vertexShader,
+                fragmentShader: StarShader.fragmentShader,
+                uniforms: {
+                    uColor: { value: new THREE.Color(settings.starCoreColor) },
+                    uGlowColor: { value: new THREE.Color(settings.starGlowColor) },
+                    uTime: { value: 0 }
+                }
+            });
+            starMesh = new THREE.Mesh(starGeo, starMaterial);
+            scene.add(starMesh);
+
+            const coronaGeo = new THREE.PlaneGeometry(settings.starRadius * 11, settings.starRadius * 11);
+            coronaMaterial = new THREE.ShaderMaterial({
+                vertexShader: CoronaShader.vertexShader,
+                fragmentShader: CoronaShader.fragmentShader,
+                uniforms: {
+                    uColor: { value: new THREE.Color(settings.starGlowColor) },
+                    uOpacity: { value: 0.6 },
+                    uTime: { value: 0 }
+                },
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                side: THREE.DoubleSide
+            });
+            coronaMesh = new THREE.Mesh(coronaGeo, coronaMaterial);
+            scene.add(coronaMesh);
+        }
+
+        // --- CREATE DISTANT STARFIELD ---
+        function createStarfield() {
+            if (starfieldPoints) scene.remove(starfieldPoints);
+
+            const count = settings.starCount;
+            const geo = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const sizes = new Float32Array(count);
+            const twinkleSpeeds = new Float32Array(count);
+            const phases = new Float32Array(count);
+
+            const scheme = COLOR_SCHEMES[settings.colorScheme] || COLOR_SCHEMES['Pallet 7 (Cosmic Iris)'];
+            const p1 = new THREE.Color(scheme.starCore);
+            const p2 = new THREE.Color(scheme.starGlow);
+            const p3 = new THREE.Color(scheme.rim);
+            const white = new THREE.Color('#ffffff');
+            const blueWhite = new THREE.Color('#e0f0ff');
+            const warmGold = new THREE.Color('#fff0d0');
+
+            const paletteList = [p1, p2, p3, white, blueWhite, warmGold];
+
+            for (let i = 0; i < count; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const r = 550 + Math.random() * 1800;
+
+                positions[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                const chosen = paletteList[Math.floor(Math.random() * paletteList.length)];
+                colors[i * 3 + 0] = chosen.r;
+                colors[i * 3 + 1] = chosen.g;
+                colors[i * 3 + 2] = chosen.b;
+
+                sizes[i] = 1.0 + Math.pow(Math.random(), 3) * 3.5;
+                twinkleSpeeds[i] = 0.6 + Math.random() * 2.8;
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+            geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+            geo.setAttribute('aTwinkleSpeed', new THREE.BufferAttribute(twinkleSpeeds, 1));
+            geo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
+
+            starfieldMaterial = new THREE.ShaderMaterial({
+                vertexShader: StarfieldShader.vertexShader,
+                fragmentShader: StarfieldShader.fragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uPixelRatio: { value: settings.dpr },
+                    uBrightness: { value: settings.starBrightness }
+                },
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            starfieldPoints = new THREE.Points(geo, starfieldMaterial);
+            starfieldPoints.visible = settings.showStars && !settings.greenscreen;
+            scene.add(starfieldPoints);
+        }
+
+        // --- CREATE COSMIC DUST / NEBULA MOTES ---
+        function createCosmicDust() {
+            if (cosmicDustPoints) scene.remove(cosmicDustPoints);
+
+            const count = settings.dustCount;
+            const geo = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const scales = new Float32Array(count);
+            const phases = new Float32Array(count);
+
+            const scheme = COLOR_SCHEMES[settings.colorScheme] || COLOR_SCHEMES['Pallet 7 (Cosmic Iris)'];
+            const dustBase = new THREE.Color(settings.bokehColor);
+            const starGlow = new THREE.Color(settings.starGlowColor);
+            const rimCol = new THREE.Color(settings.rimLightColor);
+
+            for (let i = 0; i < count; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const r = 90 + Math.random() * 580;
+
+                positions[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = (r * Math.sin(phi) * Math.sin(theta)) * 0.6;
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                const mixRatio = Math.random();
+                const c = dustBase.clone().lerp(mixRatio > 0.5 ? starGlow : rimCol, Math.random() * 0.7);
+
+                colors[i * 3 + 0] = c.r;
+                colors[i * 3 + 1] = c.g;
+                colors[i * 3 + 2] = c.b;
+
+                scales[i] = 0.5 + Math.random() * 2.2;
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+            geo.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
+            geo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
+
+            cosmicDustMaterial = new THREE.ShaderMaterial({
+                vertexShader: CosmicDustShader.vertexShader,
+                fragmentShader: CosmicDustShader.fragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uPixelRatio: { value: settings.dpr },
+                    uBaseSize: { value: settings.dustSize },
+                    uGlobalOpacity: { value: settings.dustOpacity }
+                },
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            cosmicDustPoints = new THREE.Points(geo, cosmicDustMaterial);
+            cosmicDustPoints.visible = settings.showDust && !settings.greenscreen;
+            scene.add(cosmicDustPoints);
+        }
+
+        // --- CREATE BOKEH BACKGROUND ---
+        function createBokehField() {
+            if (bokehPoints) scene.remove(bokehPoints);
+
+            const count = settings.bokehCount;
+            const geo = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const scales = new Float32Array(count);
+            const phases = new Float32Array(count);
+
+            const baseColor = new THREE.Color(settings.bokehColor);
+            const starColor = new THREE.Color(settings.starGlowColor);
+            const rimColor = new THREE.Color(settings.rimLightColor);
+
+            const spread = settings.bokehSpread;
+
+            for (let i = 0; i < count; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const r = 220 + Math.random() * (spread);
+
+                positions[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = (r * Math.sin(phi) * Math.sin(theta)) * 0.65;
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                const mixFactor = Math.random();
+                const mixedColor = baseColor.clone().lerp(mixFactor > 0.5 ? starColor : rimColor, Math.random() * 0.6);
+
+                colors[i * 3 + 0] = mixedColor.r;
+                colors[i * 3 + 1] = mixedColor.g;
+                colors[i * 3 + 2] = mixedColor.b;
+
+                scales[i] = 0.4 + Math.random() * 1.8;
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+            geo.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
+            geo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
+
+            bokehMaterial = new THREE.ShaderMaterial({
+                vertexShader: BokehShader.vertexShader,
+                fragmentShader: BokehShader.fragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uPixelRatio: { value: settings.dpr },
+                    uBaseSize: { value: settings.bokehSize }
+                },
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            bokehPoints = new THREE.Points(geo, bokehMaterial);
+            bokehPoints.visible = settings.showBokeh && !settings.greenscreen;
+            scene.add(bokehPoints);
+        }
+
+        // --- CREATE COMETS SYSTEM ---
+        function createComets() {
+            while (cometsGroup.children.length > 0) cometsGroup.remove(cometsGroup.children[0]);
+            cometInstances.length = 0;
+
+            const count = settings.cometCount;
+            const scheme = COLOR_SCHEMES[settings.colorScheme] || COLOR_SCHEMES['Pallet 7 (Cosmic Iris)'];
+            const sphereGeo = new THREE.SphereGeometry(1, 16, 16);
+            const coronaGeo = new THREE.PlaneGeometry(16, 16);
+
+            for (let i = 0; i < count; i++) {
+                const a = 180 + i * 85 + Math.random() * 50;
+                const e = 0.88 + Math.random() * 0.06;
+                const b = a * Math.sqrt(Math.max(1 - e * e, 0.05));
+                
+                const tiltX = (Math.random() - 0.5) * 1.4;
+                const tiltY = Math.random() * Math.PI * 2;
+                const tiltZ = (Math.random() - 0.5) * 1.4;
+                const speed = (0.24 + Math.random() * 0.16) / Math.sqrt(a * 0.04);
+                const initialPhase = Math.random() * Math.PI * 2;
+
+                const cometColor = new THREE.Color(settings.rimLightColor).lerp(new THREE.Color(settings.starGlowColor), Math.random() * 0.6);
+
+                const headMat = new THREE.MeshBasicMaterial({
+                    color: new THREE.Color('#ffffff')
+                });
+                const headMesh = new THREE.Mesh(sphereGeo, headMat);
+                headMesh.scale.setScalar(1.2);
+                cometsGroup.add(headMesh);
+
+                const glowMat = new THREE.ShaderMaterial({
+                    vertexShader: CoronaShader.vertexShader,
+                    fragmentShader: CoronaShader.fragmentShader,
+                    uniforms: {
+                        uColor: { value: cometColor },
+                        uOpacity: { value: 0.85 },
+                        uTime: { value: 0 }
+                    },
+                    transparent: true,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false,
+                    side: THREE.DoubleSide
+                });
+                const glowMesh = new THREE.Mesh(coronaGeo, glowMat);
+                cometsGroup.add(glowMesh);
+
+                const maxTail = settings.cometTailLength;
+                const tailPositions = new Float32Array(maxTail * 3);
+                const tailAlphas = new Float32Array(maxTail);
+                const tailWidths = new Float32Array(maxTail);
+                const tailColors = new Float32Array(maxTail * 3);
+
+                for (let k = 0; k < maxTail; k++) {
+                    tailPositions[k * 3 + 0] = 0;
+                    tailPositions[k * 3 + 1] = 0;
+                    tailPositions[k * 3 + 2] = 0;
+                    const factor = 1.0 - k / maxTail;
+                    tailAlphas[k] = factor;
+                    tailWidths[k] = 2.0 + (1.0 - factor) * 22.0;
+                    tailColors[k * 3 + 0] = cometColor.r;
+                    tailColors[k * 3 + 1] = cometColor.g;
+                    tailColors[k * 3 + 2] = cometColor.b;
+                }
+
+                const tailGeo = new THREE.BufferGeometry();
+                tailGeo.setAttribute('position', new THREE.BufferAttribute(tailPositions, 3));
+                tailGeo.setAttribute('aAlpha', new THREE.BufferAttribute(tailAlphas, 1));
+                tailGeo.setAttribute('aWidth', new THREE.BufferAttribute(tailWidths, 1));
+                tailGeo.setAttribute('aColor', new THREE.BufferAttribute(tailColors, 3));
+
+                const tailMat = new THREE.ShaderMaterial({
+                    vertexShader: `
+                        attribute float aAlpha;
+                        attribute float aWidth;
+                        attribute vec3 aColor;
+                        varying float vAlpha;
+                        varying vec3 vColor;
+                        void main() {
+                            vAlpha = aAlpha;
+                            vColor = aColor;
+                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            gl_PointSize = aWidth * (350.0 / -mvPosition.z);
+                            gl_PointSize = clamp(gl_PointSize, 1.0, 55.0);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform float uOpacity;
+                        varying float vAlpha;
+                        varying vec3 vColor;
+                        void main() {
+                            vec2 coord = gl_PointCoord - vec2(0.5);
+                            float d = length(coord);
+                            if (d > 0.5) discard;
+                            float falloff = smoothstep(0.5, 0.0, d);
+                            gl_FragColor = vec4(vColor * 2.2, vAlpha * uOpacity * falloff);
+                        }
+                    `,
+                    uniforms: {
+                        uOpacity: { value: 0.85 }
+                    },
+                    transparent: true,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false
+                });
+
+                const tailPoints = new THREE.Points(tailGeo, tailMat);
+                cometsGroup.add(tailPoints);
+
+                cometInstances.push({
+                    headMesh,
+                    glowMesh,
+                    tailGeo,
+                    tailMat,
+                    a, b, e,
+                    tiltX, tiltY, tiltZ,
+                    speed,
+                    phase: initialPhase,
+                    history: [],
+                    maxTail,
+                    cometColor
+                });
+            }
+
+            cometsGroup.visible = settings.showComets && !settings.greenscreen;
+        }
+
+        // --- CREATE ORBITAL SYSTEM (PLANETS, TRAILS, ORBITS) ---
+        function createOrbitalSystem() {
+            while (planetsGroup.children.length > 0) planetsGroup.remove(planetsGroup.children[0]);
+            while (orbitGuidesGroup.children.length > 0) orbitGuidesGroup.remove(orbitGuidesGroup.children[0]);
+            while (trailsGroup.children.length > 0) trailsGroup.remove(trailsGroup.children[0]);
+            planetObjects.length = 0;
+
+            const scheme = COLOR_SCHEMES[settings.colorScheme] || COLOR_SCHEMES['Pallet 7 (Cosmic Iris)'];
+            const count = settings.planetCount;
+
+            const sphereGeo = new THREE.SphereGeometry(1, 48, 48);
+
+            for (let i = 0; i < count; i++) {
+                const progress = (i + 1) / (count + 0.8);
+                const a = 32 + progress * settings.systemRadius;
+                const e = Math.min(settings.orbitEccentricity * (0.6 + 0.8 * Math.sin(i * 1.4)), 0.65);
+                const b = a * Math.sqrt(Math.max(1 - e * e, 0.1));
+
+                const tiltX = (Math.sin(i * 1.7) * 0.5 + 0.5) * settings.orbitTilt;
+                const tiltZ = (Math.cos(i * 2.3) * 0.5 + 0.5) * settings.orbitTilt * 0.7;
+                const initialPhase = (i * (Math.PI * 2 / count) + i * 0.7) % (Math.PI * 2);
+
+                const orbitalSpeed = 0.22 / Math.sqrt(a * 0.05);
+                const radius = 1.8 + Math.pow(Math.sin(i * 1.2 + 0.5), 2) * 3.8;
+                const planetColorHex = scheme.planets[i % scheme.planets.length];
+
+                const material = new THREE.ShaderMaterial({
+                    vertexShader: PlanetShader.vertexShader,
+                    fragmentShader: PlanetShader.fragmentShader,
+                    uniforms: {
+                        uColor: { value: new THREE.Color(planetColorHex) },
+                        uRimColor: { value: new THREE.Color(settings.rimLightColor) },
+                        uLightPos: { value: new THREE.Vector3(0, 0, 0) },
+                        uRimPower: { value: settings.rimPower },
+                        uRimIntensity: { value: settings.rimIntensity },
+                        uAtmosphere: { value: 0.8 },
+                        uTime: { value: 0 },
+                        uPatternSeed: { value: i * 13.7 }
+                    }
+                });
+
+                const mesh = new THREE.Mesh(sphereGeo, material);
+                mesh.scale.setScalar(radius);
+                planetsGroup.add(mesh);
+
+                let moonData = null;
+                if ((i === 1 || i === 3) && count >= 3) {
+                    const moonRadius = radius * 0.32;
+                    const moonDistance = radius * 2.6 + 2.5;
+                    const moonSpeed = 2.4;
+                    const moonMat = new THREE.ShaderMaterial({
+                        vertexShader: PlanetShader.vertexShader,
+                        fragmentShader: PlanetShader.fragmentShader,
+                        uniforms: {
+                            uColor: { value: new THREE.Color(scheme.planets[(i + 2) % scheme.planets.length]) },
+                            uRimColor: { value: new THREE.Color(settings.rimLightColor) },
+                            uLightPos: { value: new THREE.Vector3(0, 0, 0) },
+                            uRimPower: { value: settings.rimPower * 1.2 },
+                            uRimIntensity: { value: settings.rimIntensity * 1.3 },
+                            uAtmosphere: { value: 0.5 },
+                            uTime: { value: 0 },
+                            uPatternSeed: { value: i * 9.1 }
+                        }
+                    });
+                    const moonMesh = new THREE.Mesh(sphereGeo, moonMat);
+                    moonMesh.scale.setScalar(moonRadius);
+                    planetsGroup.add(moonMesh);
+
+                    moonData = {
+                        mesh: moonMesh,
+                        distance: moonDistance,
+                        speed: moonSpeed,
+                        angle: Math.random() * Math.PI * 2
+                    };
+                }
+
+                // Trailing Particle Orbit-Path
+                const maxHistory = settings.trailLength;
+                const trailPositions = new Float32Array(maxHistory * 3);
+                const trailAlphas = new Float32Array(maxHistory);
+                const trailColors = new Float32Array(maxHistory * 3);
+
+                const tCol = new THREE.Color(settings.trailColor).lerp(new THREE.Color(planetColorHex), 0.4);
+
+                for (let k = 0; k < maxHistory; k++) {
+                    trailPositions[k * 3 + 0] = 0;
+                    trailPositions[k * 3 + 1] = 0;
+                    trailPositions[k * 3 + 2] = 0;
+                    const factor = 1.0 - k / maxHistory;
+                    trailAlphas[k] = factor;
+                    trailColors[k * 3 + 0] = tCol.r;
+                    trailColors[k * 3 + 1] = tCol.g;
+                    trailColors[k * 3 + 2] = tCol.b;
+                }
+
+                const trailGeo = new THREE.BufferGeometry();
+                trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+                trailGeo.setAttribute('aAlpha', new THREE.BufferAttribute(trailAlphas, 1));
+                trailGeo.setAttribute('aColor', new THREE.BufferAttribute(trailColors, 3));
+
+                const trailMat = new THREE.ShaderMaterial({
+                    vertexShader: `
+                        attribute float aAlpha;
+                        attribute vec3 aColor;
+                        varying float vAlpha;
+                        varying vec3 vColor;
+                        void main() {
+                            vAlpha = aAlpha;
+                            vColor = aColor;
+                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            gl_PointSize = (1.0 + vAlpha * 3.5);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform float uGlobalOpacity;
+                        varying float vAlpha;
+                        varying vec3 vColor;
+                        void main() {
+                            vec2 coord = gl_PointCoord - vec2(0.5);
+                            if (length(coord) > 0.5) discard;
+                            float d = smoothstep(0.5, 0.0, length(coord));
+                            gl_FragColor = vec4(vColor * 1.3, vAlpha * uGlobalOpacity * d);
+                        }
+                    `,
+                    uniforms: {
+                        uGlobalOpacity: { value: settings.trailOpacity }
+                    },
+                    transparent: true,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false
+                });
+
+                const trailPoints = new THREE.Points(trailGeo, trailMat);
+                trailsGroup.add(trailPoints);
+
+                // Orbit Guide Ring
+                const segments = 128;
+                const guidePositions = new Float32Array((segments + 1) * 3);
+                for (let s = 0; s <= segments; s++) {
+                    const theta = (s / segments) * Math.PI * 2;
+                    const xLocal = a * Math.cos(theta) - a * e;
+                    const zLocal = b * Math.sin(theta);
+                    
+                    const yRot = xLocal * Math.sin(tiltZ) + zLocal * Math.sin(tiltX);
+                    const xRot = xLocal * Math.cos(tiltZ);
+                    const zRot = zLocal * Math.cos(tiltX);
+
+                    guidePositions[s * 3 + 0] = xRot;
+                    guidePositions[s * 3 + 1] = yRot;
+                    guidePositions[s * 3 + 2] = zRot;
+                }
+
+                const guideGeo = new THREE.BufferGeometry();
+                guideGeo.setAttribute('position', new THREE.BufferAttribute(guidePositions, 3));
+                const guideMat = new THREE.LineBasicMaterial({
+                    color: new THREE.Color(settings.trailColor),
+                    transparent: true,
+                    opacity: settings.showOrbitGuides ? 0.12 : 0.0,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false
+                });
+                const guideLine = new THREE.Line(guideGeo, guideMat);
+                orbitGuidesGroup.add(guideLine);
+
+                planetObjects.push({
+                    mesh,
+                    material,
+                    radius,
+                    a,
+                    b,
+                    e,
+                    tiltX,
+                    tiltZ,
+                    speed: orbitalSpeed,
+                    phase: initialPhase,
+                    history: [],
+                    maxHistory,
+                    trailGeo,
+                    trailMat,
+                    guideLine,
+                    moon: moonData
+                });
+            }
+        }
+
+        // --- REBUILD SCENE VISUALS ---
+        function updateSceneTheme() {
+            const scheme = COLOR_SCHEMES[settings.colorScheme] || COLOR_SCHEMES['Pallet 7 (Cosmic Iris)'];
+            
+            if (settings.greenscreen) {
+                scene.background = new THREE.Color('#00ff00');
+                renderer.setClearColor('#00ff00', 1);
+                postProcessor.settings.noiseIntensity = 0.0;
+                postProcessor.settings.vignetteReduction = 0.0;
+                postProcessor.settings.chromaticAberration = 0.0;
+            } else {
+                scene.background = new THREE.Color(settings.backgroundColor);
+                renderer.setClearColor(settings.backgroundColor, 1);
+                postProcessor.settings.noiseIntensity = 0.035;
+                postProcessor.settings.vignetteReduction = 0.0;
+                postProcessor.settings.chromaticAberration = 0.07;
+            }
+            postProcessor.updateSettings();
+
+            if (starMaterial) {
+                starMaterial.uniforms.uColor.value.set(settings.starCoreColor);
+                starMaterial.uniforms.uGlowColor.value.set(settings.starGlowColor);
+            }
+            if (coronaMaterial) {
+                coronaMaterial.uniforms.uColor.value.set(settings.starGlowColor);
+            }
+
+            if (starfieldPoints) {
+                starfieldPoints.visible = settings.showStars && !settings.greenscreen;
+                createStarfield();
+            }
+
+            if (cosmicDustPoints) {
+                cosmicDustPoints.visible = settings.showDust && !settings.greenscreen;
+                createCosmicDust();
+            }
+
+            if (bokehPoints) {
+                bokehPoints.visible = settings.showBokeh && !settings.greenscreen;
+                createBokehField();
+            }
+
+            if (cometsGroup) {
+                cometsGroup.visible = settings.showComets && !settings.greenscreen;
+                createComets();
+            }
+
+            planetObjects.forEach((p, idx) => {
+                const pCol = scheme.planets[idx % scheme.planets.length];
+                p.material.uniforms.uColor.value.set(pCol);
+                p.material.uniforms.uRimColor.value.set(settings.rimLightColor);
+                p.material.uniforms.uRimPower.value = settings.rimPower;
+                p.material.uniforms.uRimIntensity.value = settings.rimIntensity;
+
+                if (p.guideLine) {
+                    p.guideLine.material.color.set(settings.trailColor);
+                    p.guideLine.material.opacity = settings.showOrbitGuides && !settings.greenscreen ? 0.12 : 0.0;
+                }
+
+                if (p.trailMat) {
+                    p.trailMat.uniforms.uGlobalOpacity.value = settings.greenscreen ? 0.0 : settings.trailOpacity;
+                }
+
+                if (p.moon) {
+                    p.moon.mesh.material.uniforms.uRimColor.value.set(settings.rimLightColor);
+                    p.moon.mesh.material.uniforms.uRimPower.value = settings.rimPower * 1.2;
+                    p.moon.mesh.material.uniforms.uRimIntensity.value = settings.rimIntensity * 1.3;
+                }
+            });
+        }
+
+        function applyScheme(schemeName) {
+            const scheme = COLOR_SCHEMES[schemeName];
+            if (!scheme) return;
+            settings.colorScheme = schemeName;
+            settings.backgroundColor = scheme.bg;
+            settings.starCoreColor = scheme.starCore;
+            settings.starGlowColor = scheme.starGlow;
+            settings.rimLightColor = scheme.rim;
+            settings.trailColor = scheme.trail;
+            settings.bokehColor = scheme.bokeh;
+            
+            updateSceneTheme();
+            createOrbitalSystem();
+            syncGuiDisplay();
+        }
+
+        function resetToDefaults() {
+            settings.colorScheme = 'Pallet 7 (Cosmic Iris)';
+            settings.greenscreen = false;
+            settings.backgroundColor = '#090612';
+            settings.starCoreColor = '#f6f2ff';
+            settings.starGlowColor = '#b38fff';
+            settings.rimLightColor = '#f4f0ff';
+            settings.trailColor = '#b38fff';
+            settings.bokehColor = '#6a3de8';
+
+            settings.animationSpeed = 1.21;
+            settings.cameraAnimation = 'Slow Dolly-In';
+
+            settings.dpr = 1.0;
+            settings.clickToRandomize = true;
+
+            settings.planetCount = 8;
+            settings.systemRadius = 200;
+            settings.orbitEccentricity = 0.28;
+            settings.orbitTilt = 0.36;
+            settings.rimPower = 2.6;
+            settings.rimIntensity = 2.4;
+            settings.showOrbitGuides = true;
+            settings.trailOpacity = 0.75;
+
+            settings.showStars = true;
+            settings.starCount = 2200;
+            settings.starBrightness = 1.15;
+
+            settings.showDust = true;
+            settings.dustCount = 450;
+            settings.dustSize = 65.0;
+            settings.dustOpacity = 0.4;
+
+            settings.showComets = true;
+            settings.cometCount = 3;
+            settings.cometSpeed = 1.0;
+            settings.cometTailLength = 90;
+
+            settings.showBokeh = true;
+            settings.bokehCount = 325;
+            settings.bokehSize = 34.0;
+
+            postProcessor.settings.enabled = true;
+            postProcessor.settings.bloomEnabled = true;
+            postProcessor.settings.bloomStrength = 1.95;
+            postProcessor.settings.bloomRadius = 1.65;
+            postProcessor.settings.bloomThreshold = 0.15;
+            postProcessor.settings.fisheyeStrength = -0.23;
+            postProcessor.settings.chromaticAberration = 0.07;
+            postProcessor.settings.vignetteBoost = 1.05;
+            postProcessor.settings.vignetteReduction = 0.0;
+            postProcessor.settings.noiseIntensity = 0.035;
+            postProcessor.settings.gamma = 0.95;
+            postProcessor.settings.minInputLevel = 0.0;
+            postProcessor.settings.maxInputLevel = 1.0;
+            postProcessor.updateSettings();
+
+            renderer.setPixelRatio(1.0);
+            postProcessor.setSize(window.innerWidth, window.innerHeight, 1.0);
+
+            updateSceneTheme();
+            createCentralStar();
+            createStarfield();
+            createCosmicDust();
+            createBokehField();
+            createComets();
+            createOrbitalSystem();
+            syncGuiDisplay();
+        }
+
+        // --- PROCEDURAL GENERATOR (CLICK-TO-MUTATE) ---
+        function randomizeScene() {
+            const schemeKeys = Object.keys(COLOR_SCHEMES);
+            const randomScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+            
+            settings.colorScheme = randomScheme;
+            const scheme = COLOR_SCHEMES[randomScheme];
+            settings.backgroundColor = scheme.bg;
+            settings.starCoreColor = scheme.starCore;
+            settings.starGlowColor = scheme.starGlow;
+            settings.rimLightColor = scheme.rim;
+            settings.trailColor = scheme.trail;
+            settings.bokehColor = scheme.bokeh;
+
+            settings.planetCount = Math.floor(4 + Math.random() * 5);
+            settings.orbitEccentricity = parseFloat((0.1 + Math.random() * 0.35).toFixed(2));
+            settings.orbitTilt = parseFloat((0.08 + Math.random() * 0.3).toFixed(2));
+            settings.rimPower = parseFloat((1.8 + Math.random() * 1.8).toFixed(1));
+            settings.rimIntensity = parseFloat((1.5 + Math.random() * 1.5).toFixed(1));
+            settings.animationSpeed = parseFloat((0.7 + Math.random() * 0.7).toFixed(2));
+
+            postProcessor.settings.bloomStrength = parseFloat((0.9 + Math.random() * 0.8).toFixed(2));
+            postProcessor.updateSettings();
+
+            updateSceneTheme();
+            createOrbitalSystem();
+            createStarfield();
+            createCosmicDust();
+            createBokehField();
+            createComets();
+            syncGuiDisplay();
+        }
+
+        // --- 8 PRECONFIGURED CAMERA ANIMATION MODES ---
+        let simTime = 0;
+        let globalTime = 0;
+
+        function updateCameraMotion(delta) {
+            const t = globalTime * 0.15 * settings.animationSpeed;
+            const mode = settings.cameraAnimation;
+
+            if (mode === 'Slow Dolly-In') {
+                const dollyCycle = (Math.sin(t * 0.18) * 0.5 + 0.5);
+                const currentDist = 280 - dollyCycle * 110;
+                const azimuth = t * 0.08;
+                camera.position.x = Math.sin(azimuth) * currentDist;
+                camera.position.z = Math.cos(azimuth) * currentDist;
+                camera.position.y = 80 + Math.sin(t * 0.1) * 35;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Ecliptic Drift') {
+                const currentDist = 220 + Math.sin(t * 0.25) * 40;
+                const azimuth = t * 0.18;
+                camera.position.x = Math.sin(azimuth) * currentDist;
+                camera.position.z = Math.cos(azimuth) * currentDist;
+                camera.position.y = 20 + Math.sin(t * 0.3) * 15;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Zenith Descent') {
+                const glide = Math.sin(t * 0.2) * 0.5 + 0.5;
+                const currentDist = 210 + (1.0 - glide) * 70;
+                const azimuth = t * 0.12;
+                camera.position.x = Math.sin(azimuth) * currentDist;
+                camera.position.z = Math.cos(azimuth) * currentDist;
+                camera.position.y = 40 + glide * 160;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Orbital Resonance') {
+                const R = 230;
+                camera.position.x = Math.sin(t * 0.22) * R;
+                camera.position.y = Math.cos(t * 0.16) * (R * 0.45) + 45;
+                camera.position.z = Math.cos(t * 0.22) * R;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Solar Embrace') {
+                const R = 150 + Math.sin(t * 0.2) * 25;
+                const azimuth = t * 0.25;
+                camera.position.x = Math.cos(azimuth) * R;
+                camera.position.z = Math.sin(azimuth) * R;
+                camera.position.y = 45 + Math.cos(t * 0.25) * 20;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Cosmic Breathing') {
+                const breathe = Math.sin(t * 0.35);
+                const currentDist = 240 + breathe * 90;
+                const azimuth = t * 0.05;
+                camera.position.x = Math.sin(azimuth) * currentDist;
+                camera.position.z = Math.cos(azimuth) * currentDist;
+                camera.position.y = 70 + breathe * 25;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Ascending Horizon') {
+                const climb = Math.sin(t * 0.22) * 0.5 + 0.5;
+                const currentDist = 250 - climb * 50;
+                const azimuth = t * 0.14;
+                camera.position.x = Math.sin(azimuth) * currentDist;
+                camera.position.z = Math.cos(azimuth) * currentDist;
+                camera.position.y = 30 + climb * 130;
+                camera.lookAt(0, 0, 0);
+            }
+            else if (mode === 'Static (Manual Observation)') {
+                // Static
+            }
+        }
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = Math.min(clock.getDelta(), 0.1);
+            const effectiveDelta = delta * settings.animationSpeed;
+            simTime += effectiveDelta;
+            globalTime += delta;
+
+            updateCameraMotion(delta);
+            controls.update();
+
+            // Central Star
+            if (starMaterial) starMaterial.uniforms.uTime.value = simTime;
+            if (coronaMaterial) coronaMaterial.uniforms.uTime.value = simTime;
+
+            // Starfield, Dust & Bokeh
+            if (starfieldMaterial) starfieldMaterial.uniforms.uTime.value = simTime;
+            if (cosmicDustMaterial) cosmicDustMaterial.uniforms.uTime.value = simTime;
+            if (bokehMaterial) bokehMaterial.uniforms.uTime.value = simTime;
+
+            // Planets & Moons
+            for (let i = 0; i < planetObjects.length; i++) {
+                const p = planetObjects[i];
+                p.material.uniforms.uTime.value = simTime;
+
+                const currentAngle = p.phase + simTime * p.speed;
+
+                const xLocal = p.a * Math.cos(currentAngle) - p.a * p.e;
+                const zLocal = p.b * Math.sin(currentAngle);
+
+                const yPos = xLocal * Math.sin(p.tiltZ) + zLocal * Math.sin(p.tiltX);
+                const xPos = xLocal * Math.cos(p.tiltZ);
+                const zPos = zLocal * Math.cos(p.tiltX);
+
+                p.mesh.position.set(xPos, yPos, zPos);
+                p.mesh.rotation.y += effectiveDelta * 0.6;
+
+                if (p.moon) {
+                    p.moon.angle += effectiveDelta * p.moon.speed;
+                    const mx = xPos + Math.cos(p.moon.angle) * p.moon.distance;
+                    const mz = zPos + Math.sin(p.moon.angle) * p.moon.distance;
+                    const my = yPos + Math.sin(p.moon.angle * 1.5) * (p.moon.distance * 0.3);
+                    p.moon.mesh.position.set(mx, my, mz);
+                }
+
+                p.history.unshift({ x: xPos, y: yPos, z: zPos });
+                if (p.history.length > p.maxHistory) {
+                    p.history.pop();
+                }
+
+                const posAttr = p.trailGeo.attributes.position;
+                const arr = posAttr.array;
+                for (let k = 0; k < p.maxHistory; k++) {
+                    if (k < p.history.length) {
+                        arr[k * 3 + 0] = p.history[k].x;
+                        arr[k * 3 + 1] = p.history[k].y;
+                        arr[k * 3 + 2] = p.history[k].z;
+                    } else if (p.history.length > 0) {
+                        const last = p.history[p.history.length - 1];
+                        arr[k * 3 + 0] = last.x;
+                        arr[k * 3 + 1] = last.y;
+                        arr[k * 3 + 2] = last.z;
+                    }
+                }
+                posAttr.needsUpdate = true;
+            }
+
+            // Comets Motion & Dynamic Sweeping Tails
+            for (let i = 0; i < cometInstances.length; i++) {
+                const c = cometInstances[i];
+                const angle = c.phase + simTime * c.speed * settings.cometSpeed;
+
+                const xLocal = c.a * Math.cos(angle) - c.a * c.e;
+                const zLocal = c.b * Math.sin(angle);
+
+                let cx = xLocal * Math.cos(c.tiltZ) - zLocal * Math.sin(c.tiltZ);
+                let cy = xLocal * Math.sin(c.tiltZ) + zLocal * Math.cos(c.tiltZ);
+                let cz = zLocal * Math.cos(c.tiltX) - cy * Math.sin(c.tiltX);
+                cy = zLocal * Math.sin(c.tiltX) + cy * Math.cos(c.tiltX);
+
+                const finalX = cx * Math.cos(c.tiltY) - cz * Math.sin(c.tiltY);
+                const finalZ = cx * Math.sin(c.tiltY) + cz * Math.cos(c.tiltY);
+                const finalY = cy;
+
+                c.headMesh.position.set(finalX, finalY, finalZ);
+                c.glowMesh.position.set(finalX, finalY, finalZ);
+
+                const distToStar = Math.hypot(finalX, finalY, finalZ);
+                const proximityScale = Math.max(0.3, Math.min(2.2, 380.0 / (distToStar + 40.0)));
+                c.glowMesh.scale.setScalar(proximityScale * 1.5);
+                c.glowMesh.material.uniforms.uOpacity.value = Math.min(1.0, proximityScale * 0.9);
+
+                const sunRepelX = (finalX / (distToStar + 0.001));
+                const sunRepelY = (finalY / (distToStar + 0.001));
+                const sunRepelZ = (finalZ / (distToStar + 0.001));
+
+                c.history.unshift({
+                    x: finalX,
+                    y: finalY,
+                    z: finalZ,
+                    rx: sunRepelX,
+                    ry: sunRepelY,
+                    rz: sunRepelZ,
+                    proximity: proximityScale
+                });
+
+                if (c.history.length > c.maxTail) {
+                    c.history.pop();
+                }
+
+                const posAttr = c.tailGeo.attributes.position;
+                const arr = posAttr.array;
+                for (let k = 0; k < c.maxTail; k++) {
+                    if (k < c.history.length) {
+                        const h = c.history[k];
+                        const offsetFactor = k * 0.35 * h.proximity;
+                        arr[k * 3 + 0] = h.x + h.rx * offsetFactor;
+                        arr[k * 3 + 1] = h.y + h.ry * offsetFactor;
+                        arr[k * 3 + 2] = h.z + h.rz * offsetFactor;
+                    } else if (c.history.length > 0) {
+                        const last = c.history[c.history.length - 1];
+                        arr[k * 3 + 0] = last.x;
+                        arr[k * 3 + 1] = last.y;
+                        arr[k * 3 + 2] = last.z;
+                    }
+                }
+                posAttr.needsUpdate = true;
+            }
+
+            postProcessor.renderScene(scene, camera);
+        }
+
+        // --- LIL-GUI CONTROL PANEL SETUP ---
+        const gui = new GUI({ title: 'Orbital Stillness' });
+        const guiControllers = [];
+
+        function buildGUI() {
+            // 🎨 COLOR & THEME FOLDER
+            const fTheme = gui.addFolder('🎨 Color & Theme');
+            guiControllers.push(
+                fTheme.add(settings, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Preset Scheme').onChange(val => applyScheme(val)),
+                fTheme.add(settings, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'backgroundColor').name('Background').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'starCoreColor').name('Star Core').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'starGlowColor').name('Star Glow').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'rimLightColor').name('Rim Light').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'trailColor').name('Trail Glow').onChange(() => updateSceneTheme()),
+                fTheme.addColor(settings, 'bokehColor').name('Bokeh Hue').onChange(() => updateSceneTheme())
+            );
+
+            // 🎬 CAMERA & ANIMATION FOLDER
+            const fCam = gui.addFolder('🎬 Camera & Motion');
+            const animOptions = [
+                'Slow Dolly-In',
+                'Ecliptic Drift',
+                'Zenith Descent',
+                'Orbital Resonance',
+                'Solar Embrace',
+                'Cosmic Breathing',
+                'Ascending Horizon',
+                'Static (Manual Observation)'
+            ];
+            guiControllers.push(
+                fCam.add(settings, 'cameraAnimation', animOptions).name('Camera Mode'),
+                fCam.add(settings, 'animationSpeed', 0.0, 3.0, 0.01).name('Animation Speed')
+            );
+
+            // 🪐 ORBITAL MECHANICS FOLDER
+            const fOrbits = gui.addFolder('🪐 Orbital Mechanics');
+            guiControllers.push(
+                fOrbits.add(settings, 'planetCount', 3, 9, 1).name('Planet Count').onChange(() => createOrbitalSystem()),
+                fOrbits.add(settings, 'systemRadius', 100, 350, 10).name('System Radius').onChange(() => createOrbitalSystem()),
+                fOrbits.add(settings, 'orbitEccentricity', 0.0, 0.6, 0.01).name('Eccentricity').onChange(() => createOrbitalSystem()),
+                fOrbits.add(settings, 'orbitTilt', 0.0, 0.5, 0.01).name('Orbit Tilt').onChange(() => createOrbitalSystem()),
+                fOrbits.add(settings, 'rimPower', 1.0, 5.0, 0.1).name('Rim Sharpness').onChange(() => updateSceneTheme()),
+                fOrbits.add(settings, 'rimIntensity', 0.5, 4.0, 0.1).name('Rim Intensity').onChange(() => updateSceneTheme()),
+                fOrbits.add(settings, 'showOrbitGuides').name('Show Orbit Paths').onChange(v => {
+                    planetObjects.forEach(p => { if (p.guideLine) p.guideLine.material.opacity = v && !settings.greenscreen ? 0.12 : 0.0; });
+                }),
+                fOrbits.add(settings, 'trailOpacity', 0.0, 1.0, 0.05).name('Trail Opacity').onChange(v => {
+                    planetObjects.forEach(p => { if (p.trailMat) p.trailMat.uniforms.uGlobalOpacity.value = settings.greenscreen ? 0.0 : v; });
+                })
+            );
+
+            // ✨ BOKEH ATMOSPHERE FOLDER
+            const fBokeh = gui.addFolder('✨ Bokeh Atmosphere');
+            guiControllers.push(
+                fBokeh.add(settings, 'bokehCount', 50, 600, 1).name('Bokeh Count').onChange(() => createBokehField()),
+                fBokeh.add(settings, 'bokehSize', 10.0, 70.0, 1.0).name('Bokeh Size').onChange(v => {
+                    if (bokehMaterial) bokehMaterial.uniforms.uBaseSize.value = v;
+                })
+            );
+
+            // 📽️ POST PROCESSOR ATTACHED FOLDER
+            postProcessor.attachGUI(gui, '✨ Post-Processing Suite');
+
+            // ⚙️ SYSTEM & INTERACTION
+            const fSys = gui.addFolder('⚙️ System & Controls');
+            guiControllers.push(
+                fSys.add(settings, 'dpr', 0.5, 3.0, 0.1).name('Pixel Ratio (DPR)').onChange(v => {
+                    renderer.setPixelRatio(v);
+                    postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+                    if (bokehMaterial) bokehMaterial.uniforms.uPixelRatio.value = v;
+                    if (starfieldMaterial) starfieldMaterial.uniforms.uPixelRatio.value = v;
+                    if (cosmicDustMaterial) cosmicDustMaterial.uniforms.uPixelRatio.value = v;
+                }),
+                fSys.add(settings, 'clickToRandomize').name('Click Scene: Mutate'),
+                fSys.add({ randomize: () => randomizeScene() }, 'randomize').name('🎲 Randomize Now!'),
+                fSys.add({ reset: () => resetToDefaults() }, 'reset').name('↺ Reset Defaults')
+            );
+        }
+
+        function syncGuiDisplay() {
+            guiControllers.forEach(controller => {
+                if (controller && typeof controller.updateDisplay === 'function') {
+                    controller.updateDisplay();
+                }
+            });
+        }
+
+        // --- KEYBOARD LISTENER (TOGGLE UI WITH "H") ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'h' || e.key === 'H') {
+                if (gui._hidden) {
+                    gui.show();
+                } else {
+                    gui.hide();
+                }
+            }
+        });
+
+        // --- POINTER CLICK LISTENER (CLICK SCENE TO RANDOMIZE) ---
+        let pointerDownPos = { x: 0, y: 0, time: 0 };
+
+        window.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('.lil-gui')) return;
+            pointerDownPos = { x: e.clientX, y: e.clientY, time: performance.now() };
+        });
+
+        window.addEventListener('pointerup', (e) => {
+            if (e.target.closest('.lil-gui')) return;
+            const dx = e.clientX - pointerDownPos.x;
+            const dy = e.clientY - pointerDownPos.y;
+            const dt = performance.now() - pointerDownPos.time;
+            const dist = Math.hypot(dx, dy);
+
+            if (dist < 6 && dt < 350 && settings.clickToRandomize) {
+                randomizeScene();
+            }
+        });
+
+        // --- WINDOW RESIZE HANDLER ---
+        window.addEventListener('resize', () => {
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            renderer.setSize(width, height);
+            postProcessor.setSize(width, height, settings.dpr);
+        });
+
+        // --- INITIALIZATION ---
+        createCentralStar();
+        createStarfield();
+        createCosmicDust();
+        createBokehField();
+        createComets();
+        createOrbitalSystem();
+        updateSceneTheme();
+        buildGUI();
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,2024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Happy Town 3D - Post-Processed</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #FFFFFF;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #webgl-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+    #webgl-canvas.is-dragging {
+      cursor: grabbing;
+    }
+  </style>
+  <script src="https://unpkg.com/zdog@1/dist/zdog.dist.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import GUI from 'lil-gui';
+
+    // =========================================================================================
+    // POST PROCESSOR SUITE (Three.js Shader Post-Processing Pipeline)
+    // =========================================================================================
+
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+    }
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+      fragColor.a = 1.0;
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoQuad.frustumCulled = false;
+        this.orthoScene.add(this.orthoQuad);
+
+        this.fbo = createFBO(1, 1, options);
+      }
+
+      get texture() {
+        return this.fbo.texture;
+      }
+
+      render(renderer, toScreen = false) {
+        if (toScreen) {
+          renderer.setRenderTarget(null);
+        } else {
+          renderer.setRenderTarget(this.fbo);
+        }
+        renderer.render(this.orthoScene, this.orthoCamera);
+      }
+
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.fbo.setSize(w, h);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoQuad.frustumCulled = false;
+        this.orthoScene.add(this.orthoQuad);
+
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.index = 0;
+      }
+
+      get current() {
+        return this.fbos[this.index];
+      }
+
+      get texture() {
+        return this.current.texture;
+      }
+
+      render(renderer) {
+        this.index = 1 - this.index;
+        renderer.setRenderTarget(this.current);
+        renderer.render(this.orthoScene, this.orthoCamera);
+      }
+
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.6,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.35,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.4,
+
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.015,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.3,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.01,
+
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.shader.uniforms.inputTexture.value = this.finalPass.texture;
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = 'Post-Processing Suite') {
+        const root = gui.addFolder(title);
+        root.add(this.settings, 'enabled').name('Enable Suite');
+
+        const bloom = root.addFolder('Bloom');
+        bloom.add(this.settings, 'bloomEnabled').name('Enable Bloom').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomStrength', 0, 3.0, 0.05).name('Strength').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomRadius', 0, 2.0, 0.05).name('Radius').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomThreshold', 0, 1.0, 0.01).name('Threshold').onChange(() => this.updateSettings());
+
+        const lens = root.addFolder('Lens, Optics & Fisheye');
+        lens.add(this.settings, 'fisheyeStrength', -1.0, 1.5, 0.01).name('Fisheye Distortion').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'fisheyeRadius', 0.2, 2.0, 0.05).name('Fisheye Radius').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'chromaticAberration', 0, 0.2, 0.005).name('Chromatic Aberration').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteBoost', 0, 2.0, 0.05).name('Vignette Boost').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteReduction', 0, 2.0, 0.05).name('Vignette Falloff').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'noiseIntensity', 0, 0.1, 0.005).name('Film Grain').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'gamma', 0.2, 2.0, 0.05).name('Gamma').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'minInputLevel', 0, 0.5, 0.01).name('Black Level').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'maxInputLevel', 0.5, 1.0, 0.01).name('White Level').onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // =========================================================================================
+    // HAPPY TOWN 3D SCENE & ENGINE
+    // =========================================================================================
+
+    const TAU = Zdog.TAU;
+
+    [Zdog.Shape, Zdog.Rect, Zdog.Ellipse].forEach(ItemClass => {
+      ItemClass.defaults.fill = true;
+      ItemClass.defaults.stroke = false;
+    });
+
+    const colorSchemes = {
+      'Original Town': {
+        red: '#F44444',
+        navy: '#224477',
+        blue: '#55AAEE',
+        gold: '#FFBB33',
+        white: '#FFFFFF',
+        background: '#FFFFFF'
+      },
+      'Black & White': {
+        red: '#CCCCCC',
+        navy: '#111111',
+        blue: '#666666',
+        gold: '#999999',
+        white: '#FFFFFF',
+        background: '#0A0A0A'
+      },
+      'White & Black': {
+        red: '#333333',
+        navy: '#EEEEEE',
+        blue: '#777777',
+        gold: '#444444',
+        white: '#111111',
+        background: '#FFFFFF'
+      },
+      'Sunset Warmth': {
+        red: '#E05A47',
+        navy: '#2C1E38',
+        blue: '#4A7B82',
+        gold: '#E8A838',
+        white: '#F6ECE1',
+        background: '#F7E4D8'
+      },
+      'Cyberpunk Neon': {
+        red: '#FF0055',
+        navy: '#0A0E2A',
+        blue: '#00F0FF',
+        gold: '#FFE600',
+        white: '#E8FCFF',
+        background: '#080918'
+      }
+    };
+
+    const params = {
+      colorScheme: 'Original Town',
+      greenscreen: false,
+      colorRed: colorSchemes['Original Town'].red,
+      colorNavy: colorSchemes['Original Town'].navy,
+      colorBlue: colorSchemes['Original Town'].blue,
+      colorGold: colorSchemes['Original Town'].gold,
+      colorWhite: colorSchemes['Original Town'].white,
+      colorBackground: colorSchemes['Original Town'].background,
+
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+      zoom: 3.5,
+      panX: 0,
+      panY: 0,
+      rotateX: 0,
+      rotateY: TAU / 8,
+
+      animation: 'Classic Orbit',
+      speed: 1.0,
+      isSpinning: true,
+
+      clickToRandomize: true,
+
+      frontWidth: 22,
+      frontHeight: 20,
+      frontDepth: 16,
+      leftWidth: 16,
+      leftHeight: 20,
+      leftDepth: 22,
+      towerHeight: 28,
+      churchHeight: 28,
+      sunHeight: -52,
+      cloudCount: 3,
+
+      resetView: () => resetCamera(),
+      randomizeNow: () => triggerRandomization()
+    };
+
+    // Offscreen 2D canvas for Zdog rendering
+    const offscreenCanvas = document.createElement('canvas');
+    const zdogCtx = offscreenCanvas.getContext('2d');
+
+    // Fullscreen WebGL canvas for Three.js + PostProcessor
+    const webglCanvas = document.getElementById('webgl-canvas');
+    const renderer = new THREE.WebGLRenderer({
+      canvas: webglCanvas,
+      antialias: false,
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: false
+    });
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+    const postProcessor = new PostProcessor(renderer);
+
+    const canvasTexture = new THREE.CanvasTexture(offscreenCanvas);
+    canvasTexture.minFilter = THREE.LinearFilter;
+    canvasTexture.magFilter = THREE.LinearFilter;
+    canvasTexture.generateMipmaps = false;
+
+    // Setup Zdog Illustration targeting offscreen canvas
+    const illo = new Zdog.Illustration({
+      element: offscreenCanvas,
+      zoom: params.zoom,
+      rotate: { y: params.rotateY, x: params.rotateX },
+      translate: { x: params.panX, y: params.panY },
+      dragRotate: false
+    });
+
+    const quarterView = 1 / Math.sin(TAU / 8);
+
+    let town = null;
+    let flatEarth = null;
+    let sky = null;
+
+    function getColors() {
+      return {
+        red: params.colorRed,
+        navy: params.colorNavy,
+        blue: params.colorBlue,
+        gold: params.colorGold,
+        white: params.colorWhite
+      };
+    }
+
+    // -------------------------------------------------------------
+    // Geometry Builders
+    // -------------------------------------------------------------
+
+    function makeBuilding(options) {
+      const colors = getColors();
+      const wallX = options.width / 2;
+      const wallY = options.height;
+      const wallZ = options.depth / 2;
+      const building = {};
+
+      // South / North walls
+      [true, false].forEach(isSouth => {
+        const wallTZ = isSouth ? -wallZ : wallZ;
+        const wallGroup = new Zdog.Group({
+          addTo: options.addTo,
+          translate: { z: -wallTZ }
+        });
+
+        let wallPath = [{ x: -wallX, y: -wallY }];
+        if (options.gable === 'ns') {
+          wallPath.push({ x: 0, y: -wallY - wallX });
+        }
+        wallPath = wallPath.concat([
+          { x: wallX, y: -wallY },
+          { x: wallX, y: 0 },
+          { x: -wallX, y: 0 }
+        ]);
+
+        new Zdog.Shape({
+          path: wallPath,
+          addTo: wallGroup,
+          color: isSouth ? colors.red : colors.gold
+        });
+
+        const windowColor = isSouth ? colors.navy : colors.red;
+        const windowProperty = isSouth ? 'southWindows' : 'northWindows';
+        handleWindows(options, windowProperty, wallGroup, windowColor);
+
+        building[isSouth ? 'southWall' : 'northWall'] = wallGroup;
+      });
+
+      // East / West walls
+      [true, false].forEach(isWest => {
+        const wallGroup = new Zdog.Group({
+          addTo: options.addTo,
+          translate: { x: isWest ? -wallX : wallX },
+          rotate: { y: TAU / 4 }
+        });
+
+        let wallPath = [{ x: -wallZ, y: -wallY }];
+        if (options.gable === 'ew') {
+          wallPath.push({ x: 0, y: -wallY - wallZ });
+        }
+        wallPath = wallPath.concat([
+          { x: wallZ, y: -wallY },
+          { x: wallZ, y: 0 },
+          { x: -wallZ, y: 0 }
+        ]);
+
+        new Zdog.Shape({
+          path: wallPath,
+          addTo: wallGroup,
+          color: isWest ? colors.blue : colors.white
+        });
+
+        const windowColor = isWest ? colors.navy : colors.blue;
+        const windowProperty = isWest ? 'westWindows' : 'eastWindows';
+        handleWindows(options, windowProperty, wallGroup, windowColor);
+
+        building[isWest ? 'westWall' : 'eastWall'] = wallGroup;
+      });
+
+      // Roofs
+      const roofMakers = {
+        ns: function() {
+          const y0 = -wallY - wallX;
+          const roofPanel = new Zdog.Shape({
+            path: [
+              { x: 0, y: y0, z: wallZ },
+              { x: 0, y: y0, z: -wallZ },
+              { x: wallX, y: -wallY, z: -wallZ },
+              { x: wallX, y: -wallY, z: wallZ }
+            ],
+            addTo: options.addTo,
+            color: colors.gold
+          });
+          roofPanel.copy({
+            scale: { x: -1 },
+            color: colors.navy
+          });
+        },
+        ew: function() {
+          const y0 = -wallY - wallZ;
+          const xA = options.isChurch ? -wallX + 8 : -wallX;
+          const roofPanel = new Zdog.Shape({
+            path: [
+              { z: 0, y: y0, x: xA },
+              { z: 0, y: y0, x: wallX },
+              { z: -wallZ, y: -wallY, x: wallX },
+              { z: -wallZ, y: -wallY, x: xA }
+            ],
+            addTo: options.addTo,
+            color: colors.red
+          });
+          roofPanel.copy({
+            path: [
+              { z: 0, y: y0, x: -wallX },
+              { z: 0, y: y0, x: wallX },
+              { z: -wallZ, y: -wallY, x: wallX },
+              { z: -wallZ, y: -wallY, x: -wallX }
+            ],
+            scale: { z: -1 },
+            color: colors.navy
+          });
+        }
+      };
+
+      const roofMaker = roofMakers[options.gable];
+      if (roofMaker) {
+        roofMaker();
+      }
+
+      return building;
+    }
+
+    function handleWindows(options, windowProperty, wallGroup, color) {
+      const windowOption = options[windowProperty];
+      if (!windowOption) return;
+
+      const columns = windowOption[0];
+      const rows = windowOption[1];
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < columns; col++) {
+          const x = (col - (columns - 1) / 2) * 6;
+          const y = -options.height + (row + 0.75) * 8;
+          const windowPath = [
+            { x: x - 1, y: y - 2 },
+            { x: x + 1, y: y - 2 },
+            { x: x + 1, y: y + 2 },
+            { x: x - 1, y: y + 2 }
+          ];
+          new Zdog.Shape({
+            path: windowPath,
+            addTo: wallGroup,
+            color: color
+          });
+        }
+      }
+    }
+
+    function lilPyramid(options) {
+      const colors = getColors();
+      const anchor = new Zdog.Anchor({
+        addTo: options.addTo,
+        translate: options.translate
+      });
+
+      const panel = new Zdog.Shape({
+        path: [
+          { x: 0, y: -3, z: 0 },
+          { x: 3, y: 0, z: 0 },
+          { x: 0, y: 0, z: 3 }
+        ],
+        addTo: anchor,
+        color: colors.red
+      });
+
+      panel.copy({ rotate: { y: TAU / 4 }, color: colors.red });
+      panel.copy({ rotate: { y: TAU / 2 }, color: colors.navy });
+      panel.copy({ rotate: { y: TAU * 3 / 4 }, color: colors.navy });
+    }
+
+    function hedge(options) {
+      const colors = getColors();
+      const anchor = new Zdog.Anchor({
+        addTo: options.addTo,
+        translate: options.translate
+      });
+
+      const ball = new Zdog.Shape({
+        path: [{ y: 0 }, { y: -1 }],
+        addTo: anchor,
+        translate: { y: -2.5 },
+        stroke: 5,
+        color: options.color || colors.navy
+      });
+
+      ball.copy({ stroke: 4, translate: { y: -5 } });
+      ball.copy({ stroke: 2.5, translate: { y: -7.5 } });
+    }
+
+    // -------------------------------------------------------------
+    // Build Scene Graph
+    // -------------------------------------------------------------
+
+    function buildScene() {
+      while (illo.children.length > 0) {
+        illo.children[0].remove();
+      }
+
+      const colors = getColors();
+
+      town = new Zdog.Group({
+        addTo: illo,
+        translate: { y: 36 },
+        scale: { x: quarterView, z: quarterView },
+        updateSort: true
+      });
+
+      flatEarth = new Zdog.Ellipse({
+        diameter: 128,
+        addTo: illo,
+        translate: town.translate,
+        rotate: { x: TAU / 4 },
+        stroke: 8,
+        color: colors.navy
+      });
+
+      sky = new Zdog.Group({
+        addTo: illo,
+        translate: town.translate
+      });
+
+      const topYs = [
+        -64, -64, -52, -52,
+        -44, -44, -36, -36,
+        -44, -44, -52, -52,
+        -60, -60, -52, -52
+      ];
+      const bottomYs = [
+        -24, -24, -16, -16,
+        -8, -8, 0, 0,
+        -8, -8, -16, -16,
+        -24, -24, -32, -32
+      ];
+      const radius = 64;
+      const skyPanelCount = topYs.length;
+      const angle = TAU / skyPanelCount;
+      const panelWidth = Math.tan(angle / 2) * radius * 2;
+
+      for (let i = 0; i < skyPanelCount; i++) {
+        const nextI = (i + 1) % skyPanelCount;
+        const topYA = topYs[i];
+        const topYB = topYs[nextI];
+        const bottomYA = bottomYs[i];
+        const bottomYB = bottomYs[nextI];
+        const panelAnchor = new Zdog.Anchor({
+          addTo: sky,
+          rotate: { y: angle * i - TAU / 4 },
+          translate: { y: 1 }
+        });
+        new Zdog.Shape({
+          path: [
+            { x: -panelWidth / 2, y: topYA },
+            { bezier: [
+              { x: 0, y: topYA },
+              { x: 0, y: topYB },
+              { x: panelWidth / 2, y: topYB }
+            ]},
+            { x: panelWidth / 2, y: bottomYB },
+            { bezier: [
+              { x: 0, y: bottomYB },
+              { x: 0, y: bottomYA },
+              { x: -panelWidth / 2, y: bottomYA }
+            ]}
+          ],
+          addTo: panelAnchor,
+          translate: { z: -radius },
+          color: colors.blue,
+          stroke: 1,
+          backface: false
+        });
+      }
+
+      // ----- Front Building -----
+      const frontAnchor = new Zdog.Anchor({
+        addTo: town,
+        translate: { x: 16, y: -4, z: 20 }
+      });
+
+      const frontBuilding = makeBuilding({
+        width: params.frontWidth,
+        depth: params.frontDepth,
+        height: params.frontHeight,
+        addTo: frontAnchor,
+        gable: 'ew',
+        southWindows: [3, 1],
+        eastWindows: [2, 2],
+        westWindows: [2, 2],
+        northWindows: [3, 2]
+      });
+
+      const gableDot = new Zdog.Ellipse({
+        diameter: 2,
+        addTo: frontBuilding.eastWall,
+        color: colors.blue,
+        translate: { y: -params.frontHeight }
+      });
+      gableDot.copy({
+        addTo: frontBuilding.westWall,
+        color: colors.navy
+      });
+
+      const door = new Zdog.Shape({
+        path: [
+          { x: -2.5, y: 0 },
+          { x: -2.5, y: -5.5 },
+          { arc: [
+            { x: -2.5, y: -8 },
+            { x: 0, y: -8 }
+          ]},
+          { arc: [
+            { x: 2.5, y: -8 },
+            { x: 2.5, y: -5.5 }
+          ]},
+          { x: 2.5, y: 0 }
+        ],
+        addTo: frontBuilding.southWall,
+        translate: { x: -4.5 },
+        color: colors.navy
+      });
+      door.copy({ translate: { x: 4.5 } });
+
+      [-1, 1].forEach(zSide => {
+        const frontGableGroup = new Zdog.Group({
+          addTo: frontAnchor,
+          translate: { y: -params.frontHeight, z: -8 * zSide }
+        });
+
+        new Zdog.Shape({
+          path: [
+            { x: 0, y: -6 },
+            { x: -6, y: 0 },
+            { x: 6, y: 0 }
+          ],
+          addTo: frontGableGroup,
+          translate: { y: 1 },
+          color: zSide === -1 ? colors.red : colors.gold
+        });
+
+        gableDot.copy({
+          addTo: frontGableGroup,
+          translate: { y: -2 },
+          color: zSide === -1 ? colors.navy : colors.red
+        });
+
+        const frontGableSide = new Zdog.Shape({
+          path: [
+            { x: 0, y: 0, z: 0 },
+            { x: 5, y: 5, z: 0 },
+            { x: 0, y: 0, z: 5 * zSide }
+          ],
+          addTo: frontAnchor,
+          translate: { y: -params.frontHeight - 5, z: -8 * zSide },
+          color: colors.gold
+        });
+        frontGableSide.copy({
+          scale: { x: -1 },
+          color: colors.navy
+        });
+      });
+
+      // ----- Left Building -----
+      const leftAnchor = new Zdog.Anchor({
+        addTo: town,
+        translate: { x: -13, y: -10, z: 23 }
+      });
+
+      const leftBuilding = makeBuilding({
+        width: params.leftWidth,
+        depth: params.leftDepth,
+        height: params.leftHeight,
+        addTo: leftAnchor,
+        gable: 'ns',
+        southWindows: [2, 2],
+        eastWindows: [3, 2],
+        westWindows: [3, 1],
+        northWindows: [2, 2]
+      });
+
+      door.copy({
+        addTo: leftBuilding.westWall,
+        translate: { x: -4.5 }
+      });
+      door.copy({
+        addTo: leftBuilding.westWall,
+        translate: { x: 4.5 }
+      });
+
+      // ----- Cupola -----
+      const cupolaNSPanel = new Zdog.Shape({
+        path: [
+          { x: -1, y: 0 },
+          { x: 3, y: 0 },
+          { x: 3, y: 9 },
+          { x: -1, y: 5 },
+          { move: { x: 8, z: 4 } }
+        ],
+        addTo: leftAnchor,
+        translate: { y: -params.leftHeight - 14, z: 3 },
+        color: colors.red
+      });
+      cupolaNSPanel.copy({ scale: { x: -1 } });
+      cupolaNSPanel.copy({
+        scale: { z: -1 },
+        translate: { y: -params.leftHeight - 14, z: -3 },
+        color: colors.gold
+      });
+      cupolaNSPanel.copy({
+        translate: { y: -params.leftHeight - 14, z: -3 },
+        scale: { x: -1, z: -1 },
+        color: colors.gold
+      });
+
+      [-1, 1].forEach(xSide => {
+        const group = new Zdog.Group({
+          addTo: leftAnchor,
+          translate: { y: -params.leftHeight - 14, x: 3 * xSide }
+        });
+        new Zdog.Shape({
+          path: [
+            { z: 3, y: 0 },
+            { z: 0, y: -3 },
+            { z: -3, y: 0 },
+            { z: -3, y: 9 },
+            { z: 3, y: 9 },
+            { move: { x: 16 * xSide } }
+          ],
+          addTo: group,
+          color: xSide === -1 ? colors.blue : colors.white
+        });
+        gableDot.copy({
+          addTo: group,
+          translate: { y: 3 },
+          rotate: { y: TAU / 4 },
+          color: xSide === -1 ? colors.navy : colors.blue
+        });
+      });
+
+      const cupolaRoofPanel = new Zdog.Shape({
+        path: [
+          { x: -3, y: -3, z: 0 },
+          { x: 3, y: -3, z: 0 },
+          { x: 3, y: 0, z: 3 },
+          { x: -3, y: 0, z: 3 }
+        ],
+        addTo: leftAnchor,
+        translate: { y: -params.leftHeight - 14 },
+        color: colors.navy
+      });
+      cupolaRoofPanel.copy({
+        scale: { z: -1 },
+        color: colors.red
+      });
+
+      // ----- Left Building Slopes -----
+      const leftEWSlope = new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 11 },
+          { x: 0, y: 0, z: -11 },
+          { x: 6, y: 6, z: -11 },
+          { x: 6, y: 6, z: 11 }
+        ],
+        addTo: leftAnchor,
+        translate: { x: 8 },
+        color: colors.gold
+      });
+      leftEWSlope.copy({
+        scale: { x: -1 },
+        translate: { x: -8 },
+        color: colors.gold
+      });
+
+      new Zdog.Shape({
+        path: [
+          { z: 0, y: 0, x: -8 },
+          { z: 0, y: 0, x: 8 },
+          { z: 6, y: 6, x: 8 },
+          { z: 6, y: 6, x: -8 }
+        ],
+        addTo: leftAnchor,
+        translate: { z: 11 },
+        color: colors.navy
+      });
+
+      const leftCorner = new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 0 },
+          { x: 6, y: 6, z: 0 },
+          { x: 0, y: 6, z: 6 }
+        ],
+        addTo: leftAnchor,
+        translate: { x: 8, z: 11 },
+        color: colors.red
+      });
+      leftCorner.copy({
+        scale: { x: -1 },
+        translate: { x: -8, z: 11 },
+        color: colors.blue
+      });
+
+      // ----- Back Tower -----
+      const towerAnchor = new Zdog.Anchor({
+        addTo: town,
+        translate: { x: -13, y: -24, z: -4 }
+      });
+
+      const tower = makeBuilding({
+        width: 16,
+        depth: 16,
+        height: params.towerHeight,
+        addTo: towerAnchor,
+        gable: 'ns',
+        southWindows: [2, 3],
+        eastWindows: [2, 2],
+        westWindows: [2, 3],
+        northWindows: [2, 3]
+      });
+
+      door.copy({
+        addTo: tower.eastWall,
+        translate: { x: 0 },
+        color: colors.blue
+      });
+
+      gableDot.copy({
+        addTo: tower.southWall,
+        translate: { y: -params.towerHeight - 1 },
+        color: colors.navy
+      });
+
+      gableDot.copy({
+        addTo: tower.northWall,
+        translate: { y: -params.towerHeight - 1 },
+        color: colors.red
+      });
+
+      const towerChimney = new Zdog.Shape({
+        addTo: towerAnchor,
+        path: [{ y: 0 }, { y: 4 }],
+        translate: { x: -2, y: -params.towerHeight - 9, z: 1 },
+        stroke: 2,
+        color: colors.navy
+      });
+      towerChimney.copy({
+        translate: { x: -2, y: -params.towerHeight - 9, z: -3 }
+      });
+
+      new Zdog.Shape({
+        path: [
+          { x: -3, y: 1 },
+          { arc: [
+            { x: -3, y: -1 },
+            { x: -1, y: -1 }
+          ]},
+          { x: 3, y: -1 },
+          { arc: [
+            { x: 3, y: 1 },
+            { x: 1, y: 1 }
+          ]}
+        ],
+        addTo: towerAnchor,
+        translate: { x: -2, y: -params.towerHeight - 14, z: -6 },
+        rotate: { y: -TAU / 4 },
+        stroke: 2,
+        color: colors.blue
+      });
+
+      const towerEWSlope = new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 1 },
+          { x: 0, y: 0, z: -1 },
+          { x: 1, y: 1, z: -1 },
+          { x: 1, y: 1, z: 1 }
+        ],
+        addTo: towerAnchor,
+        translate: { x: 8 },
+        scale: { x: 20, y: 20, z: 8 },
+        color: colors.gold
+      });
+
+      const towerNSSLope = new Zdog.Shape({
+        path: [
+          { z: 0, y: 0, x: 1 },
+          { z: 0, y: 0, x: -1 },
+          { z: 1, y: 1, x: -1 },
+          { z: 1, y: 1, x: 1 }
+        ],
+        addTo: towerAnchor,
+        translate: { z: 8 },
+        scale: { x: 8, y: 14, z: 8 },
+        color: colors.navy
+      });
+
+      new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 0 },
+          { x: 20, y: 20, z: 0 },
+          { x: 6, y: 20, z: 8 },
+          { x: 0, y: 14, z: 8 }
+        ],
+        addTo: towerAnchor,
+        translate: { x: 8, z: 8 },
+        color: colors.red
+      });
+
+      towerNSSLope.copy({
+        translate: { z: -8 },
+        scale: { x: 8, y: 20, z: -7 },
+        color: colors.gold
+      });
+
+      new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 0 },
+          { x: 20, y: 20, z: 0 },
+          { x: 0, y: 20, z: -7 }
+        ],
+        addTo: towerAnchor,
+        translate: { x: 8, z: -8 },
+        color: colors.gold
+      });
+
+      towerEWSlope.copy({
+        scale: { x: -12, y: 20, z: 8 },
+        translate: { x: -8 },
+        color: colors.gold
+      });
+
+      new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 0 },
+          { x: -12, y: 20, z: 0 },
+          { x: 0, y: 20, z: -7 }
+        ],
+        addTo: towerAnchor,
+        translate: { x: -8, z: -8 },
+        color: colors.red
+      });
+
+      new Zdog.Shape({
+        path: [
+          { x: 0, y: 0, z: 0 },
+          { x: -12, y: 20, z: 0 },
+          { x: -6, y: 20, z: 8 },
+          { x: 0, y: 14, z: 8 }
+        ],
+        addTo: towerAnchor,
+        translate: { x: -8, z: 8 },
+        color: colors.blue
+      });
+
+      // ----- Church -----
+      const churchAnchor = new Zdog.Anchor({
+        addTo: town,
+        translate: { x: -5, y: -4, z: -27 }
+      });
+
+      const church = makeBuilding({
+        isChurch: true,
+        width: 22,
+        depth: 16,
+        height: params.churchHeight,
+        addTo: churchAnchor,
+        gable: 'ew',
+        southWindows: [3, 2],
+        eastWindows: [2, 2],
+        northWindows: [3, 2]
+      });
+
+      door.copy({
+        addTo: church.westWall,
+        translate: { x: -3.5 }
+      });
+      door.copy({
+        addTo: church.westWall,
+        translate: { x: 3.5 }
+      });
+
+      new Zdog.Ellipse({
+        diameter: 8,
+        addTo: church.westWall,
+        translate: { y: -22 },
+        color: colors.navy
+      });
+
+      // ----- Bell Tower -----
+      const bellTowerAnchor = new Zdog.Anchor({
+        addTo: churchAnchor,
+        translate: { x: -7, y: -params.churchHeight - 8, z: -4 }
+      });
+
+      new Zdog.Rect({
+        width: 8,
+        height: 8,
+        addTo: bellTowerAnchor,
+        translate: { y: -12 },
+        rotate: { x: TAU / 4 },
+        color: colors.navy
+      });
+
+      const wallColors = [colors.red, colors.white, colors.gold, colors.blue];
+      const accentColors = [colors.navy, colors.blue, colors.red, colors.navy];
+      const roofColors = [colors.navy, colors.gold, colors.red, colors.navy];
+
+      for (let i = 0; i < 4; i++) {
+        const wallAnchor = new Zdog.Anchor({
+          addTo: bellTowerAnchor,
+          rotate: { y: (TAU / 4) * -i }
+        });
+        const bottomWallGroup = new Zdog.Group({
+          addTo: wallAnchor,
+          translate: { z: 4 }
+        });
+
+        new Zdog.Rect({
+          width: 8,
+          height: 12,
+          addTo: bottomWallGroup,
+          translate: { y: -6 },
+          color: wallColors[i]
+        });
+        new Zdog.Ellipse({
+          diameter: 4,
+          addTo: bottomWallGroup,
+          translate: { y: -4 },
+          color: accentColors[i]
+        });
+        new Zdog.Rect({
+          width: 8,
+          height: 2,
+          addTo: bottomWallGroup,
+          translate: { y: -9 },
+          color: accentColors[i]
+        });
+
+        const topWallGroup = new Zdog.Group({
+          addTo: wallAnchor,
+          translate: { y: -12, z: 3 }
+        });
+        new Zdog.Rect({
+          width: 6,
+          height: 7,
+          addTo: topWallGroup,
+          translate: { y: -3.5 },
+          color: wallColors[i]
+        });
+        new Zdog.Rect({
+          width: 2,
+          height: 5,
+          addTo: topWallGroup,
+          translate: { y: -2.5 },
+          color: accentColors[i]
+        });
+
+        new Zdog.Shape({
+          path: [
+            { x: 0, y: 0, z: 0 },
+            { x: -3, y: 6, z: 3 },
+            { x: 3, y: 6, z: 3 }
+          ],
+          addTo: wallAnchor,
+          translate: { y: -25 },
+          color: roofColors[i]
+        });
+      }
+
+      new Zdog.Shape({
+        path: [
+          { z: 4, y: 0 },
+          { z: -4, y: -1 },
+          { z: -4, y: 8 }
+        ],
+        addTo: bellTowerAnchor,
+        translate: { x: 4 },
+        color: colors.white
+      });
+
+      const connector = new Zdog.Rect({
+        width: 8,
+        height: 10,
+        addTo: bellTowerAnchor,
+        translate: { z: -4, y: 4 },
+        color: colors.gold
+      });
+      connector.copy({
+        translate: { x: -4, y: 4 },
+        rotate: { y: TAU / 4 },
+        color: colors.blue
+      });
+
+      // ----- Hill -----
+      new Zdog.Shape({
+        path: [
+          { x: 0, y: 2 },
+          { x: 10, y: 2 },
+          { bezier: [
+            { x: 14, y: 2 },
+            { x: 20, y: 10 },
+            { x: 24, y: 10 }
+          ]},
+          { x: 30, y: 10 },
+          { arc: [
+            { x: 34, y: 10 },
+            { x: 34, y: 14 }
+          ]},
+          { x: 14, y: 14, z: 0 }
+        ],
+        addTo: town,
+        translate: { x: -6, y: -20, z: -12 },
+        stroke: 4,
+        color: colors.gold
+      });
+
+      // ----- Lil Pyramids -----
+      lilPyramid({ addTo: town, translate: { x: 6, z: 35, y: -4 } });
+      lilPyramid({ addTo: town, translate: { x: -34, z: 20, y: -4 } });
+      lilPyramid({ addTo: town, translate: { x: 35, z: 8, y: -4 } });
+      lilPyramid({ addTo: town, translate: { x: 31, z: -2, y: -4 } });
+      lilPyramid({ addTo: town, translate: { x: 22, z: -28, y: -4 } });
+
+      // ----- Hedges -----
+      hedge({ addTo: town, translate: { x: 24, y: -4, z: 4 } });
+      hedge({ addTo: town, translate: { x: -4, y: -4, z: -42 } });
+      hedge({ addTo: town, translate: { x: -30, y: -4, z: -18 } });
+      hedge({ addTo: town, translate: { x: 9, y: -4, z: -17 } });
+
+      // ----- Sun -----
+      new Zdog.Shape({
+        addTo: town,
+        translate: { x: -6, y: params.sunHeight, z: -42 },
+        stroke: 6,
+        color: colors.gold
+      });
+
+      // ----- Sky Particles -----
+      const skyDot = new Zdog.Shape({
+        translate: { x: -3, y: -48, z: 42 },
+        addTo: town,
+        stroke: 2,
+        color: colors.white
+      });
+      skyDot.copy({ translate: { x: 30, y: -28, z: -28 } });
+
+      const skyDiamond = new Zdog.Shape({
+        path: [
+          { x: 0, y: -1 },
+          { x: 1, y: 0 },
+          { x: 0, y: 1 },
+          { x: -1, y: 0 }
+        ],
+        addTo: town,
+        translate: { x: -27, y: -45, z: 29 },
+        scale: 0.75,
+        stroke: 0.5,
+        color: colors.white
+      });
+      skyDiamond.copy({ rotate: { y: TAU / 4 } });
+
+      const skyDiamond2 = skyDiamond.copy({
+        translate: { x: 8, y: -34, z: -42 }
+      });
+      skyDiamond2.copy({ rotate: { y: TAU / 4 } });
+
+      const skyStar = new Zdog.Shape({
+        path: [
+          { x: 0, y: -1 },
+          { arc: [{ x: 0, y: 0 }, { x: 1, y: 0 }] },
+          { arc: [{ x: 0, y: 0 }, { x: 0, y: 1 }] },
+          { arc: [{ x: 0, y: 0 }, { x: -1, y: 0 }] },
+          { arc: [{ x: 0, y: 0 }, { x: 0, y: -1 }] }
+        ],
+        addTo: town,
+        translate: { x: -39, y: -51, z: 12 },
+        scale: 1.5,
+        stroke: 1,
+        color: colors.white
+      });
+      skyStar.copy({ rotate: { y: TAU / 4 } });
+
+      const skyStar2 = skyStar.copy({
+        translate: { x: 29, y: -42, z: 30 },
+        color: colors.white
+      });
+      skyStar2.copy({ rotate: { y: TAU / 4 } });
+
+      // ----- Clouds -----
+      for (let c = 0; c < params.cloudCount; c++) {
+        const cOffsetY = c * -14;
+        const cOffsetZ = c * 18 - 10;
+        const cloud = new Zdog.Ellipse({
+          addTo: town,
+          diameter: 3,
+          quarters: 2,
+          translate: { x: -30, y: -56 + cOffsetY, z: 10 + cOffsetZ },
+          rotate: { y: TAU / 4, z: -TAU / 4 },
+          stroke: 2,
+          closed: true,
+          color: colors.white
+        });
+        cloud.copy({ translate: { x: -30, y: -57 + cOffsetY, z: 6 + cOffsetZ } });
+        cloud.copy({ translate: { x: -30, y: -56 + cOffsetY, z: 2 + cOffsetZ } });
+
+        new Zdog.Shape({
+          addTo: town,
+          path: [{ x: -1 }, { x: 1 }],
+          translate: { x: -30, y: -56 + cOffsetY, z: 6 + cOffsetZ },
+          scale: { x: 2 },
+          rotate: { y: TAU / 4 },
+          stroke: 2,
+          color: colors.white
+        });
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Canvas Resizing & DPR
+    // -------------------------------------------------------------
+
+    function resize() {
+      const dpr = params.dpr;
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+
+      // Resize offscreen canvas for Zdog
+      offscreenCanvas.width = Math.max(1, Math.floor(width * dpr));
+      offscreenCanvas.height = Math.max(1, Math.floor(height * dpr));
+      illo.setSize(offscreenCanvas.width, offscreenCanvas.height);
+      illo.zoom = params.zoom * dpr;
+
+      // Resize WebGL renderer & PostProcessor
+      renderer.setPixelRatio(dpr);
+      renderer.setSize(width, height, false);
+      postProcessor.setSize(width, height, dpr);
+
+      // Refresh texture dimensions
+      canvasTexture.image = offscreenCanvas;
+      canvasTexture.needsUpdate = true;
+    }
+
+    window.addEventListener('resize', resize);
+
+    // -------------------------------------------------------------
+    // View Reset
+    // -------------------------------------------------------------
+
+    function resetCamera() {
+      params.panX = 0;
+      params.panY = 0;
+      params.rotateX = 0;
+      params.rotateY = TAU / 8;
+      params.zoom = 3.5;
+
+      illo.translate.set({ x: 0, y: 0, z: 0 });
+      illo.rotate.set({ x: 0, y: TAU / 8, z: 0 });
+      illo.zoom = params.zoom * params.dpr;
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // -------------------------------------------------------------
+    // Procedural Randomization (Click to re-roll)
+    // -------------------------------------------------------------
+
+    const curatedHarmoniousPalettes = [
+      { red: '#F44444', navy: '#224477', blue: '#55AAEE', gold: '#FFBB33', white: '#FFFFFF', background: '#FFFFFF' },
+      { red: '#CCCCCC', navy: '#111111', blue: '#666666', gold: '#999999', white: '#FFFFFF', background: '#0A0A0A' },
+      { red: '#333333', navy: '#EEEEEE', blue: '#777777', gold: '#444444', white: '#111111', background: '#FFFFFF' },
+      { red: '#E05A47', navy: '#2C1E38', blue: '#4A7B82', gold: '#E8A838', white: '#F6ECE1', background: '#F7E4D8' },
+      { red: '#FF0055', navy: '#0A0E2A', blue: '#00F0FF', gold: '#FFE600', white: '#E8FCFF', background: '#080918' },
+      { red: '#FF6B6B', navy: '#1A535C', blue: '#4ECDC4', gold: '#FFE66D', white: '#F7FFF7', background: '#292F36' },
+      { red: '#E63946', navy: '#1D3557', blue: '#457B9D', gold: '#A8DADC', white: '#F1FAEE', background: '#F8F9FA' },
+      { red: '#F72585', navy: '#3A0CA3', blue: '#4361EE', gold: '#4CC9F0', white: '#FAFAFA', background: '#10002B' },
+      { red: '#D81159', navy: '#218380', blue: '#73D2DE', gold: '#FFBC42', white: '#FFFCF9', background: '#FFF7EE' },
+      { red: '#E76F51', navy: '#264653', blue: '#2A9D8F', gold: '#E9C46A', white: '#F4A261', background: '#FEFAE0' }
+    ];
+
+    const animationModes = [
+      'Classic Orbit',
+      'Isometric Float',
+      'Slow Panorama 360',
+      'Breeze & Wobble',
+      'Static Scene'
+    ];
+
+    function triggerRandomization() {
+      const palette = curatedHarmoniousPalettes[Math.floor(Math.random() * curatedHarmoniousPalettes.length)];
+
+      params.colorScheme = 'Custom';
+      params.colorRed = palette.red;
+      params.colorNavy = palette.navy;
+      params.colorBlue = palette.blue;
+      params.colorGold = palette.gold;
+      params.colorWhite = palette.white;
+      if (!params.greenscreen) {
+        params.colorBackground = palette.background;
+      }
+
+      params.frontWidth = Math.round(18 + Math.random() * 10);
+      params.frontHeight = Math.round(16 + Math.random() * 10);
+      params.frontDepth = Math.round(14 + Math.random() * 8);
+
+      params.leftWidth = Math.round(14 + Math.random() * 8);
+      params.leftHeight = Math.round(16 + Math.random() * 10);
+      params.leftDepth = Math.round(18 + Math.random() * 8);
+
+      params.towerHeight = Math.round(22 + Math.random() * 14);
+      params.churchHeight = Math.round(22 + Math.random() * 12);
+      params.sunHeight = Math.round(-40 - Math.random() * 20);
+      params.cloudCount = Math.round(1 + Math.random() * 3);
+
+      params.animation = animationModes[Math.floor(Math.random() * animationModes.length)];
+      params.speed = parseFloat((0.5 + Math.random() * 1.5).toFixed(2));
+
+      buildScene();
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // -------------------------------------------------------------
+    // Mouse & Touch Controls (Zoom & Drag object across screen)
+    // -------------------------------------------------------------
+
+    let isPointerDown = false;
+    let pointerStartX = 0;
+    let pointerStartY = 0;
+    let startRotateX = 0;
+    let startRotateY = 0;
+    let startPanX = 0;
+    let startPanY = 0;
+    let hasDragged = false;
+    let isPanDrag = false;
+
+    webglCanvas.addEventListener('pointerdown', e => {
+      isPointerDown = true;
+      hasDragged = false;
+      webglCanvas.classList.add('is-dragging');
+
+      pointerStartX = e.clientX;
+      pointerStartY = e.clientY;
+
+      startRotateX = illo.rotate.x;
+      startRotateY = illo.rotate.y;
+      startPanX = illo.translate.x;
+      startPanY = illo.translate.y;
+
+      isPanDrag = e.button === 2 || e.shiftKey || e.button === 1;
+    });
+
+    window.addEventListener('pointermove', e => {
+      if (!isPointerDown) return;
+
+      const dx = e.clientX - pointerStartX;
+      const dy = e.clientY - pointerStartY;
+
+      if (Math.hypot(dx, dy) > 4) {
+        hasDragged = true;
+      }
+
+      if (isPanDrag) {
+        params.panX = startPanX + dx / (params.zoom * 0.5);
+        params.panY = startPanY + dy / (params.zoom * 0.5);
+        illo.translate.x = params.panX;
+        illo.translate.y = params.panY;
+      } else {
+        params.rotateY = startRotateY - (dx / window.innerWidth) * TAU;
+        params.rotateX = startRotateX - (dy / window.innerHeight) * TAU;
+        illo.rotate.y = params.rotateY;
+        illo.rotate.x = params.rotateX;
+      }
+    });
+
+    window.addEventListener('pointerup', e => {
+      if (!isPointerDown) return;
+      isPointerDown = false;
+      webglCanvas.classList.remove('is-dragging');
+
+      if (!hasDragged && e.button === 0 && !e.shiftKey) {
+        if (params.clickToRandomize) {
+          triggerRandomization();
+        }
+      }
+    });
+
+    webglCanvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    webglCanvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+      params.zoom = Math.min(Math.max(params.zoom * zoomFactor, 0.5), 20);
+      illo.zoom = params.zoom * params.dpr;
+      gui.controllersRecursive().forEach(c => {
+        if (c.property === 'zoom') c.updateDisplay();
+      });
+    }, { passive: false });
+
+    // Hide/Show UI with 'H' key
+    let isUiHidden = false;
+    window.addEventListener('keydown', e => {
+      if (e.key === 'h' || e.key === 'H') {
+        isUiHidden = !isUiHidden;
+        gui.domElement.style.display = isUiHidden ? 'none' : '';
+      }
+    });
+
+    // -------------------------------------------------------------
+    // lil-gui Control Panel
+    // -------------------------------------------------------------
+
+    const gui = new GUI({ title: 'Scene Controls' });
+
+    // 1. Post-Processor Suite (Integrated GUI)
+    postProcessor.attachGUI(gui, 'Post-Processing Suite');
+
+    // 2. Color Themes Folder
+    const fTheme = gui.addFolder('Color Themes');
+    fTheme.add(params, 'colorScheme', Object.keys(colorSchemes).concat(['Custom'])).name('Theme').onChange(val => {
+      if (colorSchemes[val]) {
+        const sc = colorSchemes[val];
+        params.colorRed = sc.red;
+        params.colorNavy = sc.navy;
+        params.colorBlue = sc.blue;
+        params.colorGold = sc.gold;
+        params.colorWhite = sc.white;
+        params.colorBackground = sc.background;
+        buildScene();
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    });
+
+    fTheme.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => {
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    });
+
+    fTheme.addColor(params, 'colorBackground').name('Background').onChange(() => {
+      params.colorScheme = 'Custom';
+      gui.controllersRecursive().forEach(c => {
+        if (c.property === 'colorScheme') c.updateDisplay();
+      });
+    });
+
+    fTheme.addColor(params, 'colorRed').name('Color: Red/Brick').onChange(() => {
+      params.colorScheme = 'Custom';
+      buildScene();
+    });
+    fTheme.addColor(params, 'colorNavy').name('Color: Navy/Dark').onChange(() => {
+      params.colorScheme = 'Custom';
+      buildScene();
+    });
+    fTheme.addColor(params, 'colorBlue').name('Color: Blue/Sky').onChange(() => {
+      params.colorScheme = 'Custom';
+      buildScene();
+    });
+    fTheme.addColor(params, 'colorGold').name('Color: Gold/Sun').onChange(() => {
+      params.colorScheme = 'Custom';
+      buildScene();
+    });
+    fTheme.addColor(params, 'colorWhite').name('Color: White/Cloud').onChange(() => {
+      params.colorScheme = 'Custom';
+      buildScene();
+    });
+
+    // 3. Animation Folder
+    const fAnim = gui.addFolder('Animation');
+    fAnim.add(params, 'animation', animationModes).name('Motion Mode');
+    fAnim.add(params, 'speed', 0.0, 3.0, 0.05).name('Speed');
+    fAnim.add(params, 'isSpinning').name('Auto Animate');
+
+    // 4. Camera & View Folder
+    const fView = gui.addFolder('Camera & View');
+    fView.add(params, 'zoom', 0.5, 15.0, 0.1).name('Zoom').onChange(v => {
+      illo.zoom = v * params.dpr;
+    });
+    fView.add(params, 'panX', -100, 100, 1).name('Pan X').onChange(v => {
+      illo.translate.x = v;
+    });
+    fView.add(params, 'panY', -100, 100, 1).name('Pan Y').onChange(v => {
+      illo.translate.y = v;
+    });
+    fView.add(params, 'dpr', 0.5, 3.0, 0.25).name('Pixel Ratio (DPR)').onChange(() => {
+      resize();
+    });
+    fView.add(params, 'resetView').name('Reset Camera');
+
+    // 5. Procedural Generator Folder
+    const fProc = gui.addFolder('Procedural Generation');
+    fProc.add(params, 'clickToRandomize').name('Click Scene to Re-roll');
+    fProc.add(params, 'randomizeNow').name('Generate Random Town');
+    fProc.add(params, 'frontWidth', 12, 32, 1).name('Front Width').onChange(() => buildScene());
+    fProc.add(params, 'frontHeight', 12, 36, 1).name('Front Height').onChange(() => buildScene());
+    fProc.add(params, 'leftHeight', 12, 36, 1).name('Left Height').onChange(() => buildScene());
+    fProc.add(params, 'towerHeight', 16, 48, 1).name('Tower Height').onChange(() => buildScene());
+    fProc.add(params, 'churchHeight', 16, 44, 1).name('Church Height').onChange(() => buildScene());
+
+    // -------------------------------------------------------------
+    // Main Animation & Render Loop
+    // -------------------------------------------------------------
+
+    let t = 0;
+    const baseSpeed = 1 / 120;
+    let then = performance.now();
+
+    function update() {
+      const now = performance.now();
+      const delta = (now - then) / 1000;
+      then = now;
+
+      if (params.isSpinning && !isPointerDown) {
+        t += baseSpeed * params.speed * delta * 60;
+
+        switch (params.animation) {
+          case 'Classic Orbit': {
+            const theta = Zdog.easeInOut(t % 1) * TAU;
+            const rev = 1;
+            const spin = -theta * rev + TAU / 8;
+            const extraRotation = TAU * rev * Math.floor(t % 4);
+            illo.rotate.y = spin - extraRotation;
+            const everyOtherCycle = (t % 2) < 1;
+            illo.rotate.x = everyOtherCycle ? 0 : (Math.cos(theta) * -0.5 + 0.5) * TAU * -1 / 8;
+            town.translate.y = 36;
+            break;
+          }
+
+          case 'Isometric Float': {
+            illo.rotate.y = TAU / 8 + Math.sin(t * 0.4) * 0.25;
+            illo.rotate.x = -TAU / 16 + Math.cos(t * 0.3) * 0.08;
+            town.translate.y = 36 + Math.sin(t * 0.8) * 4;
+            break;
+          }
+
+          case 'Slow Panorama 360': {
+            illo.rotate.y = (TAU / 8) + (t * 0.15) * TAU;
+            illo.rotate.x = -TAU / 24 + Math.sin(t * 0.1) * 0.03;
+            town.translate.y = 36;
+            break;
+          }
+
+          case 'Breeze & Wobble': {
+            illo.rotate.y = TAU / 8 + Math.sin(t * 0.3) * 0.35;
+            illo.rotate.x = -TAU / 20 + Math.sin(t * 0.6) * 0.12;
+            town.translate.y = 36 + Math.cos(t * 0.5) * 3;
+            break;
+          }
+
+          case 'Static Scene': {
+            town.translate.y = 36;
+            break;
+          }
+        }
+      }
+
+      illo.normalizeRotate();
+      illo.updateGraph();
+    }
+
+    function render() {
+      const activeBg = params.greenscreen ? '#00ff00' : params.colorBackground;
+      document.body.style.backgroundColor = activeBg;
+
+      // 1. Fill entire offscreen canvas with chosen background color or greenscreen
+      zdogCtx.fillStyle = activeBg;
+      zdogCtx.fillRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+
+      // 2. Set up Zdog rendering context (avoiding clearRect to preserve background color)
+      zdogCtx.save();
+      zdogCtx.lineCap = 'round';
+      zdogCtx.lineJoin = 'round';
+      zdogCtx.translate(offscreenCanvas.width / 2, offscreenCanvas.height / 2);
+      zdogCtx.scale(illo.zoom, illo.zoom);
+
+      // 3. Render shapes
+      const isCameraXUp = illo.rotate.x < 0 || illo.rotate.x > TAU / 2;
+
+      sky.renderGraphCanvas(zdogCtx);
+
+      if (isCameraXUp) {
+        flatEarth.renderGraphCanvas(zdogCtx);
+      }
+      town.renderGraphCanvas(zdogCtx);
+      if (!isCameraXUp) {
+        flatEarth.renderGraphCanvas(zdogCtx);
+      }
+
+      zdogCtx.restore();
+
+      // 4. Update WebGL texture and render PostProcessor pipeline
+      canvasTexture.needsUpdate = true;
+      postProcessor.render(canvasTexture);
+    }
+
+    function animate() {
+      update();
+      render();
+      requestAnimationFrame(animate);
+    }
+
+    // Initialize
+    buildScene();
+    resize();
+    animate();
+  </script>
+</body>
+</html>

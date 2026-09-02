@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resonance Plate (Chladni Cymatics)</title>
+
+    <!-- Import Maps for Three.js and lil-gui -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000000;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        body.greenscreen {
+            background-color: #00ff00 !important;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            cursor: grab;
+        }
+
+        canvas:active {
+            cursor: grabbing;
+        }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import GUI from 'lil-gui';
+
+        // =========================================================================
+        // INLINED POST PROCESSOR SUITE (postprocessing/PostProcessor.js)
+        // =========================================================================
+        /**
+         * =========================================================================================
+         * POST PROCESSOR SUITE (Three.js Shader Post-Processing Pipeline)
+         * =========================================================================================
+         * Description:
+         * A high-performance, modular post-processing pipeline for Three.js. It features:
+         *   - Universal 3-Parameter Gaussian Bloom (Strength, Radius, Threshold)
+         *   - Radial Chromatic Aberration distortion
+         *   - Dynamic Film Grain Noise
+         *   - Adjustable Vignette (Boost & Reduction)
+         *   - Custom Gamma Correction & Min/Max Level controls
+         *   - One-line lil-gui integration (`attachGUI(gui)`)
+         *   - Offscreen scene target rendering (`renderScene(scene, camera)`)
+         * =========================================================================================
+         */
+
+        // -------------------------------------------------------------
+        // Shaders: GLSL Code
+        // -------------------------------------------------------------
+        const orthoVertexShader = `
+        precision highp float;
+        in vec3 position;
+        out vec2 vUv;
+        void main() {
+          vUv = position.xy * 0.5 + 0.5;
+          gl_Position = vec4(position, 1.0);
+        }
+        `;
+
+        const brightFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float bloomThreshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          // Calculate relative luminance (Rec. 709)
+          float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          // Soft knee thresholding
+          float knee = 0.1;
+          float soft = luminance - bloomThreshold + knee;
+          soft = clamp(soft, 0.0, 2.0 * knee);
+          soft = (soft * soft) / (4.0 * knee + 0.00001);
+          float contribution = max(soft, luminance - bloomThreshold);
+          contribution /= max(luminance, 0.00001);
+          fragColor = vec4(color.rgb * contribution, color.a);
+        }
+        `;
+
+        const blur13ShaderChunk = `
+        vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+          vec2 resolution = vec2(textureSize(image, 0));
+          vec4 color = vec4(0.0);
+          vec2 off1 = vec2(1.411764705882353) * direction;
+          vec2 off2 = vec2(3.2941176470588234) * direction;
+          vec2 off3 = vec2(5.176470588235294) * direction;
+          color += texture(image, uv) * 0.1964825501511404;
+          color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+          color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+          return color;
+        }
+        `;
+
+        const blurFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 direction;
+        in vec2 vUv;
+        out vec4 color;
+        ${blur13ShaderChunk}
+        void main() {
+          color = blur13(inputTexture, vUv, direction);
+        }
+        `;
+
+        const finalFragmentShader = `
+        precision highp float;
+        uniform vec2 resolution;
+        uniform sampler2D inputTexture;
+        uniform sampler2D blur0Texture;
+        uniform sampler2D blur1Texture;
+        uniform sampler2D blur2Texture;
+        uniform sampler2D blur3Texture;
+        uniform sampler2D blur4Texture;
+        uniform bool bloomEnabled;
+        uniform float bloomStrength;
+        uniform float vignetteBoost;
+        uniform float vignetteReduction;
+        uniform float noiseIntensity;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        float vignette(vec2 uv, float boost, float reduction) {
+          vec2 position = vUv - 0.5;
+          return boost - length(position) * reduction;
+        }
+
+        float hash1(uint n) {
+          n = (n << 13U) ^ n;
+          n = n * (n * n * 15731U + 789221U) + 1376312589U;
+          return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+        }
+
+        float noise(in vec2 uv, in float timeVal) {
+          uvec2 p = uvec2(uv);
+          return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+        }
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+
+          if (bloomEnabled && bloomStrength > 0.001) {
+            vec4 b0 = texture(blur0Texture, vUv);
+            vec4 b1 = texture(blur1Texture, vUv);
+            vec4 b2 = texture(blur2Texture, vUv);
+            vec4 b3 = texture(blur3Texture, vUv);
+            vec4 b4 = texture(blur4Texture, vUv);
+
+            vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+            color += bloomSum * bloomStrength;
+          }
+
+          color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+          color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+          fragColor = vec4(color.rgb, 1.0);
+        }
+        `;
+
+        const chromaticAberrationShaderChunk = `
+        vec2 barrelDistortion(vec2 coord, float amt) {
+          vec2 cc = coord - 0.5;
+          float dist = dot(cc, cc);
+          return coord + cc * dist * amt;
+        }
+        float sat(float t) { return clamp(t, 0.0, 1.0); }
+        float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+        float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+        vec4 spectrum_offset(float t) {
+          float lo = step(t, 0.5);
+          float hi = 1.0 - lo;
+          float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+          vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+          return pow(ret, vec4(1.0 / 2.2));
+        }
+        const float max_distort = 2.2;
+        const int num_iter = 8;
+        const float reci_num_iter_f = 1.0 / float(num_iter);
+        vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+          vec4 sumcol = vec4(0.0);
+          vec4 sumw = vec4(0.0);
+          for (int i = 0; i < num_iter; ++i) {
+            float t = float(i) * reci_num_iter_f;
+            vec4 w = spectrum_offset(t);
+            sumw += w;
+            sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+          }
+          return sumcol / sumw;
+        }
+        `;
+
+        const colorFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float chromaticAberrationAmount;
+        uniform float minInputLevel;
+        uniform float maxInputLevel;
+        uniform float gammaLevel;
+        uniform float fisheyeStrength;
+        uniform float fisheyeRadius;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        ${chromaticAberrationShaderChunk}
+
+        vec2 applyFisheye(vec2 uv, float strength, float radius) {
+          if (abs(strength) < 0.0001) return uv;
+          vec2 p = uv - 0.5;
+          float d = length(p);
+          if (d > radius * 1.5) return uv;
+          float r = d / max(radius, 0.001);
+          float theta = atan(p.y, p.x);
+          float rDist = r + strength * (r * r * r);
+          return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+        }
+
+        vec3 gammaCorrect(vec3 color, vec3 gamma) {
+          return pow(max(color, vec3(0.0)), 1.0 / gamma);
+        }
+        vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+          return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+        }
+        vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+          return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+        }
+        void main() {
+          vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+          fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+          fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+          fragColor.a = 1.0;
+        }
+        `;
+
+        const copyFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        in vec2 vUv;
+        out vec4 fragColor;
+        void main() {
+          fragColor = texture(inputTexture, vUv);
+        }
+        `;
+
+        // -------------------------------------------------------------
+        // Helper Classes (FBO & Passes)
+        // -------------------------------------------------------------
+        function createFBO(w, h, options = {}) {
+          return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+            wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+            wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+            minFilter: options.minFilter || THREE.LinearFilter,
+            magFilter: options.magFilter || THREE.LinearFilter,
+            format: options.format || THREE.RGBAFormat,
+            type: options.type || THREE.HalfFloatType,
+            stencilBuffer: options.stencilBuffer || false,
+            depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+            samples: options.samples || 0,
+          });
+        }
+
+        class ShaderPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbo = createFBO(1, 1, options);
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+            this.texture = this.fbo.texture;
+          }
+          render(renderer, toScreen = false) {
+            if (!toScreen) {
+              renderer.setRenderTarget(this.fbo);
+            }
+            renderer.render(this.orthoScene, this.orthoCamera);
+            if (!toScreen) {
+              renderer.setRenderTarget(null);
+            }
+          }
+          setSize(width, height) {
+            this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+            this.orthoQuad.scale.set(width, height, 1);
+          }
+        }
+
+        class ShaderPingPongPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+            this.currentFBO = 0;
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+          }
+          render(renderer) {
+            renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+            renderer.render(this.orthoScene, this.orthoCamera);
+            renderer.setRenderTarget(null);
+            this.currentFBO = 1 - this.currentFBO;
+          }
+          get current() { return this.fbos[this.currentFBO]; }
+          get texture() { return this.current.texture; }
+          setSize(width, height) {
+            const w = Math.max(1, width);
+            const h = Math.max(1, height);
+            this.orthoQuad.scale.set(w, h, 1);
+            this.fbos[0].setSize(w, h);
+            this.fbos[1].setSize(w, h);
+          }
+        }
+
+        class BloomPass {
+          constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+            this.strength = strength;
+            this.radius = radius;
+            this.threshold = threshold;
+            this.enabled = true;
+            this.levels = levels;
+
+            this.brightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                bloomThreshold: { value: this.threshold },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: brightFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.brightPass = new ShaderPass(this.brightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.blurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                direction: { value: new THREE.Vector2(0, 1) },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: blurFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+
+            this.blurPasses = [];
+            for (let i = 0; i < this.levels; i++) {
+              this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+                format: THREE.RGBAFormat,
+                type: THREE.HalfFloatType,
+              }));
+            }
+          }
+
+          setSize(w, h) {
+            let tw = Math.max(1, w);
+            let th = Math.max(1, h);
+            this.brightPass.setSize(tw, th);
+            for (let i = 0; i < this.levels; i++) {
+              tw = Math.max(1, Math.round(tw / 2));
+              th = Math.max(1, Math.round(th / 2));
+              this.blurPasses[i].setSize(tw, th);
+            }
+          }
+
+          set source(texture) {
+            this.brightShader.uniforms.inputTexture.value = texture;
+          }
+
+          render(renderer) {
+            if (!this.enabled || this.strength <= 0.001) return;
+
+            this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+            this.brightPass.render(renderer);
+
+            const baseOffset = Math.max(0.1, this.radius * 2.0);
+            const u = this.blurShader.uniforms;
+
+            for (let j = 0; j < this.levels; j++) {
+              const blurPass = this.blurPasses[j];
+              const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+              // Horizontal blur pass
+              u.direction.value.set(stepOffset, 0);
+              u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+              blurPass.render(renderer);
+
+              // Vertical blur pass
+              u.direction.value.set(0, stepOffset * 0.5);
+              u.inputTexture.value = blurPass.current.texture;
+              blurPass.render(renderer);
+            }
+          }
+        }
+
+        // -------------------------------------------------------------
+        // Main PostProcessor Class
+        // -------------------------------------------------------------
+        class PostProcessor {
+          constructor(renderer, params = {}) {
+            this.renderer = renderer;
+
+            this.settings = {
+              // Global Switch
+              enabled: params.enabled !== undefined ? params.enabled : true,
+
+              // 1. Universal 3-Param Bloom Engine
+              bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+              bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.8,
+              bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+              bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.2,
+
+              // 2. Lens & Camera Optics
+              fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+              fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+              chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.02,
+              vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
+              vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.4,
+              noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.015,
+
+              // 3. Color Grading & Tone
+              gamma: params.gamma !== undefined ? params.gamma : 1.0,
+              minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+              maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+            };
+
+            this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+            this.bloomPass = new BloomPass(
+              this.settings.bloomStrength,
+              this.settings.bloomRadius,
+              this.settings.bloomThreshold,
+              5
+            );
+
+            this.finalShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                resolution: { value: new THREE.Vector2(1, 1) },
+                bloomEnabled: { value: this.settings.bloomEnabled },
+                bloomStrength: { value: this.settings.bloomStrength },
+                vignetteBoost: { value: this.settings.vignetteBoost },
+                vignetteReduction: { value: this.settings.vignetteReduction },
+                noiseIntensity: { value: this.settings.noiseIntensity },
+                inputTexture: { value: null },
+                blur0Texture: { value: null },
+                blur1Texture: { value: null },
+                blur2Texture: { value: null },
+                blur3Texture: { value: null },
+                blur4Texture: { value: null },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: finalFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.finalPass = new ShaderPass(this.finalShader);
+
+            this.rgbShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: this.finalPass.texture },
+                fisheyeStrength: { value: this.settings.fisheyeStrength },
+                fisheyeRadius: { value: this.settings.fisheyeRadius },
+                chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+                minInputLevel: { value: this.settings.minInputLevel },
+                maxInputLevel: { value: this.settings.maxInputLevel },
+                gammaLevel: { value: this.settings.gamma },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: colorFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.rgbPass = new ShaderPass(this.rgbShader);
+
+            this.copyShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: copyFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.copyPass = new ShaderPass(this.copyShader);
+          }
+
+          updateSettings() {
+            this.bloomPass.enabled = this.settings.bloomEnabled;
+            this.bloomPass.strength = this.settings.bloomStrength;
+            this.bloomPass.radius = this.settings.bloomRadius;
+            this.bloomPass.threshold = this.settings.bloomThreshold;
+
+            this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+            this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+            this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+            this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+            this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+            this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+            this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+            this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+            this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+            this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+            this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+          }
+
+          setSize(w0, h0, dpr = 1) {
+            const w = Math.max(1, Math.floor(w0 * dpr));
+            const h = Math.max(1, Math.floor(h0 * dpr));
+            this.sceneTarget.setSize(w, h);
+            this.finalPass.setSize(w, h);
+            this.finalShader.uniforms.resolution.value.set(w, h);
+            this.bloomPass.setSize(w, h);
+            this.rgbPass.setSize(w, h);
+            this.copyPass.setSize(w, h);
+          }
+
+          renderScene(scene, camera) {
+            if (!this.settings.enabled) {
+              this.renderer.render(scene, camera);
+              return;
+            }
+            this.renderer.setRenderTarget(this.sceneTarget);
+            this.renderer.render(scene, camera);
+            this.renderer.setRenderTarget(null);
+            this.render(this.sceneTarget.texture);
+          }
+
+          render(sourceTexture) {
+            if (!this.settings.enabled) {
+              this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+              this.copyPass.render(this.renderer, true);
+              return;
+            }
+
+            this.updateSettings();
+
+            this.bloomPass.source = sourceTexture;
+            this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+            this.bloomPass.render(this.renderer);
+
+            this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+            this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+            this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+            this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+            this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+            const randomTime = Math.random() * 100000;
+            this.finalPass.shader.uniforms.time.value = randomTime;
+            this.rgbPass.shader.uniforms.time.value = randomTime;
+
+            this.finalPass.render(this.renderer);
+            this.rgbPass.render(this.renderer, true);
+          }
+
+          attachGUI(gui, title = "Post-Processing Suite") {
+            const root = gui.addFolder(title);
+            root.add(this.settings, "enabled").name("Enable Suite");
+
+            // Folder 1: Bloom (Standard 3-Param Optical Engine)
+            const bloom = root.addFolder("Bloom");
+            bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+            // Folder 2: Lens & Cinematic Effects
+            const lens = root.addFolder("Lens, Optics & Fisheye");
+            lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+            lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+            lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+            lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+            lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+            lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+            lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+            return root;
+          }
+        }
+
+        // =========================================================================
+        // 1. COLOR SCHEMES CONFIGURATION (10 PRESETS)
+        // =========================================================================
+        const COLOR_SCHEMES = {
+            'Monochromatic': {
+                plateColor: '#18191c',
+                sandColor: '#d8dce6',
+                accentColor: '#ffffff',
+                bgColor: '#08080a',
+                backlight: '#c8d0e0'
+            },
+            'Analogous': {
+                plateColor: '#0b1622',
+                sandColor: '#00b4d8',
+                accentColor: '#90e0ef',
+                bgColor: '#030712',
+                backlight: '#48cae4'
+            },
+            'Complementary': {
+                plateColor: '#141a2e',
+                sandColor: '#f59e0b',
+                accentColor: '#fde68a',
+                bgColor: '#080c18',
+                backlight: '#3b82f6'
+            },
+            'Split-complementary': {
+                plateColor: '#08231a',
+                sandColor: '#fb7185',
+                accentColor: '#fde047',
+                bgColor: '#02120d',
+                backlight: '#2dd4bf'
+            },
+            'Triadic': {
+                plateColor: '#1c1917',
+                sandColor: '#38bdf8',
+                accentColor: '#f43f5e',
+                bgColor: '#0c0a09',
+                backlight: '#eab308'
+            },
+            'Tetradic': {
+                plateColor: '#1b1734',
+                sandColor: '#2dd4bf',
+                accentColor: '#f472b6',
+                bgColor: '#080614',
+                backlight: '#fbbf24'
+            },
+            'Double split-complementary': {
+                plateColor: '#182030',
+                sandColor: '#fb923c',
+                accentColor: '#38bdf8',
+                bgColor: '#070a12',
+                backlight: '#a78bfa'
+            },
+            'Achromatic (Black & White)': {
+                plateColor: '#f0f2f5',
+                sandColor: '#151518',
+                accentColor: '#3d3d45',
+                bgColor: '#e2e5eb',
+                backlight: '#ffffff'
+            },
+            'Achromatic (White & Black)': {
+                plateColor: '#0c0c0e',
+                sandColor: '#f8fafc',
+                accentColor: '#ffffff',
+                bgColor: '#000000',
+                backlight: '#ffffff'
+            },
+            'Neutral + accent': {
+                plateColor: '#202024',
+                sandColor: '#fbbf24',
+                accentColor: '#ffffff',
+                bgColor: '#0e0e11',
+                backlight: '#f59e0b'
+            }
+        };
+
+        // =========================================================================
+        // 2. SETTINGS & GUI PARAMETERS
+        // =========================================================================
+        const params = {
+            // Quality & Render
+            dpr: 1.0,
+            antiAlias: false,
+            greenScreen: false,
+            greenThreshold: 0.03,
+            greenFeather: 0.07,
+
+            // Animation
+            animationPreset: 'Subtle Orbit & Harmonic Breathing',
+            speed: 0.2,
+
+            // Interactive Randomizer
+            randomizeOnClick: true,
+
+            // Camera & Transform
+            perspective: 2.2,
+            zoom: 5.2,
+            panX: 0.0,
+            panY: 0.0,
+
+            // Plate & Wave Physical Geometry
+            plateSize: 1.55,
+            plateThickness: 0.045,
+            waveFrequency: 2.8,
+            vibrationSpeed: 1.2,
+            vibrationAmp: 0.09,
+            nodeSharpness: 9.0,
+            sandAmount: 0.085,
+
+            // Standing Wave Eigenmode Harmonics (Chladni Modes)
+            modeN1: 3.0,
+            modeM1: 1.0,
+            modeN2: 2.0,
+            modeM2: 4.0,
+            modeN3: 5.0,
+            modeM3: 2.0,
+            radialFreq: 3.5,
+            weight1: 0.95,
+            weight2: 0.85,
+            weight3: 0.45,
+            weight4: 0.35,
+
+            // Fractal Granular Micro-Texture (Fold Loop gated at nodes)
+            iterations: 5,
+            foldX: 0.85,
+            foldY: 0.45,
+            foldZ: 0.65,
+            foldScale: 1.35,
+
+            // Lighting, Sparkle & Cymatics Accumulation
+            glowIntensity: 0.045,
+            backlightIntensity: 0.85,
+            sparkleIntensity: 1.2,
+            sparkleDensity: 160.0,
+            specularRoughness: 0.35,
+
+            // Color Palette
+            colorScheme: 'Achromatic (White & Black)',
+            plateColor: COLOR_SCHEMES['Achromatic (White & Black)'].plateColor,
+            sandColor: COLOR_SCHEMES['Achromatic (White & Black)'].sandColor,
+            accentColor: COLOR_SCHEMES['Achromatic (White & Black)'].accentColor,
+            bgColor: COLOR_SCHEMES['Achromatic (White & Black)'].bgColor,
+            backlightColor: COLOR_SCHEMES['Achromatic (White & Black)'].backlight
+        };
+
+        // =========================================================================
+        // 3. THREE.JS & POST-PROCESSOR INITIALIZATION
+        // =========================================================================
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+        renderer.setPixelRatio(params.dpr);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(new THREE.Color(params.bgColor), 1);
+        document.body.appendChild(renderer.domElement);
+
+        // Instantiate Post-Processing Suite
+        const postProcessor = new PostProcessor(renderer, {
+            enabled: true,
+            bloomEnabled: true,
+            bloomStrength: 0.65,
+            bloomRadius: 0.45,
+            bloomThreshold: 0.25,
+            chromaticAberration: 0.015,
+            vignetteBoost: 1.05,
+            vignetteReduction: 0.45,
+            noiseIntensity: 0.012
+        });
+        postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+        // Helper to parse hex colors into vec3
+        const hexToVec3 = (hex) => {
+            const c = new THREE.Color(hex);
+            return new THREE.Vector3(c.r, c.g, c.b);
+        };
+
+        // =========================================================================
+        // 4. SHADER UNIFORMS
+        // =========================================================================
+        const uniforms = {
+            u_time: { value: 0.0 },
+            u_resolution: { value: new THREE.Vector2(window.innerWidth * params.dpr, window.innerHeight * params.dpr) },
+            u_mouse_rot: { value: new THREE.Vector2(0.5, 0.4) },
+            u_pan: { value: new THREE.Vector2(0.0, 0.0) },
+            u_zoom: { value: params.zoom },
+            u_perspective: { value: params.perspective },
+            u_anim_speed: { value: params.speed },
+
+            // Plate & Wave Geometry
+            u_plate_size: { value: params.plateSize },
+            u_plate_thickness: { value: params.plateThickness },
+            u_wave_freq: { value: params.waveFrequency },
+            u_vibe_speed: { value: params.vibrationSpeed },
+            u_vibe_amp: { value: params.vibrationAmp },
+            u_node_sharpness: { value: params.nodeSharpness },
+            u_sand_amount: { value: params.sandAmount },
+
+            // Eigenmodes
+            u_mode_n1: { value: params.modeN1 },
+            u_mode_m1: { value: params.modeM1 },
+            u_mode_n2: { value: params.modeN2 },
+            u_mode_m2: { value: params.modeM2 },
+            u_mode_n3: { value: params.modeN3 },
+            u_mode_m3: { value: params.modeM3 },
+            u_radial_freq: { value: params.radialFreq },
+            u_weights: { value: new THREE.Vector4(params.weight1, params.weight2, params.weight3, params.weight4) },
+
+            // Fractal Fold Loop
+            u_iterations: { value: params.iterations },
+            u_fold: { value: new THREE.Vector3(params.foldX, params.foldY, params.foldZ) },
+            u_fold_scale: { value: params.foldScale },
+
+            // Sparkle & Light
+            u_glow_intensity: { value: params.glowIntensity },
+            u_backlight_intensity: { value: params.backlightIntensity },
+            u_sparkle_intensity: { value: params.sparkleIntensity },
+            u_sparkle_density: { value: params.sparkleDensity },
+            u_roughness: { value: params.specularRoughness },
+
+            // Colors
+            u_plate_color: { value: hexToVec3(params.plateColor) },
+            u_sand_color: { value: hexToVec3(params.sandColor) },
+            u_accent_color: { value: hexToVec3(params.accentColor) },
+            u_bg_color: { value: hexToVec3(params.bgColor) },
+            u_backlight_color: { value: hexToVec3(params.backlightColor) },
+
+            // Green Screen
+            u_green_screen: { value: params.greenScreen },
+            u_green_threshold: { value: params.greenThreshold },
+            u_green_feather: { value: params.greenFeather }
+        };
+
+        // =========================================================================
+        // 5. RAYMARCHING CYMATICS SHADER
+        // =========================================================================
+        const getFragmentShader = (useAA) => `
+            precision highp float;
+
+            #define MAX_ITERATIONS 10
+            #define MAX_STEPS 128
+            #define SURF_DIST 0.0006
+            #define MAX_DIST 22.0
+
+            ${useAA ? '#define USE_AA' : ''}
+
+            uniform float u_time;
+            uniform vec2 u_resolution;
+            uniform vec2 u_mouse_rot;
+            uniform vec2 u_pan;
+            uniform float u_zoom;
+            uniform float u_perspective;
+            uniform float u_anim_speed;
+
+            // Plate & Wave Geometry
+            uniform float u_plate_size;
+            uniform float u_plate_thickness;
+            uniform float u_wave_freq;
+            uniform float u_vibe_speed;
+            uniform float u_vibe_amp;
+            uniform float u_node_sharpness;
+            uniform float u_sand_amount;
+
+            // Eigenmodes
+            uniform float u_mode_n1;
+            uniform float u_mode_m1;
+            uniform float u_mode_n2;
+            uniform float u_mode_m2;
+            uniform float u_mode_n3;
+            uniform float u_mode_m3;
+            uniform float u_radial_freq;
+            uniform vec4 u_weights;
+
+            // Fractal Detail Gating
+            uniform int u_iterations;
+            uniform vec3 u_fold;
+            uniform float u_fold_scale;
+
+            // Light & Sparkle
+            uniform float u_glow_intensity;
+            uniform float u_backlight_intensity;
+            uniform float u_sparkle_intensity;
+            uniform float u_sparkle_density;
+            uniform float u_roughness;
+
+            // Colors
+            uniform vec3 u_plate_color;
+            uniform vec3 u_sand_color;
+            uniform vec3 u_accent_color;
+            uniform vec3 u_bg_color;
+            uniform vec3 u_backlight_color;
+
+            // Green Screen
+            uniform bool u_green_screen;
+            uniform float u_green_threshold;
+            uniform float u_green_feather;
+
+            // Global matrices and evaluation caches
+            mat2 g_rotAnim;
+            mat2 g_rotFractalXY;
+            mat2 g_rotFractalXZ;
+            mat2 g_camRotX;
+            mat2 g_camRotY;
+
+            mat2 rotate2D(float angle) {
+                float c = cos(angle);
+                float s = sin(angle);
+                return mat2(c, -s, s, c);
+            }
+
+            // High quality 2D/3D hash for granular sand sparkle
+            float hash21(vec2 p) {
+                p = fract(p * vec2(234.34, 435.345));
+                p += dot(p, p + 34.23);
+                return fract(p.x * p.y);
+            }
+
+            float hash31(vec3 p) {
+                p = fract(p * vec3(443.897, 441.423, 437.195));
+                p += dot(p, p.yzx + 19.19);
+                return fract((p.x + p.y) * p.z);
+            }
+
+            // SDF of rounded box slab (the resonance plate)
+            float sdRoundedBox(vec3 p, vec3 b, float r) {
+                vec3 q = abs(p) - b + r;
+                return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+            }
+
+            // Chladni 2D Standing Wave Field calculation
+            float evaluateChladniField(vec2 xz, float time) {
+                vec2 p = xz * u_wave_freq;
+                float t = time * u_vibe_speed;
+
+                // Mode 1: Classic rectangular eigenmode pair with phase breathing
+                float t1 = cos(u_mode_n1 * p.x + sin(t * 0.35) * 0.2) * cos(u_mode_m1 * p.y)
+                         - cos(u_mode_m1 * p.x) * cos(u_mode_n1 * p.y + cos(t * 0.28) * 0.2);
+
+                // Mode 2: Secondary cross eigenmode
+                float t2 = cos(u_mode_n2 * p.x) * cos(u_mode_m2 * p.y + sin(t * 0.45) * 0.15)
+                         + cos(u_mode_m2 * p.x + cos(t * 0.4) * 0.15) * cos(u_mode_n2 * p.y);
+
+                // Mode 3: Diagonal standing wave interference
+                vec2 rotP = rotate2D(0.785398) * p;
+                float t3 = sin(rotP.x * u_mode_n3 + t * 0.2) * cos(rotP.y * u_mode_m3);
+
+                // Mode 4: Concentric radial Bessel-like ripple
+                float r = length(p);
+                float t4 = sin(r * u_radial_freq - t * 0.5) * exp(-r * 0.12);
+
+                return u_weights.x * t1 + u_weights.y * t2 + u_weights.z * t3 + u_weights.w * t4;
+            }
+
+            // Evaluate scene SDF and return vec2(distance, nodeProximity)
+            vec2 evaluateSceneSDF(vec3 pos, out vec4 outFoldQ) {
+                vec3 localPos = pos;
+
+                // Plate dimensions
+                float halfThick = u_plate_thickness * 0.5;
+                vec3 plateBox = vec3(u_plate_size, halfThick, u_plate_size);
+
+                // 1. Base Plate SDF
+                float dPlate = sdRoundedBox(localPos, plateBox, 0.025);
+
+                // Calculate standing wave amplitude and node proximity
+                float wave = evaluateChladniField(localPos.xz, u_time);
+                float waveAmp = abs(wave);
+
+                // Node proximity: 1.0 at nodal lines (zero amplitude), 0.0 at antinodes (maximum vibration)
+                float nodeProximity = exp(-waveAmp * waveAmp * u_node_sharpness);
+
+                // Plate boundary mask (sand only rests on the top surface within the plate boundary)
+                vec2 edgeDist = abs(localPos.xz) - vec2(u_plate_size - 0.04);
+                float insidePlate = 1.0 - smoothstep(0.0, 0.06, max(edgeDist.x, edgeDist.y));
+                nodeProximity *= insidePlate;
+
+                // Vibrational displacement of the plate itself
+                float plateVibration = wave * u_vibe_amp * (1.0 - nodeProximity * 0.7);
+
+                // 2. Sand Heaps & Granular Ridge Accumulation (Fold loop gated at node lines)
+                float sandHeight = nodeProximity * u_sand_amount;
+
+                // Gated recursive fold detail: full fractal texture at nodes, smooth at antinodes
+                vec4 q = vec4(localPos.x * 2.2, (localPos.y - halfThick) * 3.5, localPos.z * 2.2, 1.0);
+                float foldGate = smoothstep(0.12, 0.85, nodeProximity);
+                vec3 effectiveFold = u_fold * foldGate;
+
+                for (int k = 0; k < MAX_ITERATIONS; k++) {
+                    if (k >= u_iterations) break;
+
+                    float r2 = dot(q.xyz, q.xyz);
+                    float sphereFold = mix(1.0, max(1.35 / max(r2, -0.7), 1.08), foldGate);
+                    q *= sphereFold;
+
+                    q.xyz = abs(q.xyz) - effectiveFold;
+                    q.xy *= g_rotFractalXY;
+                    q.xz *= g_rotFractalXZ;
+
+                    q *= mix(1.0, u_fold_scale, foldGate);
+                }
+
+                outFoldQ = q;
+
+                // Sand micro-structure distance
+                float fractalGranules = (length(q.xyz) - 0.95) / q.w * foldGate * 0.4;
+                float sandTopSurface = localPos.y - halfThick - sandHeight - fractalGranules;
+
+                // Combine plate and sand
+                float dSand = max(sandTopSurface, max(edgeDist.x, edgeDist.y));
+                
+                // Displace the plate top slightly by vibration
+                float dDisplacedPlate = dPlate - plateVibration * 0.02 * (1.0 - nodeProximity);
+
+                float sceneDist = min(dDisplacedPlate, dSand);
+
+                return vec2(sceneDist, nodeProximity);
+            }
+
+            // Simplified SDF evaluator for fast raymarching step
+            float getSceneDist(vec3 pos) {
+                vec4 dummyQ;
+                return evaluateSceneSDF(pos, dummyQ).x;
+            }
+
+            // Normal estimation via 4-sample tetrahedron technique
+            vec3 estimateNormal(vec3 p) {
+                vec2 e = vec2(1.0, -1.0) * 0.0012;
+                return normalize(
+                    e.xyy * getSceneDist(p + e.xyy) +
+                    e.yyx * getSceneDist(p + e.yyx) +
+                    e.yxy * getSceneDist(p + e.yxy) +
+                    e.xxx * getSceneDist(p + e.xxx)
+                );
+            }
+
+            // Raymarching render loop with inverse-amplitude illumination & granular sparkles
+            vec3 renderRay(vec3 ro, vec3 rd, float jitter) {
+                float totalDist = jitter * 0.02;
+                vec3 accumColor = vec3(0.0);
+                float minRayDist = 100.0;
+                vec3 hitPos = vec3(0.0);
+                bool hit = false;
+                float hitNodeProx = 0.0;
+                vec4 hitQ = vec4(0.0);
+
+                // Step march
+                for (int i = 0; i < MAX_STEPS; i++) {
+                    vec3 p = ro + rd * totalDist;
+                    vec4 foldQ;
+                    vec2 res = evaluateSceneSDF(p, foldQ);
+                    float d = res.x;
+                    float nodeProx = res.y;
+
+                    minRayDist = min(minRayDist, d);
+
+                    // Accumulate brightness inversely to local wave amplitude (nodes bright, antinodes dark)
+                    if (abs(p.y) < u_plate_thickness * 2.5 && length(p.xz) < u_plate_size * 1.3) {
+                        float nodeGlow = pow(nodeProx, 2.2);
+                        
+                        // Sparkle catch-light from crystalline quartz grains at node lines
+                        vec3 sparkleCell = floor(p * u_sparkle_density);
+                        float grainHash = hash31(sparkleCell);
+                        float sparkle = pow(grainHash, 18.0) * nodeProx * u_sparkle_intensity * 4.5;
+
+                        vec3 glowCol = mix(u_sand_color, u_accent_color, sparkle * 0.5) + u_accent_color * sparkle;
+                        accumColor += glowCol * (nodeGlow * u_glow_intensity + sparkle * 0.015) * exp(-totalDist * 0.08);
+                    }
+
+                    if (d < SURF_DIST) {
+                        hit = true;
+                        hitPos = p;
+                        hitNodeProx = nodeProx;
+                        hitQ = foldQ;
+                        break;
+                    }
+
+                    totalDist += d * 0.78;
+                    if (totalDist > MAX_DIST) break;
+                }
+
+                // If surface hit: calculate physical shading, backlit rim and granular reflections
+                if (hit) {
+                    vec3 n = estimateNormal(hitPos);
+                    vec3 v = -rd;
+
+                    // Dual light sources: Overhead grazing key light + strong dark-field backlight
+                    vec3 keyLightDir = normalize(vec3(0.5, 0.9, -0.6));
+                    vec3 backLightDir = normalize(vec3(-0.3, 0.4, 0.8));
+
+                    float diffKey = max(0.0, dot(n, keyLightDir));
+                    float diffBack = max(0.0, dot(n, backLightDir));
+
+                    // Grazing rim / backlit halo characteristic of cymatics macro photography
+                    float rim = pow(1.0 - max(0.0, dot(v, n)), 3.0);
+
+                    // Granular sparkle glints
+                    vec3 grainCoord = floor(hitPos * u_sparkle_density);
+                    float grainNoise = hash31(grainCoord);
+                    vec3 hKey = normalize(keyLightDir + v);
+                    vec3 hBack = normalize(backLightDir + v);
+                    float specKey = pow(max(0.0, dot(n, hKey)), 24.0);
+                    float specBack = pow(max(0.0, dot(n, hBack)), 32.0);
+
+                    float crystallineGlint = pow(grainNoise, 14.0) * hitNodeProx * (specKey + specBack * 1.5) * u_sparkle_intensity * 12.0;
+
+                    // Color blending: plate vs sand
+                    vec3 basePlate = u_plate_color;
+                    
+                    // Metallic sheen on plate
+                    float plateFresnel = pow(1.0 - max(0.0, dot(v, n)), 4.0);
+                    basePlate += u_backlight_color * plateFresnel * 0.35 * (1.0 - hitNodeProx);
+
+                    // Sand color with micro-fold variation
+                    vec3 sandTint = mix(u_sand_color, u_accent_color, clamp(sin(hitQ.x * 3.0) * 0.5 + 0.5, 0.0, 1.0) * 0.4);
+
+                    // Combine surface material
+                    vec3 matColor = mix(basePlate, sandTint, smoothstep(0.05, 0.75, hitNodeProx));
+
+                    // Ambient occlusion based on step count and proximity
+                    float ao = clamp(1.0 - float(hitNodeProx) * 0.25, 0.2, 1.0);
+
+                    vec3 litColor = matColor * (0.25 + diffKey * 0.65) * ao;
+                    litColor += u_backlight_color * (diffBack * 0.4 + rim * 0.75) * u_backlight_intensity;
+                    litColor += (u_accent_color + vec3(0.5)) * crystallineGlint;
+
+                    accumColor += litColor;
+                } else {
+                    // Deep field background with subtle acoustic backlight vignette
+                    float bgVignette = smoothstep(2.0, 0.2, length(ro.xy + rd.xy * 6.0));
+                    accumColor += u_bg_color + u_backlight_color * bgVignette * 0.06 * u_backlight_intensity;
+                }
+
+                return accumColor;
+            }
+
+            vec3 getPixelColor(vec2 fragCoord) {
+                // Centered normalized coordinates with pan offset
+                vec2 uv = (2.0 * (fragCoord.xy - u_pan) - u_resolution.xy) / u_resolution.y;
+
+                float jitter = hash21(fragCoord.xy + fract(u_time * 17.13)) * 0.08;
+
+                // Camera ray setup with orbit rotations
+                vec3 ro = vec3(0.0, 0.0, -u_zoom);
+                vec3 rd = normalize(vec3(uv, u_perspective));
+
+                // Apply orbit rotations
+                ro.yz *= g_camRotY;
+                ro.xz *= g_camRotX;
+                rd.yz *= g_camRotY;
+                rd.xz *= g_camRotX;
+
+                vec3 col = renderRay(ro, rd, jitter);
+                return col;
+            }
+
+            void main() {
+                // Precalculate rotation matrices for raymarching
+                g_camRotY = rotate2D(-u_mouse_rot.y);
+                g_camRotX = rotate2D(-u_mouse_rot.x);
+                g_rotAnim = rotate2D(u_time * u_anim_speed);
+                g_rotFractalXY = rotate2D(0.72 + sin(u_time * 0.06) * 0.08);
+                g_rotFractalXZ = rotate2D(0.54 + cos(u_time * 0.05) * 0.06);
+
+                vec3 finalColor = vec3(0.0);
+
+                #ifdef USE_AA
+                    for(int m = 0; m < 2; m++) {
+                        for(int n = 0; n < 2; n++) {
+                            vec2 offset = vec2(float(m), float(n)) * 0.5 - 0.25;
+                            finalColor += getPixelColor(gl_FragCoord.xy + offset);
+                        }
+                    }
+                    finalColor *= 0.25;
+                #else
+                    finalColor = getPixelColor(gl_FragCoord.xy);
+                #endif
+
+                // Tone mapping and photographic contrast enhancement
+                finalColor = finalColor / (1.0 + finalColor * 0.45);
+                finalColor = pow(max(finalColor, vec3(0.0)), vec3(1.15));
+
+                // Green screen support (#00ff00)
+                if (u_green_screen) {
+                    float brightness = max(max(finalColor.r, finalColor.g), finalColor.b);
+                    float keepPlate = smoothstep(u_green_threshold, u_green_threshold + u_green_feather, brightness);
+                    finalColor = mix(vec3(0.0, 1.0, 0.0), finalColor, keepPlate);
+                }
+
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        const vertexShader = `
+            void main() {
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        let material = new THREE.ShaderMaterial({
+            vertexShader: vertexShader,
+            fragmentShader: getFragmentShader(params.antiAlias),
+            uniforms: uniforms
+        });
+
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // =========================================================================
+        // 6. ANIMATION PRESETS (8 DISTINCT MODES)
+        // =========================================================================
+        const ANIMATION_PRESETS = [
+            'Static (No Motion)',
+            'Subtle Orbit & Harmonic Breathing',
+            'Plate Tilt & Chladni Drift',
+            'Acoustic Levitation Float',
+            'Resonance Sweep',
+            'Macro Cymatic Inspection',
+            'Pulsed Cymatic Strobe',
+            'Zenith Turntable'
+        ];
+
+        // Apply automated camera/wave motion depending on the selected preset
+        function applyAnimationPreset(elapsedTime) {
+            const t = elapsedTime * params.speed * 1.5;
+
+            switch (params.animationPreset) {
+                case 'Static (No Motion)':
+                    // Keep camera stationary, only standing wave vibrational oscillation runs in shader
+                    break;
+
+                case 'Subtle Orbit & Harmonic Breathing':
+                    targetMouseRot.x = baseMouseRot.x + Math.sin(t * 0.35) * 0.55;
+                    targetMouseRot.y = baseMouseRot.y + Math.cos(t * 0.28) * 0.22;
+                    uniforms.u_vibe_amp.value = params.vibrationAmp * (1.0 + Math.sin(t * 0.8) * 0.25);
+                    break;
+
+                case 'Plate Tilt & Chladni Drift':
+                    targetMouseRot.x = baseMouseRot.x + Math.sin(t * 0.45) * 0.75;
+                    targetMouseRot.y = 0.65 + Math.sin(t * 0.3) * 0.35;
+                    uniforms.u_node_sharpness.value = params.nodeSharpness * (1.0 + Math.sin(t * 0.6) * 0.2);
+                    break;
+
+                case 'Acoustic Levitation Float':
+                    targetMouseRot.x = baseMouseRot.x + Math.sin(t * 0.25) * 0.35;
+                    targetMouseRot.y = 0.5 + Math.cos(t * 0.2) * 0.25;
+                    currentPan.y = basePan.y + Math.sin(t * 0.5) * 45.0;
+                    uniforms.u_pan.value.copy(currentPan);
+                    break;
+
+                case 'Resonance Sweep':
+                    targetMouseRot.x = baseMouseRot.x + t * 0.15;
+                    targetMouseRot.y = baseMouseRot.y + Math.sin(t * 0.25) * 0.15;
+                    // Dynamically sweep modal harmonic weights
+                    uniforms.u_weights.value.set(
+                        Math.sin(t * 0.4) * 0.5 + 0.5,
+                        Math.cos(t * 0.35) * 0.5 + 0.5,
+                        Math.sin(t * 0.25 + 1.0) * 0.5 + 0.3,
+                        Math.cos(t * 0.5 + 2.0) * 0.4 + 0.2
+                    );
+                    break;
+
+                case 'Macro Cymatic Inspection':
+                    targetMouseRot.x = baseMouseRot.x + Math.sin(t * 0.2) * 0.45;
+                    targetMouseRot.y = 0.85 + Math.cos(t * 0.15) * 0.15;
+                    currentZoom = params.zoom * 0.65 + Math.sin(t * 0.25) * 0.4;
+                    uniforms.u_zoom.value = currentZoom;
+                    break;
+
+                case 'Pulsed Cymatic Strobe':
+                    targetMouseRot.x = baseMouseRot.x + Math.sin(t * 0.3) * 0.25;
+                    targetMouseRot.y = baseMouseRot.y + Math.cos(t * 0.25) * 0.15;
+                    const strobe = Math.pow(Math.sin(t * 3.0) * 0.5 + 0.5, 4.0);
+                    uniforms.u_sparkle_intensity.value = params.sparkleIntensity * (1.0 + strobe * 3.0);
+                    break;
+
+                case 'Zenith Turntable':
+                    targetMouseRot.x = baseMouseRot.x + t * 0.3;
+                    targetMouseRot.y = 1.38; // Near vertical top-down view
+                    break;
+            }
+        }
+
+        // =========================================================================
+        // 7. UNIFORM & PALETTE UPDATE HELPERS
+        // =========================================================================
+        const updateUniforms = () => {
+            uniforms.u_zoom.value = params.zoom;
+            uniforms.u_perspective.value = params.perspective;
+            uniforms.u_anim_speed.value = params.speed;
+
+            uniforms.u_plate_size.value = params.plateSize;
+            uniforms.u_plate_thickness.value = params.plateThickness;
+            uniforms.u_wave_freq.value = params.waveFrequency;
+            uniforms.u_vibe_speed.value = params.vibrationSpeed;
+            uniforms.u_vibe_amp.value = params.vibrationAmp;
+            uniforms.u_node_sharpness.value = params.nodeSharpness;
+            uniforms.u_sand_amount.value = params.sandAmount;
+
+            uniforms.u_mode_n1.value = params.modeN1;
+            uniforms.u_mode_m1.value = params.modeM1;
+            uniforms.u_mode_n2.value = params.modeN2;
+            uniforms.u_mode_m2.value = params.modeM2;
+            uniforms.u_mode_n3.value = params.modeN3;
+            uniforms.u_mode_m3.value = params.modeM3;
+            uniforms.u_radial_freq.value = params.radialFreq;
+            uniforms.u_weights.value.set(params.weight1, params.weight2, params.weight3, params.weight4);
+
+            uniforms.u_iterations.value = params.iterations;
+            uniforms.u_fold.value.set(params.foldX, params.foldY, params.foldZ);
+            uniforms.u_fold_scale.value = params.foldScale;
+
+            uniforms.u_glow_intensity.value = params.glowIntensity;
+            uniforms.u_backlight_intensity.value = params.backlightIntensity;
+            uniforms.u_sparkle_intensity.value = params.sparkleIntensity;
+            uniforms.u_sparkle_density.value = params.sparkleDensity;
+            uniforms.u_roughness.value = params.specularRoughness;
+
+            uniforms.u_plate_color.value.copy(hexToVec3(params.plateColor));
+            uniforms.u_sand_color.value.copy(hexToVec3(params.sandColor));
+            uniforms.u_accent_color.value.copy(hexToVec3(params.accentColor));
+            uniforms.u_bg_color.value.copy(hexToVec3(params.bgColor));
+            uniforms.u_backlight_color.value.copy(hexToVec3(params.backlightColor));
+
+            uniforms.u_green_screen.value = params.greenScreen;
+            uniforms.u_green_threshold.value = params.greenThreshold;
+            uniforms.u_green_feather.value = params.greenFeather;
+
+            if (!params.greenScreen) {
+                renderer.setClearColor(new THREE.Color(params.bgColor), 1);
+            }
+        };
+
+        function setGreenScreen(enabled) {
+            document.body.classList.toggle('greenscreen', enabled);
+            renderer.setClearColor(enabled ? 0x00ff00 : new THREE.Color(params.bgColor), 1);
+            uniforms.u_green_screen.value = enabled;
+        }
+
+        function applyColorScheme(schemeName) {
+            const scheme = COLOR_SCHEMES[schemeName];
+            if (!scheme) return;
+
+            params.plateColor = scheme.plateColor;
+            params.sandColor = scheme.sandColor;
+            params.accentColor = scheme.accentColor;
+            params.bgColor = scheme.bgColor;
+            params.backlightColor = scheme.backlight;
+
+            updateUniforms();
+            guiControllers.forEach(c => c.updateDisplay());
+        }
+
+        // =========================================================================
+        // 8. PROCEDURAL RANDOMIZER (TRIGGERS ON CANVAS CLICK)
+        // =========================================================================
+        function randomizeScene() {
+            // Pick a random color scheme from the 10 presets
+            const schemeKeys = Object.keys(COLOR_SCHEMES);
+            const randomScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+            params.colorScheme = randomScheme;
+            const scheme = COLOR_SCHEMES[randomScheme];
+            params.plateColor = scheme.plateColor;
+            params.sandColor = scheme.sandColor;
+            params.accentColor = scheme.accentColor;
+            params.bgColor = scheme.bgColor;
+            params.backlightColor = scheme.backlight;
+
+            // Pick a random animation preset
+            params.animationPreset = ANIMATION_PRESETS[Math.floor(Math.random() * ANIMATION_PRESETS.length)];
+
+            // Randomize Standing Wave Modal Harmonics
+            params.modeN1 = Math.floor(1 + Math.random() * 5);
+            params.modeM1 = Math.floor(1 + Math.random() * 5);
+            params.modeN2 = Math.floor(1 + Math.random() * 6);
+            params.modeM2 = Math.floor(1 + Math.random() * 6);
+            params.modeN3 = Math.floor(2 + Math.random() * 5);
+            params.modeM3 = Math.floor(1 + Math.random() * 4);
+            params.radialFreq = 2.0 + Math.random() * 4.0;
+            params.waveFrequency = 2.0 + Math.random() * 2.2;
+            params.vibrationAmp = 0.05 + Math.random() * 0.08;
+            params.nodeSharpness = 6.0 + Math.random() * 8.0;
+            params.sandAmount = 0.06 + Math.random() * 0.06;
+
+            // Randomize fractal grain folding
+            params.foldX = 0.4 + Math.random() * 1.0;
+            params.foldY = 0.2 + Math.random() * 0.8;
+            params.foldZ = 0.3 + Math.random() * 0.9;
+            params.iterations = Math.floor(3 + Math.random() * 4);
+
+            // Randomize lighting & sparkles
+            params.glowIntensity = 0.02 + Math.random() * 0.05;
+            params.sparkleIntensity = 0.6 + Math.random() * 1.4;
+
+            updateUniforms();
+            guiControllers.forEach(c => c.updateDisplay());
+        }
+
+        // =========================================================================
+        // 9. LIL-GUI CONTROLS SETUP
+        // =========================================================================
+        const gui = new GUI({ title: 'Resonance Plate (Chladni Cymatics)' });
+        const guiControllers = [];
+
+        // Helper to register controller for automated batch updates
+        const registerCtrl = (ctrl) => {
+            guiControllers.push(ctrl);
+            return ctrl;
+        };
+
+        // Render Quality Folder
+        const renderFolder = gui.addFolder('Render Quality');
+        registerCtrl(renderFolder.add(params, 'dpr', [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]).name('Pixel Ratio (DPR)').onChange(v => {
+            renderer.setPixelRatio(v);
+            uniforms.u_resolution.value.set(window.innerWidth * v, window.innerHeight * v);
+            postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+        }));
+        registerCtrl(renderFolder.add(params, 'antiAlias').name('Anti-Aliasing (AA)').onChange(v => {
+            material.fragmentShader = getFragmentShader(v);
+            material.needsUpdate = true;
+        }));
+
+        // Attach Post-Processing Suite to GUI
+        postProcessor.attachGUI(gui, 'Post-Processing Suite');
+
+        // Color Schemes & Palette Folder
+        const colorFolder = gui.addFolder('Color Schemes (10 Presets)');
+        registerCtrl(colorFolder.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Preset Scheme').onChange(applyColorScheme));
+        registerCtrl(colorFolder.addColor(params, 'plateColor').name('Plate Color').onChange(updateUniforms));
+        registerCtrl(colorFolder.addColor(params, 'sandColor').name('Sand / Node Color').onChange(updateUniforms));
+        registerCtrl(colorFolder.addColor(params, 'accentColor').name('Sparkle / Accent').onChange(updateUniforms));
+        registerCtrl(colorFolder.addColor(params, 'bgColor').name('Background Color').onChange(updateUniforms));
+        registerCtrl(colorFolder.addColor(params, 'backlightColor').name('Backlight Rim Tint').onChange(updateUniforms));
+
+        // Green Screen Folder
+        const greenFolder = gui.addFolder('Green Screen (#00ff00)');
+        registerCtrl(greenFolder.add(params, 'greenScreen').name('Enable Green Screen').onChange(setGreenScreen));
+        registerCtrl(greenFolder.add(params, 'greenThreshold', 0.0, 0.25, 0.002).name('Cutoff Threshold').onChange(updateUniforms));
+        registerCtrl(greenFolder.add(params, 'greenFeather', 0.0, 0.3, 0.002).name('Edge Feather').onChange(updateUniforms));
+
+        // Animation & Presets Folder
+        const animFolder = gui.addFolder('Animation & Motion');
+        registerCtrl(animFolder.add(params, 'animationPreset', ANIMATION_PRESETS).name('Animation Mode'));
+        registerCtrl(animFolder.add(params, 'speed', 0.0, 1.0, 0.01).name('Animation Speed').onChange(updateUniforms));
+        registerCtrl(animFolder.add(params, 'randomizeOnClick').name('Click Scene to Randomize'));
+
+        // Camera & Pan / Zoom Folder
+        const camFolder = gui.addFolder('Camera & View');
+        const zoomCtrl = registerCtrl(camFolder.add(params, 'zoom', 1.5, 14.0, 0.05).name('Zoom Distance').onChange(updateUniforms));
+        registerCtrl(camFolder.add(params, 'perspective', 0.8, 4.0, 0.05).name('Perspective FOV').onChange(updateUniforms));
+
+        // Cymatics Standing Waves Folder
+        const waveFolder = gui.addFolder('Chladni Wave Eigenmodes');
+        registerCtrl(waveFolder.add(params, 'waveFrequency', 0.5, 6.0, 0.1).name('Wave Frequency').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'vibrationAmp', 0.0, 0.3, 0.005).name('Vibration Amplitude').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'nodeSharpness', 1.0, 25.0, 0.5).name('Node Line Sharpness').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'sandAmount', 0.0, 0.25, 0.005).name('Sand Mound Depth').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'modeN1', 1, 8, 1).name('Mode N1 (Rect)').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'modeM1', 1, 8, 1).name('Mode M1 (Rect)').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'modeN2', 1, 8, 1).name('Mode N2 (Cross)').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'modeM2', 1, 8, 1).name('Mode M2 (Cross)').onChange(updateUniforms));
+        registerCtrl(waveFolder.add(params, 'radialFreq', 0.5, 8.0, 0.1).name('Radial Ripple Freq').onChange(updateUniforms));
+
+        // Fractal Detail Gating Folder
+        const fractalFolder = gui.addFolder('Gated Fractal Micro-Detail');
+        registerCtrl(fractalFolder.add(params, 'iterations', 1, 8, 1).name('Fold Iterations').onChange(updateUniforms));
+        registerCtrl(fractalFolder.add(params, 'foldX', 0.0, 2.5, 0.02).name('Fold X').onChange(updateUniforms));
+        registerCtrl(fractalFolder.add(params, 'foldY', 0.0, 2.5, 0.02).name('Fold Y').onChange(updateUniforms));
+        registerCtrl(fractalFolder.add(params, 'foldZ', 0.0, 2.5, 0.02).name('Fold Z').onChange(updateUniforms));
+        registerCtrl(fractalFolder.add(params, 'foldScale', 1.0, 2.0, 0.02).name('Fold Expansion').onChange(updateUniforms));
+
+        // Lighting & Sparkle Folder
+        const lightFolder = gui.addFolder('Lighting & Granular Sparkles');
+        registerCtrl(lightFolder.add(params, 'glowIntensity', 0.0, 0.15, 0.002).name('Node Glow Intensity').onChange(updateUniforms));
+        registerCtrl(lightFolder.add(params, 'backlightIntensity', 0.0, 2.0, 0.05).name('Backlight Rim Intensity').onChange(updateUniforms));
+        registerCtrl(lightFolder.add(params, 'sparkleIntensity', 0.0, 3.0, 0.05).name('Crystalline Sparkle').onChange(updateUniforms));
+        registerCtrl(lightFolder.add(params, 'sparkleDensity', 40.0, 300.0, 5.0).name('Sparkle Density').onChange(updateUniforms));
+
+        gui.close();
+
+        // Keyboard Shortcut 'H' to toggle UI
+        let isGuiVisible = true;
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'h' || e.key === 'H') {
+                isGuiVisible = !isGuiVisible;
+                gui.show(isGuiVisible);
+            }
+        });
+
+        // =========================================================================
+        // 10. MOUSE & TOUCH INTERACTION (ORBIT, PAN, ZOOM, CLICK RANDOMIZER)
+        // =========================================================================
+        let isDragging = false;
+        let isPanning = false;
+        let startMousePos = { x: 0, y: 0 };
+        let previousMousePosition = { x: 0, y: 0 };
+        let dragDistance = 0;
+
+        const targetMouseRot = new THREE.Vector2(0.5, 0.4);
+        const currentMouseRot = new THREE.Vector2(0.5, 0.4);
+        const baseMouseRot = new THREE.Vector2(0.5, 0.4);
+
+        const targetPan = new THREE.Vector2(0, 0);
+        const currentPan = new THREE.Vector2(0, 0);
+        const basePan = new THREE.Vector2(0, 0);
+        let currentZoom = params.zoom;
+
+        // Mouse Down
+        window.addEventListener('mousedown', (e) => {
+            if (e.target.tagName !== 'CANVAS') return;
+            startMousePos = { x: e.clientX, y: e.clientY };
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+            dragDistance = 0;
+
+            if (e.button === 2 || e.shiftKey) {
+                // Right click or Shift+Left click: Pan
+                isPanning = true;
+            } else if (e.button === 0) {
+                // Left click: Orbit
+                isDragging = true;
+            }
+        });
+
+        // Context Menu prevent on right drag
+        window.addEventListener('contextmenu', (e) => {
+            if (e.target.tagName === 'CANVAS') e.preventDefault();
+        });
+
+        // Mouse Move
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging && !isPanning) return;
+
+            const deltaX = e.clientX - previousMousePosition.x;
+            const deltaY = e.clientY - previousMousePosition.y;
+            dragDistance += Math.abs(deltaX) + Math.abs(deltaY);
+
+            if (isDragging) {
+                targetMouseRot.x += deltaX * 0.008;
+                targetMouseRot.y -= deltaY * 0.008;
+                // Clamp elevation angle to prevent inversion
+                targetMouseRot.y = Math.max(-1.5, Math.min(1.5, targetMouseRot.y));
+                baseMouseRot.copy(targetMouseRot);
+            } else if (isPanning) {
+                targetPan.x += deltaX * (params.dpr * 1.5);
+                targetPan.y -= deltaY * (params.dpr * 1.5);
+                basePan.copy(targetPan);
+            }
+
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+        });
+
+        // Mouse Up
+        window.addEventListener('mouseup', (e) => {
+            if (e.target.tagName === 'CANVAS' && dragDistance < 6 && params.randomizeOnClick && (isDragging || isPanning)) {
+                // User performed a clean click on the scene without dragging: trigger procedural randomizer!
+                randomizeScene();
+            }
+            isDragging = false;
+            isPanning = false;
+        });
+
+        // Mouse Wheel Zoom
+        window.addEventListener('wheel', (e) => {
+            if (e.target.tagName !== 'CANVAS') return;
+            e.preventDefault();
+
+            params.zoom += e.deltaY * 0.004;
+            params.zoom = Math.max(1.5, Math.min(14.0, params.zoom));
+
+            zoomCtrl.updateDisplay();
+            updateUniforms();
+        }, { passive: false });
+
+        // Touch Interaction support for mobile / trackpads
+        let touchStartDist = 0;
+        window.addEventListener('touchstart', (e) => {
+            if (e.target.tagName !== 'CANVAS') return;
+            if (e.touches.length === 1) {
+                startMousePos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                previousMousePosition = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                dragDistance = 0;
+                isDragging = true;
+            } else if (e.touches.length === 2) {
+                touchStartDist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+            }
+        });
+
+        window.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 1 && isDragging) {
+                const deltaX = e.touches[0].clientX - previousMousePosition.x;
+                const deltaY = e.touches[0].clientY - previousMousePosition.y;
+                dragDistance += Math.abs(deltaX) + Math.abs(deltaY);
+
+                targetMouseRot.x += deltaX * 0.008;
+                targetMouseRot.y -= deltaY * 0.008;
+                targetMouseRot.y = Math.max(-1.5, Math.min(1.5, targetMouseRot.y));
+                baseMouseRot.copy(targetMouseRot);
+
+                previousMousePosition = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            } else if (e.touches.length === 2) {
+                const dist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+                const delta = (touchStartDist - dist) * 0.01;
+                params.zoom = Math.max(1.5, Math.min(14.0, params.zoom + delta));
+                touchStartDist = dist;
+                zoomCtrl.updateDisplay();
+                updateUniforms();
+            }
+        });
+
+        window.addEventListener('touchend', (e) => {
+            if (dragDistance < 8 && params.randomizeOnClick && isDragging) {
+                randomizeScene();
+            }
+            isDragging = false;
+        });
+
+        // =========================================================================
+        // 11. RESIZE HANDLER
+        // =========================================================================
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            renderer.setSize(w, h);
+            uniforms.u_resolution.value.set(w * params.dpr, h * params.dpr);
+            postProcessor.setSize(w, h, params.dpr);
+        });
+
+        // =========================================================================
+        // 12. ANIMATION LOOP
+        // =========================================================================
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const elapsedTime = clock.getElapsedTime();
+            uniforms.u_time.value = elapsedTime;
+
+            // Apply selected automated camera & wave mode
+            applyAnimationPreset(elapsedTime);
+
+            // Smooth interpolation for mouse rotation & pan
+            currentMouseRot.lerp(targetMouseRot, 0.075);
+            uniforms.u_mouse_rot.value.copy(currentMouseRot);
+
+            currentPan.lerp(targetPan, 0.075);
+            uniforms.u_pan.value.copy(currentPan);
+
+            // Render through PostProcessor Pipeline
+            postProcessor.renderScene(scene, camera);
+        }
+
+        // Initial setup
+        setGreenScreen(params.greenScreen);
+        updateUniforms();
+        animate();
+    </script>
+</body>
+</html>
