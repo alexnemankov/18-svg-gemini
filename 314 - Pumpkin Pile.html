@@ -1,0 +1,2266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wind-Blown Leaves Around a Pumpkin Pile</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #eaeaea;
+        }
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+    <!-- Import map for Three.js and lil-gui -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+
+        // =========================================================================================
+        // POST PROCESSOR SUITE (Inlined from postprocessing/PostProcessor.js for standalone execution)
+        // =========================================================================================
+        const orthoVertexShader = `
+        precision highp float;
+        in vec3 position;
+        out vec2 vUv;
+        void main() {
+          vUv = position.xy * 0.5 + 0.5;
+          gl_Position = vec4(position, 1.0);
+        }
+        `;
+
+        const brightFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float bloomThreshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float knee = 0.1;
+          float soft = luminance - bloomThreshold + knee;
+          soft = clamp(soft, 0.0, 2.0 * knee);
+          soft = (soft * soft) / (4.0 * knee + 0.00001);
+          float contribution = max(soft, luminance - bloomThreshold);
+          contribution /= max(luminance, 0.00001);
+          fragColor = vec4(color.rgb * contribution, color.a);
+        }
+        `;
+
+        const blur13ShaderChunk = `
+        vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+          vec2 resolution = vec2(textureSize(image, 0));
+          vec4 color = vec4(0.0);
+          vec2 off1 = vec2(1.411764705882353) * direction;
+          vec2 off2 = vec2(3.2941176470588234) * direction;
+          vec2 off3 = vec2(5.176470588235294) * direction;
+          color += texture(image, uv) * 0.1964825501511404;
+          color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+          color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+          return color;
+        }
+        `;
+
+        const blurFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 direction;
+        in vec2 vUv;
+        out vec4 color;
+        ${blur13ShaderChunk}
+        void main() {
+          color = blur13(inputTexture, vUv, direction);
+        }
+        `;
+
+        const godRaysDepthMaskShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float threshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float factor = smoothstep(threshold, threshold + 0.15, lum);
+          fragColor = vec4(vec3(factor), 1.0);
+        }
+        `;
+
+        const godRaysGenerateShader = `
+        precision highp float;
+        #define TAPS_PER_PASS 6.0
+
+        uniform sampler2D inputTexture;
+        uniform vec3 vSunPositionScreenSpace;
+        uniform float fStepSize;
+        uniform float distanceAttenuation;
+        uniform float maxDensity;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec2 delta = vSunPositionScreenSpace.xy - vUv;
+          float dist = length(delta);
+          vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+          float iters = dist / max(fStepSize, 0.00001);
+
+          vec2 uv = vUv;
+          float col = 0.0;
+          float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+
+          float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+
+          if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+          uv += stepv;
+          if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+          uv += stepv;
+          if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+          uv += stepv;
+          if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+          uv += stepv;
+          if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+          uv += stepv;
+          if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+
+          float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+          fragColor = vec4(vec3(finalVal), 1.0);
+        }
+        `;
+
+        const anamorphicBrightShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float threshold;
+        uniform float smoothWidth;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+          fragColor = mix(vec4(0.0), color, alpha);
+        }
+        `;
+
+        const anamorphicBlurShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 resolution;
+        uniform float samples;
+        uniform float intensity;
+        uniform vec3 tintColor;
+        uniform float bloomRadius;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          int halfSamples = max(1, int(samples) / 2);
+          float fHalfSamples = float(halfSamples);
+          vec2 invSize = 1.0 / resolution;
+          vec4 total = vec4(0.0);
+
+          for (int i = -64; i <= 64; i++) {
+            if (i < -halfSamples || i > halfSamples) continue;
+            float softness = 1.0 - abs(float(i)) / fHalfSamples;
+            softness = pow(softness, 2.0);
+            vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+            shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+            total += texture(inputTexture, shiftedUV) * softness;
+          }
+
+          fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+        }
+        `;
+
+        const finalFragmentShader = `
+        precision highp float;
+        uniform vec2 resolution;
+        uniform sampler2D inputTexture;
+        uniform sampler2D blur0Texture;
+        uniform sampler2D blur1Texture;
+        uniform sampler2D blur2Texture;
+        uniform sampler2D blur3Texture;
+        uniform sampler2D blur4Texture;
+        uniform sampler2D raysTexture;
+        uniform sampler2D anamorphicTexture;
+        uniform bool bloomEnabled;
+        uniform float bloomStrength;
+        uniform bool raysEnabled;
+        uniform float raysStrength;
+        uniform vec3 raysColor;
+        uniform bool anamorphicEnabled;
+        uniform float vignetteBoost;
+        uniform float vignetteReduction;
+        uniform float noiseIntensity;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        float vignette(vec2 uv, float boost, float reduction) {
+          vec2 position = vUv - 0.5;
+          return boost - length(position) * reduction;
+        }
+
+        float hash1(uint n) {
+          n = (n << 13U) ^ n;
+          n = n * (n * n * 15731U + 789221U) + 1376312589U;
+          return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+        }
+
+        float noise(in vec2 uv, in float timeVal) {
+          uvec2 p = uvec2(uv);
+          return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+        }
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+
+          if (bloomEnabled && bloomStrength > 0.001) {
+            vec4 b0 = texture(blur0Texture, vUv);
+            vec4 b1 = texture(blur1Texture, vUv);
+            vec4 b2 = texture(blur2Texture, vUv);
+            vec4 b3 = texture(blur3Texture, vUv);
+            vec4 b4 = texture(blur4Texture, vUv);
+
+            vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+            color += bloomSum * bloomStrength;
+          }
+
+          if (raysEnabled && raysStrength > 0.001) {
+            vec4 r = texture(raysTexture, vUv);
+            color.rgb += r.rgb * raysColor * raysStrength;
+          }
+
+          if (anamorphicEnabled) {
+            vec4 a = texture(anamorphicTexture, vUv);
+            color.rgb += a.rgb;
+          }
+
+          color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+          color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+          fragColor = vec4(color.rgb, 1.0);
+        }
+        `;
+
+        const chromaticAberrationShaderChunk = `
+        vec2 barrelDistortion(vec2 coord, float amt) {
+          vec2 cc = coord - 0.5;
+          float dist = dot(cc, cc);
+          return coord + cc * dist * amt;
+        }
+        float sat(float t) { return clamp(t, 0.0, 1.0); }
+        float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+        float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+        vec4 spectrum_offset(float t) {
+          float lo = step(t, 0.5);
+          float hi = 1.0 - lo;
+          float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+          vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+          return pow(ret, vec4(1.0 / 2.2));
+        }
+        const float max_distort = 2.2;
+        const int num_iter = 8;
+        const float reci_num_iter_f = 1.0 / float(num_iter);
+        vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+          vec4 sumcol = vec4(0.0);
+          vec4 sumw = vec4(0.0);
+          for (int i = 0; i < num_iter; ++i) {
+            float t = float(i) * reci_num_iter_f;
+            vec4 w = spectrum_offset(t);
+            sumw += w;
+            sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+          }
+          return sumcol / sumw;
+        }
+        `;
+
+        const colorFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float chromaticAberrationAmount;
+        uniform float minInputLevel;
+        uniform float maxInputLevel;
+        uniform float gammaLevel;
+        uniform float exposure;
+        uniform float fisheyeStrength;
+        uniform float fisheyeRadius;
+        uniform float time;
+        uniform int visionMode;
+        uniform float thermalSensitivity;
+        uniform float nightVisionNoise;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        ${chromaticAberrationShaderChunk}
+
+        vec2 applyFisheye(vec2 uv, float strength, float radius) {
+          if (abs(strength) < 0.0001) return uv;
+          vec2 p = uv - 0.5;
+          float d = length(p);
+          if (d > radius * 1.5) return uv;
+          float r = d / max(radius, 0.001);
+          float theta = atan(p.y, p.x);
+          float rDist = r + strength * (r * r * r);
+          return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+        }
+
+        vec3 ACESFilmicToneMapping(vec3 color) {
+          float a = 2.51;
+          float b = 0.03;
+          float c = 2.43;
+          float d = 0.59;
+          float e = 0.14;
+          return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+        }
+
+        vec3 gammaCorrect(vec3 color, vec3 gamma) {
+          return pow(max(color, vec3(0.0)), 1.0 / gamma);
+        }
+        vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+          return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+        }
+        vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+          return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+        }
+
+        vec3 applyNightVision(vec3 color, vec2 uv, float timeVal, float noiseAmt) {
+          float lum = dot(color, vec3(0.299, 0.587, 0.114));
+          float amplified = pow(lum * 2.1, 0.72);
+          vec3 phosphorColor = mix(vec3(0.02, 0.12, 0.03), vec3(0.18, 1.0, 0.32), clamp(amplified, 0.0, 1.0));
+          phosphorColor += vec3(0.7, 1.0, 0.8) * max(0.0, amplified - 0.75) * 1.8;
+          vec2 p = uv - 0.5;
+          float tubeDist = length(p);
+          float tubeMask = smoothstep(0.72, 0.44, tubeDist);
+          float n = fract(sin(dot(uv * 280.0 + timeVal * 0.05, vec2(12.9898, 78.233))) * 43758.5453);
+          float scanline = sin(uv.y * 650.0) * 0.05;
+          phosphorColor += (n - 0.5) * noiseAmt * 2.0 + scanline;
+          return clamp(phosphorColor * tubeMask, 0.0, 1.0);
+        }
+
+        vec3 ironbow(float t) {
+          t = clamp(t, 0.0, 1.0);
+          vec3 c0 = vec3(0.02, 0.01, 0.18);
+          vec3 c1 = vec3(0.22, 0.02, 0.48);
+          vec3 c2 = vec3(0.82, 0.05, 0.25);
+          vec3 c3 = vec3(1.0, 0.62, 0.02);
+          vec3 c4 = vec3(1.0, 1.0, 0.92);
+          if (t < 0.25) return mix(c0, c1, t * 4.0);
+          if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+          if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+          return mix(c3, c4, (t - 0.75) * 4.0);
+        }
+
+        vec3 applyThermal(vec3 color, vec2 uv, float sensitivity, bool whiteHot) {
+          float lum = dot(color, vec3(0.299, 0.587, 0.114));
+          float heat = clamp(lum * sensitivity, 0.0, 1.0);
+          float sensorRaster = sin(uv.y * 900.0) * 0.015;
+          heat = clamp(heat + sensorRaster, 0.0, 1.0);
+          if (whiteHot) {
+            float grad = pow(heat, 0.85);
+            return vec3(grad);
+          } else {
+            return ironbow(heat);
+          }
+        }
+
+        void main() {
+          vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+          vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+          vec3 finalCol = col.rgb;
+
+          if (visionMode == 1) {
+            finalCol = applyNightVision(finalCol, uv, time, nightVisionNoise);
+          } else if (visionMode == 2) {
+            finalCol = applyThermal(finalCol, uv, thermalSensitivity, false);
+          } else if (visionMode == 3) {
+            finalCol = applyThermal(finalCol, uv, thermalSensitivity, true);
+          } else {
+            vec3 exposedColor = finalCol * exposure;
+            vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+            finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+          }
+
+          fragColor = vec4(finalCol, 1.0);
+        }
+        `;
+
+        const copyFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        in vec2 vUv;
+        out vec4 fragColor;
+        void main() {
+          fragColor = texture(inputTexture, vUv);
+        }
+        `;
+
+        function createFBO(w, h, options = {}) {
+          return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+            wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+            wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+            minFilter: options.minFilter || THREE.LinearFilter,
+            magFilter: options.magFilter || THREE.LinearFilter,
+            format: options.format || THREE.RGBAFormat,
+            type: options.type || THREE.HalfFloatType,
+            stencilBuffer: options.stencilBuffer || false,
+            depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+            samples: options.samples || 0,
+          });
+        }
+
+        class ShaderPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbo = createFBO(1, 1, options);
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+            this.texture = this.fbo.texture;
+          }
+          render(renderer, toScreen = false) {
+            if (!toScreen) {
+              renderer.setRenderTarget(this.fbo);
+            }
+            renderer.render(this.orthoScene, this.orthoCamera);
+            if (!toScreen) {
+              renderer.setRenderTarget(null);
+            }
+          }
+          setSize(width, height) {
+            this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+            this.orthoQuad.scale.set(width, height, 1);
+          }
+        }
+
+        class ShaderPingPongPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+            this.currentFBO = 0;
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+          }
+          render(renderer) {
+            renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+            renderer.render(this.orthoScene, this.orthoCamera);
+            renderer.setRenderTarget(null);
+            this.currentFBO = 1 - this.currentFBO;
+          }
+          get current() { return this.fbos[this.currentFBO]; }
+          get texture() { return this.current.texture; }
+          setSize(width, height) {
+            const w = Math.max(1, width);
+            const h = Math.max(1, height);
+            this.orthoQuad.scale.set(w, h, 1);
+            this.fbos[0].setSize(w, h);
+            this.fbos[1].setSize(w, h);
+          }
+        }
+
+        class BloomPass {
+          constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+            this.strength = strength;
+            this.radius = radius;
+            this.threshold = threshold;
+            this.enabled = true;
+            this.levels = levels;
+
+            this.brightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                bloomThreshold: { value: this.threshold },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: brightFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.brightPass = new ShaderPass(this.brightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.blurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                direction: { value: new THREE.Vector2(0, 1) },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: blurFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+
+            this.blurPasses = [];
+            for (let i = 0; i < this.levels; i++) {
+              this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+                format: THREE.RGBAFormat,
+                type: THREE.HalfFloatType,
+              }));
+            }
+          }
+
+          setSize(w, h) {
+            let tw = Math.max(1, w);
+            let th = Math.max(1, h);
+            this.brightPass.setSize(tw, th);
+            for (let i = 0; i < this.levels; i++) {
+              tw = Math.max(1, Math.round(tw / 2));
+              th = Math.max(1, Math.round(th / 2));
+              this.blurPasses[i].setSize(tw, th);
+            }
+          }
+
+          set source(texture) {
+            this.brightShader.uniforms.inputTexture.value = texture;
+          }
+
+          render(renderer) {
+            if (!this.enabled || this.strength <= 0.001) return;
+
+            this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+            this.brightPass.render(renderer);
+
+            const baseOffset = Math.max(0.1, this.radius * 2.0);
+            const u = this.blurShader.uniforms;
+
+            for (let j = 0; j < this.levels; j++) {
+              const blurPass = this.blurPasses[j];
+              const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+              u.direction.value.set(stepOffset, 0);
+              u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+              blurPass.render(renderer);
+
+              u.direction.value.set(0, stepOffset * 0.5);
+              u.inputTexture.value = blurPass.current.texture;
+              blurPass.render(renderer);
+            }
+          }
+        }
+
+        const VISION_MODE_MAP = {
+          'Normal (Cinematic)': 0,
+          'Night Vision (Phosphor)': 1,
+          'Thermal (Ironbow)': 2,
+          'Thermal (White-Hot)': 3,
+        };
+
+        class PostProcessor {
+          constructor(renderer, params = {}) {
+            this.renderer = renderer;
+
+            this.settings = {
+              enabled: params.enabled !== undefined ? params.enabled : true,
+              bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+              bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 2.05,
+              bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 1.35,
+              bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.21,
+
+              raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : false,
+              raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.75,
+              raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+              raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+              raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+              raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.15,
+              raysColor: params.raysColor ? (params.raysColor.isColor ? params.raysColor.clone() : new THREE.Color(params.raysColor)) : new THREE.Color(0xffdba4),
+              raysColorHex: params.raysColorHex || '#ffdba4',
+
+              anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+              anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+              anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.4,
+              anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 64,
+              anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+              anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+              anamorphicColor: params.anamorphicColor ? (params.anamorphicColor.isColor ? params.anamorphicColor.clone() : new THREE.Color(params.anamorphicColor)) : new THREE.Color(0xffaa55),
+              anamorphicColorHex: params.anamorphicColorHex || '#ffaa55',
+
+              visionMode: params.visionMode !== undefined ? params.visionMode : 'Normal (Cinematic)',
+              thermalSensitivity: params.thermalSensitivity !== undefined ? params.thermalSensitivity : 1.4,
+              nightVisionNoise: params.nightVisionNoise !== undefined ? params.nightVisionNoise : 0.12,
+
+              fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+              fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+              chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.045,
+              vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+              vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.55,
+              noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+
+              gamma: params.gamma !== undefined ? params.gamma : 1.0,
+              minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+              maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+              exposure: params.exposure !== undefined ? params.exposure : 1.0,
+            };
+
+            this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+            this.bloomPass = new BloomPass(
+              this.settings.bloomStrength,
+              this.settings.bloomRadius,
+              this.settings.bloomThreshold,
+              5
+            );
+
+            this.sunScreenPos = new THREE.Vector3(0.5, 0.7, 1.0);
+            this.sunInFront = true;
+
+            this.godRaysMaskShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                threshold: { value: this.settings.raysThreshold },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: godRaysDepthMaskShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.godRaysMaskPass = new ShaderPass(this.godRaysMaskShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.godRaysGenShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                vSunPositionScreenSpace: { value: this.sunScreenPos },
+                fStepSize: { value: 1.0 },
+                distanceAttenuation: { value: this.settings.raysDistanceAttenuation },
+                maxDensity: { value: this.settings.raysMaxDensity },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: godRaysGenerateShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.godRaysPingPong = new ShaderPingPongPass(this.godRaysGenShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                threshold: { value: this.settings.anamorphicThreshold },
+                smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: anamorphicBrightShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                resolution: { value: new THREE.Vector2(1, 1) },
+                samples: { value: this.settings.anamorphicSamples },
+                intensity: { value: this.settings.anamorphicIntensity },
+                tintColor: { value: this.settings.anamorphicColor },
+                bloomRadius: { value: this.settings.anamorphicRadius },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: anamorphicBlurShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.finalShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                resolution: { value: new THREE.Vector2(1, 1) },
+                bloomEnabled: { value: this.settings.bloomEnabled },
+                bloomStrength: { value: this.settings.bloomStrength },
+                raysEnabled: { value: this.settings.raysEnabled },
+                raysStrength: { value: this.settings.raysStrength },
+                raysColor: { value: this.settings.raysColor },
+                anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+                vignetteBoost: { value: this.settings.vignetteBoost },
+                vignetteReduction: { value: this.settings.vignetteReduction },
+                noiseIntensity: { value: this.settings.noiseIntensity },
+                inputTexture: { value: null },
+                blur0Texture: { value: null },
+                blur1Texture: { value: null },
+                blur2Texture: { value: null },
+                blur3Texture: { value: null },
+                blur4Texture: { value: null },
+                raysTexture: { value: null },
+                anamorphicTexture: { value: null },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: finalFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.finalPass = new ShaderPass(this.finalShader);
+
+            this.rgbShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: this.finalPass.texture },
+                fisheyeStrength: { value: this.settings.fisheyeStrength },
+                fisheyeRadius: { value: this.settings.fisheyeRadius },
+                chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+                minInputLevel: { value: this.settings.minInputLevel },
+                maxInputLevel: { value: this.settings.maxInputLevel },
+                gammaLevel: { value: this.settings.gamma },
+                exposure: { value: this.settings.exposure },
+                visionMode: { value: VISION_MODE_MAP[this.settings.visionMode] ?? 0 },
+                thermalSensitivity: { value: this.settings.thermalSensitivity },
+                nightVisionNoise: { value: this.settings.nightVisionNoise },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: colorFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.rgbPass = new ShaderPass(this.rgbShader);
+
+            this.copyShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: copyFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.copyPass = new ShaderPass(this.copyShader);
+          }
+
+          updateSettings() {
+            this.bloomPass.enabled = this.settings.bloomEnabled;
+            this.bloomPass.strength = this.settings.bloomStrength;
+            this.bloomPass.radius = this.settings.bloomRadius;
+            this.bloomPass.threshold = this.settings.bloomThreshold;
+
+            this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+            this.godRaysGenShader.uniforms.distanceAttenuation.value = this.settings.raysDistanceAttenuation;
+            this.godRaysGenShader.uniforms.maxDensity.value = this.settings.raysMaxDensity;
+
+            this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+            this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+            this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+            this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+            this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+            this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+            this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+            this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+            this.finalShader.uniforms.raysEnabled.value = this.settings.raysEnabled && this.sunInFront;
+            this.finalShader.uniforms.raysStrength.value = this.settings.raysStrength;
+            this.finalShader.uniforms.raysColor.value.copy(this.settings.raysColor);
+            this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+            this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+            this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+            this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+            this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+            this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+            this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+            this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+            this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+            this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+            this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+            this.rgbShader.uniforms.visionMode.value = VISION_MODE_MAP[this.settings.visionMode] ?? 0;
+            this.rgbShader.uniforms.thermalSensitivity.value = this.settings.thermalSensitivity;
+            this.rgbShader.uniforms.nightVisionNoise.value = this.settings.nightVisionNoise;
+          }
+
+          setSize(w0, h0, dpr = 1) {
+            const w = Math.max(1, Math.floor(w0 * dpr));
+            const h = Math.max(1, Math.floor(h0 * dpr));
+            this.sceneTarget.setSize(w, h);
+            this.finalPass.setSize(w, h);
+            this.finalShader.uniforms.resolution.value.set(w, h);
+            this.bloomPass.setSize(w, h);
+
+            const grW = Math.max(1, Math.round(w / 2));
+            const grH = Math.max(1, Math.round(h / 2));
+            this.godRaysMaskPass.setSize(grW, grH);
+            this.godRaysPingPong.setSize(grW, grH);
+
+            const anW = Math.max(1, Math.round(w / 4));
+            const anH = Math.max(1, Math.round(h / 4));
+            this.anamorphicBrightPass.setSize(anW, anH);
+            this.anamorphicBlurPass.setSize(anW, anH);
+            this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+            this.rgbPass.setSize(w, h);
+            this.copyPass.setSize(w, h);
+          }
+
+          setSunScreenPosition(camera, sunWorldPos) {
+            if (!this._camDir) {
+              this._camDir = new THREE.Vector3();
+              this._toSun = new THREE.Vector3();
+              this._ndc = new THREE.Vector3();
+            }
+            camera.getWorldDirection(this._camDir);
+            this._toSun.copy(sunWorldPos).sub(camera.position).normalize();
+            const dot = this._camDir.dot(this._toSun);
+
+            if (dot <= 0.02) {
+              this.sunInFront = false;
+              this.finalShader.uniforms.raysEnabled.value = false;
+              return;
+            }
+
+            this.sunInFront = true;
+            const fade = THREE.MathUtils.clamp((dot - 0.02) / 0.15, 0.0, 1.0);
+
+            this._ndc.copy(sunWorldPos).project(camera);
+            const screenX = this._ndc.x * 0.5 + 0.5;
+            const screenY = this._ndc.y * 0.5 + 0.5;
+            const screenZ = fade;
+
+            this.sunScreenPos.set(screenX, screenY, screenZ);
+            this.godRaysGenShader.uniforms.vSunPositionScreenSpace.value.set(screenX, screenY, screenZ);
+          }
+
+          renderScene(scene, camera) {
+            if (!this.settings.enabled) {
+              this.renderer.render(scene, camera);
+              return;
+            }
+            this.renderer.setRenderTarget(this.sceneTarget);
+            this.renderer.render(scene, camera);
+            this.renderer.setRenderTarget(null);
+            this.render(this.sceneTarget.texture);
+          }
+
+          render(sourceTexture) {
+            if (!this.settings.enabled) {
+              this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+              this.copyPass.render(this.renderer, true);
+              return;
+            }
+
+            this.updateSettings();
+
+            this.bloomPass.source = sourceTexture;
+            this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+            this.bloomPass.render(this.renderer);
+
+            this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+            this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+            this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+            this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+            this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+            if (this.settings.raysEnabled && this.settings.raysStrength > 0.001 && this.sunInFront) {
+              this.godRaysMaskShader.uniforms.inputTexture.value = sourceTexture;
+              this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+              this.godRaysMaskPass.render(this.renderer);
+
+              const filterLen = this.settings.raysDensity;
+              const tapsPerPass = 6.0;
+
+              this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -1.0);
+              this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysMaskPass.texture;
+              this.godRaysPingPong.render(this.renderer);
+
+              this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -2.0);
+              this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+              this.godRaysPingPong.render(this.renderer);
+
+              this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -3.0);
+              this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+              this.godRaysPingPong.render(this.renderer);
+
+              this.finalPass.shader.uniforms.raysTexture.value = this.godRaysPingPong.texture;
+              this.finalPass.shader.uniforms.raysEnabled.value = true;
+            } else {
+              this.finalPass.shader.uniforms.raysEnabled.value = false;
+            }
+
+            if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+              this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+              this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+              this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+              this.anamorphicBrightPass.render(this.renderer);
+
+              this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+              this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+              this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+              this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+              this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+              this.anamorphicBlurPass.render(this.renderer);
+
+              this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+              this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+            } else {
+              this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+            }
+
+            const randomTime = Math.random() * 100000;
+            this.finalPass.shader.uniforms.time.value = randomTime;
+            this.rgbPass.shader.uniforms.time.value = randomTime;
+
+            this.finalPass.render(this.renderer);
+            this.rgbPass.render(this.renderer, true);
+          }
+
+          attachGUI(gui, title = "Post-Processing Suite") {
+            const root = gui.addFolder(title);
+            root.add(this.settings, "enabled").name("Enable Post-Process");
+
+            const bloom = root.addFolder("Atmospheric Bloom");
+            bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+            const rays = root.addFolder("Volumetric Godrays");
+            rays.add(this.settings, "raysEnabled").name("Enable Rays").onChange(() => this.updateSettings());
+            rays.add(this.settings, "raysStrength", 0, 3.0, 0.05).name("Intensity").onChange(() => this.updateSettings());
+            rays.add(this.settings, "raysDensity", 0.1, 2.5, 0.05).name("Spread Density").onChange(() => this.updateSettings());
+            rays.add(this.settings, "raysThreshold", 0.0, 0.8, 0.01).name("Light Threshold").onChange(() => this.updateSettings());
+            rays.addColor(this.settings, "raysColorHex").name("Ray Tint").onChange((v) => {
+              this.settings.raysColor.set(v);
+              this.updateSettings();
+            });
+
+            const anamorphic = root.addFolder("Anamorphic Flare");
+            anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Flare").onChange(() => this.updateSettings());
+            anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+            anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+            anamorphic.addColor(this.settings, "anamorphicColorHex").name("Flare Tint").onChange((v) => {
+              this.settings.anamorphicColor.set(v);
+              this.updateSettings();
+            });
+
+            const vision = root.addFolder("Thermal & Night Vision");
+            vision.add(this.settings, "visionMode", Object.keys(VISION_MODE_MAP)).name("Vision Mode").onChange(() => this.updateSettings());
+            vision.add(this.settings, "thermalSensitivity", 0.5, 3.5, 0.05).name("Thermal Sensitivity").onChange(() => this.updateSettings());
+            vision.add(this.settings, "nightVisionNoise", 0.0, 0.3, 0.01).name("NVG Noise").onChange(() => this.updateSettings());
+
+            const lens = root.addFolder("Lens Optics & Film Grain");
+            lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+            lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+            lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+            lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+            lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+            lens.add(this.settings, "exposure", 0.1, 3.0, 0.05).name("Exposure").onChange(() => this.updateSettings());
+            lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+            lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+            return root;
+          }
+        }
+
+        // --- 18 Preconfigured Color Palettes ---
+        const PALETTES = {
+            'Monochromatic': {
+                bg: '#140a04',
+                pumpkinMain: '#e67e22',
+                pumpkinAccent: '#d35400',
+                stem: '#4e2808',
+                leaves: ['#f39c12', '#e67e22', '#d35400', '#f8c471'],
+                ground: '#1f1008',
+                light: '#ffdca8',
+                ambient: '#3a1e0f'
+            },
+            'Analogous': {
+                bg: '#140609',
+                pumpkinMain: '#e65100',
+                pumpkinAccent: '#c2185b',
+                stem: '#3e2723',
+                leaves: ['#fdd835', '#fb8c00', '#e53935', '#ad1457'],
+                ground: '#220b13',
+                light: '#ffe0b2',
+                ambient: '#3d1620'
+            },
+            'Complementary': {
+                bg: '#050d1a',
+                pumpkinMain: '#f26419',
+                pumpkinAccent: '#f6ae2d',
+                stem: '#2f4858',
+                leaves: ['#f26419', '#f6ae2d', '#33658a', '#86bbd8'],
+                ground: '#0c1a2d',
+                light: '#ffe6cc',
+                ambient: '#142942'
+            },
+            'Split-Complementary': {
+                bg: '#041014',
+                pumpkinMain: '#f77f00',
+                pumpkinAccent: '#fcbf49',
+                stem: '#003049',
+                leaves: ['#f77f00', '#fcbf49', '#06d6a0', '#118ab2'],
+                ground: '#091b22',
+                light: '#ffeedb',
+                ambient: '#0e2b36'
+            },
+            'Triadic': {
+                bg: '#0e0b16',
+                pumpkinMain: '#ff7b00',
+                pumpkinAccent: '#ffaa00',
+                stem: '#1b4332',
+                leaves: ['#ff7b00', '#2d6a4f', '#7209b7', '#b5179e'],
+                ground: '#181426',
+                light: '#ffe8d6',
+                ambient: '#2b1f3d'
+            },
+            'Tetradic': {
+                bg: '#0c0f0d',
+                pumpkinMain: '#f3722c',
+                pumpkinAccent: '#f8961e',
+                stem: '#3d314a',
+                leaves: ['#f3722c', '#90be6d', '#43aa8b', '#7b2cbf'],
+                ground: '#161c18',
+                light: '#fceade',
+                ambient: '#232d26'
+            },
+            'Double Split-Complementary': {
+                bg: '#0a0815',
+                pumpkinMain: '#e76f51',
+                pumpkinAccent: '#f4a261',
+                stem: '#264653',
+                leaves: ['#e76f51', '#e9c46a', '#2a9d8f', '#7b2cbf'],
+                ground: '#141026',
+                light: '#ffe9d6',
+                ambient: '#251c3d'
+            },
+            'Achromatic (Black & White)': {
+                bg: '#000000',
+                pumpkinMain: '#d8d8d8',
+                pumpkinAccent: '#888888',
+                stem: '#303030',
+                leaves: ['#ffffff', '#cccccc', '#888888', '#555555'],
+                ground: '#141414',
+                light: '#ffffff',
+                ambient: '#282828'
+            },
+            'Achromatic (White & Black)': {
+                bg: '#eaeaea',
+                pumpkinMain: '#1c1c1c',
+                pumpkinAccent: '#383838',
+                stem: '#777777',
+                leaves: ['#000000', '#2a2a2a', '#5c5c5c', '#999999'],
+                ground: '#cccccc',
+                light: '#ffffff',
+                ambient: '#aaaaaa'
+            },
+            'Neutral + Accent': {
+                bg: '#0d1117',
+                pumpkinMain: '#ff5500',
+                pumpkinAccent: '#ff7722',
+                stem: '#30363d',
+                leaves: ['#ff5500', '#f0883e', '#8b949e', '#484f58'],
+                ground: '#161b22',
+                light: '#ffeedb',
+                ambient: '#22272e'
+            },
+            'Harvest Fire (F6AA1C, BC3908...)': {
+                bg: '#220901',
+                pumpkinMain: '#f6aa1c',
+                pumpkinAccent: '#bc3908',
+                stem: '#3a1306',
+                leaves: ['#f6aa1c', '#bc3908', '#941b0c', '#ffc15e'],
+                ground: '#331005',
+                light: '#ffdba4',
+                ambient: '#4a1708'
+            },
+            'Frozen Teal (63D1CF, 5BC0BE...)': {
+                bg: '#000000',
+                pumpkinMain: '#63d1cf',
+                pumpkinAccent: '#5bc0be',
+                stem: '#0b132b',
+                leaves: ['#63d1cf', '#5bc0be', '#4bad9e', '#84e6e4'],
+                ground: '#0b132b',
+                light: '#c2f7f6',
+                ambient: '#132142'
+            },
+            'Lavender Dusk (AA60C8, D69ADE...)': {
+                bg: '#0d001d',
+                pumpkinMain: '#aa60c8',
+                pumpkinAccent: '#d69ade',
+                stem: '#120a12',
+                leaves: ['#aa60c8', '#d69ade', '#c9a3c6', '#cfb5c2'],
+                ground: '#1b082e',
+                light: '#f2dcf7',
+                ambient: '#2a1142'
+            },
+            'Amber & Spruce (FEF1BE, FFBA00...)': {
+                bg: '#061210',
+                pumpkinMain: '#ffba00',
+                pumpkinAccent: '#fef1be',
+                stem: '#00474d',
+                leaves: ['#fef1be', '#ffba00', '#008189', '#00474d'],
+                ground: '#0c211e',
+                light: '#fff4d4',
+                ambient: '#102e29'
+            },
+            'Radiant Lime (D4FFB0, 7FFF00...)': {
+                bg: '#05140a',
+                pumpkinMain: '#7fff00',
+                pumpkinAccent: '#d4ffb0',
+                stem: '#0a3322',
+                leaves: ['#d4ffb0', '#7fff00', '#00b894', '#0a3322'],
+                ground: '#0c2414',
+                light: '#eaffd4',
+                ambient: '#143820'
+            },
+            'Twilight Ember (FFE8CC, FF8C00...)': {
+                bg: '#0e0618',
+                pumpkinMain: '#ff8c00',
+                pumpkinAccent: '#ffe8cc',
+                stem: '#3d1050',
+                leaves: ['#ffe8cc', '#ff8c00', '#c7501a', '#3d1050'],
+                ground: '#1c0c30',
+                light: '#fff0dc',
+                ambient: '#2c1445'
+            },
+            'Royal Twilight (E8E0FF, B38FFF...)': {
+                bg: '#090612',
+                pumpkinMain: '#b38fff',
+                pumpkinAccent: '#e8e0ff',
+                stem: '#1a1250',
+                leaves: ['#e8e0ff', '#b38fff', '#6a3de8', '#1a1250'],
+                ground: '#170e30',
+                light: '#f3edff',
+                ambient: '#241747'
+            },
+            'Cyber Neon (E0FBFF, 00F0FF...)': {
+                bg: '#05020f',
+                pumpkinMain: '#00f0ff',
+                pumpkinAccent: '#e0fbff',
+                stem: '#1e0a3d',
+                leaves: ['#e0fbff', '#00f0ff', '#d40078', '#1e0a3d'],
+                ground: '#12072e',
+                light: '#cff7ff',
+                ambient: '#230e52'
+            }
+        };
+
+        // --- 8 Preconfigured Cinematic Camera Animations ---
+        const ANIMATION_MODES = [
+            'Static (No Camera Motion)',
+            'Autumn Breeze Orbit',
+            'Ground Level Swirl',
+            'Elevated Spiral Descent',
+            'Whispering Porch Sway',
+            'Intimate Pumpkin Close-up',
+            'Golden Hour Arc',
+            'Autumn Vortex Tracking'
+        ];
+
+        // --- Master Simulation Parameters (Defaulted to uploaded preset) ---
+        const params = {
+            // Presets
+            colorScheme: 'Achromatic (White & Black)',
+            cameraAnimation: 'Static (No Camera Motion)',
+
+            // Greenscreen and Display
+            greenscreen: false,
+            dpr: 'Device',
+            animationSpeed: 0.65,
+
+            // Wind & Turbulence (Exact values from user configuration)
+            windSpeed: 0.56,
+            curlStrength: 1.32,
+            curlScale: 0.10,
+            vortexSwirl: 0.92,
+            updraft: 1.05,
+            gravity: 1.15,
+            leafFlutter: 0.69,
+
+            // Leaves Geometry
+            leafScale: 0.28,
+            leafCount: 2600,
+
+            // Direct Color Customization (Achromatic White & Black default)
+            bgColor: '#eaeaea',
+            pumpkinMainColor: '#1c1c1c',
+            pumpkinAccentColor: '#383838',
+            stemColor: '#777777',
+            leafColor1: '#000000',
+            leafColor2: '#2a2a2a',
+            leafColor3: '#5c5c5c',
+            leafColor4: '#999999',
+
+            // Interaction
+            clickToRandomize: true
+        };
+
+        // --- Three.js Scene, Camera, Renderer ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(params.bgColor);
+        scene.fog = new THREE.FogExp2(params.bgColor, 0.024);
+
+        // Camera framed to exactly match user view (King pumpkin centered, full swirl above)
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 4.0, 16.0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.1;
+        container.appendChild(renderer.domElement);
+
+        // Initialize PostProcessor Suite with user's exact default values
+        const postProcessor = new PostProcessor(renderer, {
+            enabled: true,
+            bloomEnabled: true,
+            bloomStrength: 2.05,
+            bloomRadius: 1.35,
+            bloomThreshold: 0.21,
+
+            raysEnabled: false,
+            raysStrength: 0.75,
+            raysDensity: 1.0,
+            raysMaxDensity: 0.5,
+            raysDistanceAttenuation: 2.0,
+            raysThreshold: 0.15,
+            raysColor: new THREE.Color(0xffdba4),
+            raysColorHex: '#ffdba4',
+
+            anamorphicEnabled: false,
+            anamorphicIntensity: 4.0,
+            anamorphicThreshold: 0.4,
+            anamorphicSamples: 64,
+            anamorphicRadius: 0.0,
+            anamorphicSmoothWidth: 0.05,
+            anamorphicColor: new THREE.Color(0xffaa55),
+            anamorphicColorHex: '#ffaa55',
+
+            visionMode: 'Normal (Cinematic)',
+            thermalSensitivity: 1.4,
+            nightVisionNoise: 0.12,
+
+            fisheyeStrength: 0.0,
+            fisheyeRadius: 1.0,
+            chromaticAberration: 0.045,
+            vignetteBoost: 1.05,
+            vignetteReduction: 0.55,
+            noiseIntensity: 0.012,
+
+            gamma: 1.0,
+            minInputLevel: 0.0,
+            maxInputLevel: 1.0,
+            exposure: 1.0
+        });
+
+        function updateDPR(val) {
+            let ratio = 1;
+            if (val === 'Device') {
+                ratio = window.devicePixelRatio || 1;
+            } else {
+                ratio = parseFloat(val) || 1;
+            }
+            const dpr = Math.min(Math.max(ratio, 0.5), 2.5);
+            renderer.setPixelRatio(dpr);
+            if (postProcessor) {
+                postProcessor.setSize(window.innerWidth, window.innerHeight, dpr);
+            }
+        }
+        updateDPR(params.dpr);
+
+        // --- Camera Controls (Zoom with wheel + Drag object across screen) ---
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.enableZoom = true;
+        controls.zoomSpeed = 1.1;
+        controls.enablePan = true;
+        controls.screenSpacePanning = true;
+        controls.panSpeed = 1.0;
+        controls.rotateSpeed = 0.8;
+        controls.minDistance = 2.0;
+        controls.maxDistance = 50.0;
+        controls.target.set(0, 3.6, 0);
+        controls.update();
+        controls.saveState();
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xfff0dc, 2.2);
+        sunLight.position.set(12, 22, 10);
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 2048;
+        sunLight.shadow.mapSize.height = 2048;
+        sunLight.shadow.camera.near = 1;
+        sunLight.shadow.camera.far = 45;
+        sunLight.shadow.camera.left = -12;
+        sunLight.shadow.camera.right = 12;
+        sunLight.shadow.camera.top = 12;
+        sunLight.shadow.camera.bottom = -12;
+        sunLight.shadow.bias = -0.0005;
+        scene.add(sunLight);
+
+        const rimLight = new THREE.DirectionalLight(0xffb077, 1.4);
+        rimLight.position.set(-14, 10, -14);
+        scene.add(rimLight);
+
+        const bounceLight = new THREE.PointLight(0xffaa55, 1.0, 15);
+        bounceLight.position.set(0, 0.8, 0);
+        scene.add(bounceLight);
+
+        // --- Procedural 3D Simplex Noise Field for Curl Noise ---
+        const F3 = 1.0 / 3.0;
+        const G3 = 1.0 / 6.0;
+        const pTable = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) pTable[i] = Math.floor(Math.random() * 256);
+        const perm = new Uint8Array(512);
+        const permMod12 = new Uint8Array(512);
+        for (let i = 0; i < 512; i++) {
+            perm[i] = pTable[i & 255];
+            permMod12[i] = perm[i] % 12;
+        }
+        const grad3 = new Float32Array([
+            1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0,
+            1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1,
+            0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1
+        ]);
+
+        function snoise(x, y, z) {
+            let n0, n1, n2, n3;
+            const s = (x + y + z) * F3;
+            const i = Math.floor(x + s);
+            const j = Math.floor(y + s);
+            const k = Math.floor(z + s);
+            const t = (i + j + k) * G3;
+            const X0 = i - t;
+            const Y0 = j - t;
+            const Z0 = k - t;
+            const x0 = x - X0;
+            const y0 = y - Y0;
+            const z0 = z - Z0;
+            let i1, j1, k1, i2, j2, k2;
+            if (x0 >= y0) {
+                if (y0 >= z0) { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+                else if (x0 >= z0) { i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 0; k2 = 1; }
+                else { i1 = 0; j1 = 0; k1 = 1; i2 = 1; j2 = 0; k2 = 1; }
+            } else {
+                if (y0 < z0) { i1 = 0; j1 = 0; k1 = 1; i2 = 0; j2 = 1; k2 = 1; }
+                else if (x0 < z0) { i1 = 0; j1 = 1; k1 = 0; i2 = 0; j2 = 1; k2 = 1; }
+                else { i1 = 0; j1 = 1; k1 = 0; i2 = 1; j2 = 1; k2 = 0; }
+            }
+            const x1 = x0 - i1 + G3;
+            const y1 = y0 - j1 + G3;
+            const z1 = z0 - k1 + G3;
+            const x2 = x0 - i2 + 2.0 * G3;
+            const y2 = y0 - j2 + 2.0 * G3;
+            const z2 = z0 - k2 + 2.0 * G3;
+            const x3 = x0 - 1.0 + 3.0 * G3;
+            const y3 = y0 - 1.0 + 3.0 * G3;
+            const z3 = z0 - 1.0 + 3.0 * G3;
+            const ii = i & 255;
+            const jj = j & 255;
+            const kk = k & 255;
+            let t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0;
+            if (t0 < 0) n0 = 0.0;
+            else {
+                t0 *= t0;
+                const gi0 = permMod12[ii + perm[jj + perm[kk]]] * 3;
+                n0 = t0 * t0 * (grad3[gi0] * x0 + grad3[gi0 + 1] * y0 + grad3[gi0 + 2] * z0);
+            }
+            let t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1;
+            if (t1 < 0) n1 = 0.0;
+            else {
+                t1 *= t1;
+                const gi1 = permMod12[ii + i1 + perm[jj + j1 + perm[kk + k1]]] * 3;
+                n1 = t1 * t1 * (grad3[gi1] * x1 + grad3[gi1 + 1] * y1 + grad3[gi1 + 2] * z1);
+            }
+            let t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2;
+            if (t2 < 0) n2 = 0.0;
+            else {
+                t2 *= t2;
+                const gi2 = permMod12[ii + i2 + perm[jj + j2 + perm[kk + k2]]] * 3;
+                n2 = t2 * t2 * (grad3[gi2] * x2 + grad3[gi2 + 1] * y2 + grad3[gi2 + 2] * z2);
+            }
+            let t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3;
+            if (t3 < 0) n3 = 0.0;
+            else {
+                t3 *= t3;
+                const gi3 = permMod12[ii + 1 + perm[jj + 1 + perm[kk + 1]]] * 3;
+                n3 = t3 * t3 * (grad3[gi3] * x3 + grad3[gi3 + 1] * y3 + grad3[gi3 + 2] * z3);
+            }
+            return 32.0 * (n0 + n1 + n2 + n3);
+        }
+
+        const EPS = 0.12;
+        const inv2EPS = 1.0 / (2.0 * EPS);
+        function getCurlNoise(x, y, z, t, scale) {
+            const sx = x * scale;
+            const sy = y * scale;
+            const sz = z * scale;
+            const st = t * 0.22;
+
+            const pz_y1 = snoise(sx + 13.1, sy + EPS + st, sz + 37.7);
+            const pz_y0 = snoise(sx + 13.1, sy - EPS + st, sz + 37.7);
+            const dpz_dy = (pz_y1 - pz_y0) * inv2EPS;
+
+            const py_z1 = snoise(sx + 47.3, sy + 19.4, sz + EPS + st);
+            const py_z0 = snoise(sx + 47.3, sy + 19.4, sz - EPS + st);
+            const dpy_dz = (py_z1 - py_z0) * inv2EPS;
+
+            const px_z1 = snoise(sx + 71.9, sy + 7.1, sz + EPS + st);
+            const px_z0 = snoise(sx + 71.9, sy + 7.1, sz - EPS + st);
+            const dpx_dz = (px_z1 - px_z0) * inv2EPS;
+
+            const pz_x1 = snoise(sx + EPS + 13.1, sy + st, sz + 37.7);
+            const pz_x0 = snoise(sx - EPS + 13.1, sy + st, sz + 37.7);
+            const dpz_dx = (pz_x1 - pz_x0) * inv2EPS;
+
+            const py_x1 = snoise(sx + EPS + 47.3, sy + 19.4, sz + st);
+            const py_x0 = snoise(sx - EPS + 47.3, sy + 19.4, sz + st);
+            const dpy_dx = (py_x1 - py_x0) * inv2EPS;
+
+            const px_y1 = snoise(sx + 71.9, sy + EPS + 7.1, sz + st);
+            const px_y0 = snoise(sx + 71.9, sy - EPS + 7.1, sz + st);
+            const dpx_dy = (px_y1 - px_y0) * inv2EPS;
+
+            return {
+                x: dpz_dy - dpy_dz,
+                y: dpx_dz - dpz_dx,
+                z: dpy_dx - dpx_dy
+            };
+        }
+
+        // --- Procedural Textures ---
+        function createPumpkinTexture(colorA, colorB) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+
+            const colA = new THREE.Color(colorA);
+            const colB = new THREE.Color(colorB);
+
+            const grad = ctx.createLinearGradient(0, 0, 0, 512);
+            grad.addColorStop(0, '#' + colA.clone().multiplyScalar(0.7).getHexString());
+            grad.addColorStop(0.3, '#' + colA.getHexString());
+            grad.addColorStop(0.7, '#' + colB.getHexString());
+            grad.addColorStop(1, '#' + colB.clone().multiplyScalar(0.55).getHexString());
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 512, 512);
+
+            for (let x = 0; x < 512; x++) {
+                const alpha = Math.sin(x * 0.15) * 0.08 + Math.cos(x * 0.4) * 0.04;
+                ctx.fillStyle = alpha > 0 ? `rgba(255, 255, 255, ${alpha})` : `rgba(0, 0, 0, ${-alpha})`;
+                ctx.fillRect(x, 0, 1, 512);
+            }
+
+            for (let i = 0; i < 4000; i++) {
+                const px = Math.random() * 512;
+                const py = Math.random() * 512;
+                const rad = Math.random() * 1.5 + 0.5;
+                const op = Math.random() * 0.12;
+                ctx.fillStyle = Math.random() > 0.4 ? `rgba(0, 0, 0, ${op})` : `rgba(255, 240, 200, ${op})`;
+                ctx.beginPath();
+                ctx.arc(px, py, rad, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.ClampToEdgeWrapping;
+            return texture;
+        }
+
+        // --- Procedural 3D Pumpkin Geometry ---
+        function createPumpkinGeometry(baseRadius = 1.0, heightRatio = 0.75, ribs = 10, ribDepth = 0.18, irregularity = 0.04) {
+            const geom = new THREE.SphereGeometry(baseRadius, 54, 42);
+            const pos = geom.attributes.position;
+            const v = new THREE.Vector3();
+
+            for (let i = 0; i < pos.count; i++) {
+                v.fromBufferAttribute(pos, i);
+
+                const theta = Math.atan2(v.z, v.x);
+                const phi = Math.acos(Math.max(-1, Math.min(1, v.y / baseRadius)));
+
+                const ribWave = Math.cos(ribs * theta);
+                const ribOffset = (ribWave - 0.22 * Math.cos(ribs * 2.0 * theta)) * ribDepth;
+                const wobble = Math.sin(theta * 3.0 + 1.2) * irregularity;
+
+                const rMod = 1.0 + ribOffset + wobble;
+                v.x *= rMod;
+                v.z *= rMod;
+
+                v.y *= heightRatio;
+
+                const topDist = Math.max(0, 1.0 - phi / (Math.PI * 0.32));
+                v.y -= topDist * topDist * (baseRadius * 0.38 * heightRatio);
+
+                const botDist = Math.max(0, (phi - Math.PI * 0.68) / (Math.PI * 0.32));
+                v.y += botDist * botDist * (baseRadius * 0.22 * heightRatio);
+
+                pos.setXYZ(i, v.x, v.y, v.z);
+            }
+
+            geom.computeVertexNormals();
+            return geom;
+        }
+
+        // --- Procedural Fluted Curved Pumpkin Stem Geometry ---
+        function createStemGeometry(length = 0.6, baseRadius = 0.12, curlAngle = 0.35) {
+            const points = [];
+            const segs = 14;
+            for (let i = 0; i <= segs; i++) {
+                const t = i / segs;
+                const x = Math.sin(t * curlAngle * 2.2) * (length * 0.35) * t;
+                const y = t * length;
+                const z = (1.0 - Math.cos(t * curlAngle * 1.8)) * (length * 0.28);
+                points.push(new THREE.Vector3(x, y, z));
+            }
+            const curve = new THREE.CatmullRomCurve3(points);
+            const tubeGeom = new THREE.TubeGeometry(curve, 20, baseRadius, 8, false);
+            const pos = tubeGeom.attributes.position;
+            const v = new THREE.Vector3();
+
+            for (let i = 0; i < pos.count; i++) {
+                v.fromBufferAttribute(pos, i);
+                const t = Math.max(0, Math.min(1, v.y / length));
+                const taper = 1.0 - t * 0.58;
+                const angle = Math.atan2(v.z, v.x);
+                const flute = 1.0 + 0.24 * Math.cos(angle * 5.0);
+                v.x *= taper * flute;
+                v.z *= taper * flute;
+                pos.setXYZ(i, v.x, v.y, v.z);
+            }
+
+            tubeGeom.computeVertexNormals();
+            return tubeGeom;
+        }
+
+        // --- Materials & Textures Setup ---
+        let pumpkinTexture = createPumpkinTexture(params.pumpkinMainColor, params.pumpkinAccentColor);
+
+        const pumpkinMaterial = new THREE.MeshStandardMaterial({
+            map: pumpkinTexture,
+            roughness: 0.38,
+            metalness: 0.04,
+            shadowSide: THREE.DoubleSide
+        });
+
+        const stemMaterial = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(params.stemColor),
+            roughness: 0.88,
+            metalness: 0.05
+        });
+
+        // --- Pumpkin Pile Assembly ---
+        const pumpkinGroup = new THREE.Group();
+        scene.add(pumpkinGroup);
+
+        const PUMPKIN_SPECS = [
+            { x: 0.0, y: 1.5, z: 0.0, r: 2.3, hr: 0.72, ribs: 10, rd: 0.2, rx: 0.04, ry: 0.2, rz: -0.04, sl: 0.85, sc: 0.4 },
+            { x: -2.1, y: 1.2, z: 1.6, r: 1.8, hr: 0.76, ribs: 11, rd: 0.17, rx: -0.12, ry: 0.7, rz: 0.16, sl: 0.7, sc: -0.35 },
+            { x: 2.0, y: 1.1, z: 1.7, r: 1.7, hr: 0.72, ribs: 9, rd: 0.18, rx: 0.14, ry: -0.6, rz: -0.12, sl: 0.65, sc: 0.3 },
+            { x: 0.1, y: 0.75, z: 3.2, r: 1.15, hr: 0.82, ribs: 10, rd: 0.16, rx: 0.22, ry: 0.3, rz: -0.1, sl: 0.5, sc: -0.4 },
+            { x: -1.9, y: 1.3, z: -1.9, r: 1.85, hr: 0.80, ribs: 12, rd: 0.18, rx: 0.09, ry: 1.4, rz: 0.1, sl: 0.7, sc: 0.4 },
+            { x: 1.8, y: 1.25, z: -1.8, r: 1.75, hr: 0.74, ribs: 10, rd: 0.19, rx: -0.15, ry: -1.1, rz: 0.06, sl: 0.65, sc: -0.3 },
+            { x: -3.3, y: 0.95, z: -0.2, r: 1.5, hr: 0.66, ribs: 12, rd: 0.22, rx: 0.05, ry: 0.4, rz: 0.24, sl: 0.6, sc: 0.3 },
+            { x: 3.2, y: 0.95, z: 0.1, r: 1.45, hr: 0.78, ribs: 9, rd: 0.17, rx: -0.1, ry: -0.8, rz: -0.22, sl: 0.55, sc: -0.35 },
+            { x: 0.6, y: 3.1, z: 0.5, r: 1.25, hr: 0.74, ribs: 10, rd: 0.17, rx: 0.28, ry: 0.5, rz: -0.18, sl: 0.55, sc: 0.45 },
+            { x: -0.8, y: 2.95, z: -0.4, r: 1.15, hr: 0.70, ribs: 11, rd: 0.18, rx: -0.22, ry: -0.35, rz: 0.18, sl: 0.5, sc: -0.4 },
+            { x: -0.1, y: 4.2, z: 0.15, r: 0.82, hr: 0.82, ribs: 9, rd: 0.16, rx: 0.1, ry: 1.0, rz: -0.12, sl: 0.45, sc: 0.35 },
+            { x: -2.6, y: 0.65, z: 2.5, r: 0.95, hr: 1.05, ribs: 8, rd: 0.14, rx: 0.6, ry: 0.9, rz: 0.3, sl: 0.45, sc: -0.4 },
+            { x: 1.5, y: 2.2, z: 1.9, r: 0.9, hr: 0.75, ribs: 10, rd: 0.16, rx: 0.3, ry: -0.2, rz: 0.15, sl: 0.4, sc: 0.3 },
+            { x: -1.3, y: 2.3, z: 1.6, r: 0.92, hr: 0.72, ribs: 9, rd: 0.15, rx: 0.25, ry: 0.8, rz: -0.2, sl: 0.4, sc: -0.35 },
+            { x: 2.5, y: 0.55, z: 2.6, r: 0.75, hr: 0.85, ribs: 8, rd: 0.15, rx: -0.2, ry: 0.5, rz: 0.25, sl: 0.38, sc: 0.25 },
+            { x: -3.1, y: 0.52, z: 1.7, r: 0.7, hr: 0.8, ribs: 9, rd: 0.16, rx: 0.18, ry: -0.4, rz: -0.2, sl: 0.36, sc: -0.3 }
+        ];
+
+        const pumpkinMeshes = [];
+
+        function buildPumpkins() {
+            while (pumpkinGroup.children.length > 0) {
+                const child = pumpkinGroup.children[0];
+                if (child.geometry) child.geometry.dispose();
+                pumpkinGroup.remove(child);
+            }
+            pumpkinMeshes.length = 0;
+
+            PUMPKIN_SPECS.forEach((spec) => {
+                const singleGroup = new THREE.Group();
+
+                const geom = createPumpkinGeometry(spec.r, spec.hr, spec.ribs, spec.rd, 0.04);
+                const mesh = new THREE.Mesh(geom, pumpkinMaterial);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                singleGroup.add(mesh);
+
+                const stemGeom = createStemGeometry(spec.sl, spec.r * 0.09, spec.sc);
+                const stemMesh = new THREE.Mesh(stemGeom, stemMaterial);
+                stemMesh.position.y = spec.r * spec.hr * 0.84;
+                stemMesh.castShadow = true;
+                singleGroup.add(stemMesh);
+
+                singleGroup.position.set(spec.x, spec.y, spec.z);
+                singleGroup.rotation.set(spec.rx, spec.ry, spec.rz);
+
+                pumpkinGroup.add(singleGroup);
+                pumpkinMeshes.push(singleGroup);
+            });
+        }
+        buildPumpkins();
+
+        // --- Ground & Mound ---
+        const groundGeom = new THREE.CircleGeometry(24, 64);
+        groundGeom.rotateX(-Math.PI * 0.5);
+
+        const gPos = groundGeom.attributes.position;
+        const gVec = new THREE.Vector3();
+        for (let i = 0; i < gPos.count; i++) {
+            gVec.fromBufferAttribute(gPos, i);
+            const dist = Math.sqrt(gVec.x * gVec.x + gVec.z * gVec.z);
+            const mound = Math.max(0, 1.2 * Math.exp(- (dist * dist) / 36.0));
+            gPos.setY(i, mound);
+        }
+        groundGeom.computeVertexNormals();
+
+        const groundMaterial = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(params.bgColor).lerp(new THREE.Color(0x000000), 0.25),
+            roughness: 0.95,
+            metalness: 0.02
+        });
+
+        const groundMesh = new THREE.Mesh(groundGeom, groundMaterial);
+        groundMesh.receiveShadow = true;
+        scene.add(groundMesh);
+
+        // --- Leaf Geometries (Maple & Oak / Elm) ---
+        function createMapleLeafShape() {
+            const shape = new THREE.Shape();
+            shape.moveTo(0, -0.5);
+            shape.lineTo(0.04, -0.15);
+            shape.quadraticCurveTo(0.24, -0.1, 0.44, -0.24);
+            shape.lineTo(0.38, -0.05);
+            shape.quadraticCurveTo(0.62, 0.12, 0.72, 0.28);
+            shape.lineTo(0.48, 0.32);
+            shape.quadraticCurveTo(0.55, 0.65, 0.6, 0.85);
+            shape.lineTo(0.32, 0.75);
+            shape.quadraticCurveTo(0.18, 1.05, 0.0, 1.35);
+            shape.quadraticCurveTo(-0.18, 1.05, -0.32, 0.75);
+            shape.lineTo(-0.6, 0.85);
+            shape.quadraticCurveTo(-0.55, 0.65, -0.48, 0.32);
+            shape.lineTo(-0.72, 0.28);
+            shape.quadraticCurveTo(-0.62, 0.12, -0.38, -0.05);
+            shape.lineTo(-0.44, -0.24);
+            shape.quadraticCurveTo(-0.24, -0.1, -0.04, -0.15);
+            shape.closePath();
+            return shape;
+        }
+
+        function createOakLeafShape() {
+            const shape = new THREE.Shape();
+            shape.moveTo(0, -0.5);
+            shape.lineTo(0.04, -0.15);
+            shape.quadraticCurveTo(0.32, 0.0, 0.38, 0.15);
+            shape.quadraticCurveTo(0.24, 0.25, 0.42, 0.45);
+            shape.quadraticCurveTo(0.26, 0.55, 0.38, 0.75);
+            shape.quadraticCurveTo(0.2, 0.85, 0.0, 1.15);
+            shape.quadraticCurveTo(-0.2, 0.85, -0.38, 0.75);
+            shape.quadraticCurveTo(-0.26, 0.55, -0.42, 0.45);
+            shape.quadraticCurveTo(-0.24, 0.25, -0.38, 0.15);
+            shape.quadraticCurveTo(-0.32, 0.0, -0.04, -0.15);
+            shape.closePath();
+            return shape;
+        }
+
+        function create3DLeafGeometry(shape) {
+            const geom = new THREE.ShapeGeometry(shape, 12);
+            const pos = geom.attributes.position;
+            const v = new THREE.Vector3();
+
+            for (let i = 0; i < pos.count; i++) {
+                v.fromBufferAttribute(pos, i);
+                const distFromSpine = Math.abs(v.x);
+                v.z = -0.18 * (distFromSpine * distFromSpine) + 0.06 * Math.sin(v.y * 3.5);
+                pos.setXYZ(i, v.x, v.y, v.z);
+            }
+            geom.computeVertexNormals();
+            return geom;
+        }
+
+        const mapleGeom = create3DLeafGeometry(createMapleLeafShape());
+        const oakGeom = create3DLeafGeometry(createOakLeafShape());
+
+        const leafMaterial = new THREE.MeshStandardMaterial({
+            roughness: 0.42,
+            metalness: 0.02,
+            side: THREE.DoubleSide,
+            shadowSide: THREE.DoubleSide
+        });
+
+        const COUNT_MAPLE = 1400;
+        const COUNT_OAK = 1200;
+        const TOTAL_LEAVES = COUNT_MAPLE + COUNT_OAK;
+
+        const mapleMesh = new THREE.InstancedMesh(mapleGeom, leafMaterial, COUNT_MAPLE);
+        const oakMesh = new THREE.InstancedMesh(oakGeom, leafMaterial, COUNT_OAK);
+        mapleMesh.castShadow = true;
+        oakMesh.castShadow = true;
+        scene.add(mapleMesh);
+        scene.add(oakMesh);
+
+        const leafData = [];
+        const dummyMatrix = new THREE.Matrix4();
+        const dummyPos = new THREE.Vector3();
+        const dummyEuler = new THREE.Euler();
+        const dummyQuat = new THREE.Quaternion();
+        const dummyScale = new THREE.Vector3();
+        const colorHelper = new THREE.Color();
+
+        const Y_MIN = -0.6;
+        const Y_MAX = 20.0;
+        const R_MAX = 17.0;
+
+        function initLeafParticles() {
+            leafData.length = 0;
+            const leafColors = [
+                new THREE.Color(params.leafColor1),
+                new THREE.Color(params.leafColor2),
+                new THREE.Color(params.leafColor3),
+                new THREE.Color(params.leafColor4)
+            ];
+
+            for (let i = 0; i < TOTAL_LEAVES; i++) {
+                const isMaple = i < COUNT_MAPLE;
+                const meshIndex = isMaple ? i : i - COUNT_MAPLE;
+                const targetMesh = isMaple ? mapleMesh : oakMesh;
+
+                const r = 1.2 + Math.sqrt(Math.random()) * (R_MAX - 2.0);
+                const angle = Math.random() * Math.PI * 2;
+                const y = Y_MIN + Math.random() * (Y_MAX - Y_MIN);
+
+                const p = {
+                    x: Math.cos(angle) * r,
+                    y: y,
+                    z: Math.sin(angle) * r,
+                    vx: 0,
+                    vy: 0,
+                    vz: 0,
+                    rx: Math.random() * Math.PI * 2,
+                    ry: Math.random() * Math.PI * 2,
+                    rz: Math.random() * Math.PI * 2,
+                    wx: (Math.random() - 0.5) * 3.0,
+                    wy: (Math.random() - 0.5) * 3.5,
+                    wz: (Math.random() - 0.5) * 3.0,
+                    baseScale: (0.75 + Math.random() * 0.5) * params.leafScale,
+                    colorIdx: Math.floor(Math.random() * leafColors.length),
+                    isMaple: isMaple,
+                    meshIndex: meshIndex,
+                    seed: Math.random() * 100.0
+                };
+
+                colorHelper.copy(leafColors[p.colorIdx]);
+                colorHelper.offsetHSL((Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.08, (Math.random() - 0.5) * 0.06);
+                targetMesh.setColorAt(meshIndex, colorHelper);
+
+                leafData.push(p);
+            }
+
+            mapleMesh.instanceColor.needsUpdate = true;
+            oakMesh.instanceColor.needsUpdate = true;
+        }
+
+        function updatePaletteColors(paletteKey) {
+            const pal = PALETTES[paletteKey];
+            if (!pal) return;
+
+            params.colorScheme = paletteKey;
+            params.bgColor = pal.bg;
+            params.pumpkinMainColor = pal.pumpkinMain;
+            params.pumpkinAccentColor = pal.pumpkinAccent;
+            params.stemColor = pal.stem;
+            params.leafColor1 = pal.leaves[0];
+            params.leafColor2 = pal.leaves[1];
+            params.leafColor3 = pal.leaves[2];
+            params.leafColor4 = pal.leaves[3];
+
+            applyCurrentColors();
+        }
+
+        let prevPostProcessorEnabled = true;
+
+        function applyCurrentColors() {
+            if (params.greenscreen) {
+                if (postProcessor) {
+                    prevPostProcessorEnabled = postProcessor.settings.enabled;
+                    postProcessor.settings.enabled = false;
+                }
+                scene.background = new THREE.Color(0x00ff00);
+                renderer.setClearColor(0x00ff00, 1.0);
+                scene.fog = null;
+                groundMesh.visible = false;
+            } else {
+                if (postProcessor) {
+                    postProcessor.settings.enabled = prevPostProcessorEnabled;
+                }
+                const bg = new THREE.Color(params.bgColor);
+                scene.background = bg;
+                renderer.setClearColor(bg, 1.0);
+                scene.fog = new THREE.FogExp2(bg, 0.024);
+                groundMesh.visible = true;
+                groundMaterial.color.copy(bg).lerp(new THREE.Color(0x000000), 0.3);
+            }
+
+            pumpkinTexture.dispose();
+            pumpkinTexture = createPumpkinTexture(params.pumpkinMainColor, params.pumpkinAccentColor);
+            pumpkinMaterial.map = pumpkinTexture;
+            pumpkinMaterial.needsUpdate = true;
+
+            stemMaterial.color.set(params.stemColor);
+
+            const leafColors = [
+                new THREE.Color(params.leafColor1),
+                new THREE.Color(params.leafColor2),
+                new THREE.Color(params.leafColor3),
+                new THREE.Color(params.leafColor4)
+            ];
+
+            for (let i = 0; i < TOTAL_LEAVES; i++) {
+                const p = leafData[i];
+                const targetMesh = p.isMaple ? mapleMesh : oakMesh;
+                colorHelper.copy(leafColors[p.colorIdx]);
+                colorHelper.offsetHSL((p.seed % 0.06) - 0.03, (p.seed % 0.08) - 0.04, (p.seed % 0.06) - 0.03);
+                targetMesh.setColorAt(p.meshIndex, colorHelper);
+            }
+
+            if (mapleMesh.instanceColor) mapleMesh.instanceColor.needsUpdate = true;
+            if (oakMesh.instanceColor) oakMesh.instanceColor.needsUpdate = true;
+        }
+
+        // --- Ground Resting Leaves ---
+        const RESTING_COUNT = 320;
+        const restingMapleMesh = new THREE.InstancedMesh(mapleGeom, leafMaterial, RESTING_COUNT);
+        restingMapleMesh.receiveShadow = true;
+        scene.add(restingMapleMesh);
+
+        function initRestingLeaves() {
+            const leafColors = [
+                new THREE.Color(params.leafColor1),
+                new THREE.Color(params.leafColor2),
+                new THREE.Color(params.leafColor3),
+                new THREE.Color(params.leafColor4)
+            ];
+
+            for (let i = 0; i < RESTING_COUNT; i++) {
+                const r = 1.0 + Math.sqrt(Math.random()) * 6.5;
+                const angle = Math.random() * Math.PI * 2;
+                const x = Math.cos(angle) * r;
+                const z = Math.sin(angle) * r;
+                const y = Math.max(0, 1.2 * Math.exp(- (r * r) / 36.0)) + 0.03 + Math.random() * 0.05;
+
+                dummyPos.set(x, y, z);
+                dummyEuler.set(-Math.PI * 0.5 + (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.3, Math.random() * Math.PI * 2);
+                dummyQuat.setFromEuler(dummyEuler);
+                const s = (0.2 + Math.random() * 0.15) * params.leafScale * 3.2;
+                dummyScale.set(s, s, s);
+
+                dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+                restingMapleMesh.setMatrixAt(i, dummyMatrix);
+
+                colorHelper.copy(leafColors[i % leafColors.length]);
+                colorHelper.offsetHSL((Math.random() - 0.5) * 0.06, -0.1, -0.1);
+                restingMapleMesh.setColorAt(i, colorHelper);
+            }
+            restingMapleMesh.instanceMatrix.needsUpdate = true;
+            if (restingMapleMesh.instanceColor) restingMapleMesh.instanceColor.needsUpdate = true;
+        }
+
+        initLeafParticles();
+        initRestingLeaves();
+        applyCurrentColors();
+
+        // --- Camera Preset Animations ---
+        function updateCameraAnimation(time) {
+            const mode = params.cameraAnimation;
+            if (mode === 'Static (No Camera Motion)') {
+                return;
+            }
+
+            const t = time * 0.16;
+
+            switch (mode) {
+                case 'Autumn Breeze Orbit': {
+                    const radius = 17.5 + Math.sin(t * 0.45) * 2.2;
+                    camera.position.x = Math.sin(t * 0.35) * radius;
+                    camera.position.z = Math.cos(t * 0.35) * radius;
+                    camera.position.y = 5.0 + Math.sin(t * 0.28) * 2.2;
+                    controls.target.set(0, 2.0, 0);
+                    break;
+                }
+                case 'Ground Level Swirl': {
+                    const radius = 11.5 + Math.sin(t * 0.3) * 1.5;
+                    camera.position.x = Math.sin(t * 0.25) * radius;
+                    camera.position.z = Math.cos(t * 0.25) * radius;
+                    camera.position.y = 1.0 + Math.sin(t * 0.2) * 0.5;
+                    controls.target.set(0, 3.4, 0);
+                    break;
+                }
+                case 'Elevated Spiral Descent': {
+                    const h = 13.0 + Math.sin(t * 0.35) * 6.0;
+                    const radius = 15.5 + Math.cos(t * 0.35) * 3.5;
+                    camera.position.x = Math.sin(t * 0.32) * radius;
+                    camera.position.z = Math.cos(t * 0.32) * radius;
+                    camera.position.y = h;
+                    controls.target.set(0, 2.0, 0);
+                    break;
+                }
+                case 'Whispering Porch Sway': {
+                    camera.position.x = Math.sin(t * 0.32) * 6.5;
+                    camera.position.z = 15.0 + Math.cos(t * 0.22) * 2.5;
+                    camera.position.y = 4.2 + Math.sin(t * 0.4) * 1.4;
+                    controls.target.set(Math.sin(t * 0.32) * 1.2, 2.0, 0);
+                    break;
+                }
+                case 'Intimate Pumpkin Close-up': {
+                    const radius = 8.5 + Math.sin(t * 0.38) * 1.5;
+                    camera.position.x = Math.sin(t * 0.3) * radius;
+                    camera.position.z = Math.cos(t * 0.3) * radius;
+                    camera.position.y = 2.8 + Math.cos(t * 0.45) * 1.0;
+                    controls.target.set(0, 2.2, 0);
+                    break;
+                }
+                case 'Golden Hour Arc': {
+                    const arcAngle = Math.sin(t * 0.22) * 1.15;
+                    camera.position.x = Math.sin(arcAngle) * 19.0;
+                    camera.position.z = Math.cos(arcAngle) * 19.0;
+                    camera.position.y = 5.8 + Math.sin(t * 0.3) * 1.8;
+                    controls.target.set(0, 2.0, 0);
+                    break;
+                }
+                case 'Autumn Vortex Tracking': {
+                    const radius = 13.5;
+                    camera.position.x = Math.sin(t * 0.4) * radius;
+                    camera.position.z = Math.cos(t * 0.4) * radius;
+                    const h = 7.5 + Math.sin(t * 0.35) * 4.5;
+                    camera.position.y = h;
+                    controls.target.set(Math.sin(t * 0.4) * 1.5, 2.2, Math.cos(t * 0.4) * 1.5);
+                    break;
+                }
+            }
+        }
+
+        // --- Interactive Procedural Reroll (Preserves Post-Processing Settings) ---
+        function randomizeScene() {
+            const keys = Object.keys(PALETTES);
+            const randomKey = keys[Math.floor(Math.random() * keys.length)];
+            updatePaletteColors(randomKey);
+
+            params.windSpeed = +(0.4 + Math.random() * 0.4).toFixed(2);
+            params.curlStrength = +(0.8 + Math.random() * 0.6).toFixed(2);
+            params.vortexSwirl = +(0.6 + Math.random() * 0.5).toFixed(2);
+            params.leafFlutter = +(0.6 + Math.random() * 0.5).toFixed(2);
+            params.leafScale = +(0.24 + Math.random() * 0.10).toFixed(2);
+
+            pumpkinMeshes.forEach((mesh, idx) => {
+                const spec = PUMPKIN_SPECS[idx];
+                mesh.scale.set(
+                    0.9 + Math.random() * 0.2,
+                    0.9 + Math.random() * 0.2,
+                    0.9 + Math.random() * 0.2
+                );
+                mesh.rotation.y = spec.ry + (Math.random() - 0.5) * 0.5;
+            });
+
+            for (let i = 0; i < TOTAL_LEAVES; i++) {
+                leafData[i].baseScale = (0.75 + Math.random() * 0.5) * params.leafScale;
+            }
+
+            fPresets.controllersRecursive().forEach(c => c.updateDisplay());
+            fWind.controllersRecursive().forEach(c => c.updateDisplay());
+            fColors.controllersRecursive().forEach(c => c.updateDisplay());
+        }
+
+        // --- lil-gui Controls Panel ---
+        const gui = new GUI({ title: 'Autumn Wind & Pumpkin Pile' });
+
+        // Presets Folder
+        const fPresets = gui.addFolder('Presets & Animation');
+        fPresets.add(params, 'colorScheme', Object.keys(PALETTES)).name('Color Scheme').onChange(v => {
+            updatePaletteColors(v);
+            fColors.controllersRecursive().forEach(c => c.updateDisplay());
+        });
+        fPresets.add(params, 'cameraAnimation', ANIMATION_MODES).name('Camera Animation');
+        fPresets.add(params, 'animationSpeed', 0.1, 3.0, 0.05).name('Sim Speed');
+
+        // Greenscreen & Display Folder
+        const fDisplay = gui.addFolder('Display & Greenscreen');
+        fDisplay.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => {
+            applyCurrentColors();
+        });
+        fDisplay.add(params, 'dpr', ['0.5', '1.0', '1.5', '2.0', 'Device']).name('Pixel Ratio (DPR)').onChange(v => {
+            updateDPR(v);
+        });
+
+        // Post-Processing Suite Folder (Open with user's exact default values)
+        const fPostProcess = postProcessor.attachGUI(gui, 'Post-Processing Suite');
+        fPostProcess.open();
+
+        // Wind Dynamics & Curl-Noise Folder (Open with user's exact default values)
+        const fWind = gui.addFolder('Wind & Curl Turbulence');
+        fWind.add(params, 'windSpeed', 0.1, 2.5, 0.01).name('Wind Speed');
+        fWind.add(params, 'curlStrength', 0.2, 3.0, 0.01).name('Curl Strength');
+        fWind.add(params, 'vortexSwirl', 0.0, 2.5, 0.01).name('Vortex Swirl');
+        fWind.add(params, 'updraft', 0.0, 3.0, 0.01).name('Thermal Updraft');
+        fWind.add(params, 'gravity', 0.4, 3.5, 0.01).name('Gravity Fall');
+        fWind.add(params, 'leafFlutter', 0.2, 2.5, 0.01).name('Leaf Flutter');
+        fWind.add(params, 'leafScale', 0.15, 0.5, 0.01).name('Leaf Size').onChange(v => {
+            for (let i = 0; i < TOTAL_LEAVES; i++) {
+                leafData[i].baseScale = (0.75 + Math.random() * 0.5) * v;
+            }
+        });
+        fWind.open();
+
+        // Custom Color Pickers Folder (Closed as in image)
+        const fColors = gui.addFolder('Color Customization');
+        fColors.addColor(params, 'bgColor').name('Background Color').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'pumpkinMainColor').name('Pumpkin Main').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'pumpkinAccentColor').name('Pumpkin Accent').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'stemColor').name('Stem Color').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'leafColor1').name('Leaf Color 1').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'leafColor2').name('Leaf Color 2').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'leafColor3').name('Leaf Color 3').onChange(() => applyCurrentColors());
+        fColors.addColor(params, 'leafColor4').name('Leaf Color 4').onChange(() => applyCurrentColors());
+        fColors.close();
+
+        // System & Interaction Folder (Open as in image)
+        const fSystem = gui.addFolder('Interaction');
+        fSystem.add(params, 'clickToRandomize').name('Click Scene to Reroll');
+        fSystem.add({ randomize: randomizeScene }, 'randomize').name('Reroll Theme Now');
+        fSystem.add({ resetCam: () => {
+            controls.reset();
+            camera.position.set(0, 4.0, 16.0);
+            controls.target.set(0, 3.6, 0);
+            controls.update();
+        }}, 'resetCam').name('Reset Camera');
+        fSystem.open();
+
+        fPresets.open();
+        fDisplay.open();
+
+        // --- Distinguish Click from Drag for Procedural Variation ---
+        let pointerDownPos = { x: 0, y: 0 };
+        let pointerDownTime = 0;
+
+        window.addEventListener('pointerdown', (e) => {
+            pointerDownPos.x = e.clientX;
+            pointerDownPos.y = e.clientY;
+            pointerDownTime = performance.now();
+        });
+
+        window.addEventListener('pointerup', (e) => {
+            if (e.target.closest('.lil-gui')) return;
+
+            const dx = e.clientX - pointerDownPos.x;
+            const dy = e.clientY - pointerDownPos.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const duration = performance.now() - pointerDownTime;
+
+            if (dist < 6 && duration < 350 && params.clickToRandomize) {
+                randomizeScene();
+            }
+        });
+
+        // --- Keyboard Shortcut: Toggle UI with 'H' ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'h' || e.key === 'H') {
+                gui._hidden ? gui.show() : gui.hide();
+            }
+        });
+
+        // --- Window Resize Handling ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            const dpr = renderer.getPixelRatio();
+            updateDPR(params.dpr);
+            postProcessor.setSize(window.innerWidth, window.innerHeight, dpr);
+        });
+
+        // --- Main Simulation & Render Loop ---
+        const clock = new THREE.Clock();
+        let simTime = 0;
+
+        const PILE_CX = 0.0;
+        const PILE_CY = 1.8;
+        const PILE_CZ = 0.0;
+        const PILE_RX = 4.3;
+        const PILE_RY = 2.6;
+        const PILE_RZ = 4.3;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.05) * params.animationSpeed;
+            simTime += dt;
+
+            // Update Cinematic Camera Motion (Static by default, leaves controls free)
+            updateCameraAnimation(simTime);
+
+            // Update Controls
+            controls.update();
+
+            // Wind directional drift
+            const breezeX = Math.sin(simTime * 0.2) * 0.45 * params.windSpeed;
+            const breezeZ = Math.cos(simTime * 0.16) * 0.35 * params.windSpeed;
+
+            // Update Instanced Leaves Simulation
+            for (let i = 0; i < TOTAL_LEAVES; i++) {
+                const p = leafData[i];
+
+                // 1. Curl-noise velocity field
+                const curl = getCurlNoise(p.x, p.y, p.z, simTime * params.windSpeed * 0.75, params.curlScale);
+
+                // 2. Swirling vortex around the pile axis (0, y, 0)
+                const r = Math.sqrt(p.x * p.x + p.z * p.z) + 0.001;
+                const swirlV = (params.vortexSwirl * 1.8) / (1.0 + r * 0.25);
+                const tanX = -p.z / r;
+                const tanZ = p.x / r;
+
+                // 3. Central updraft & gravity
+                const updraftFactor = Math.max(0, Math.exp(- (r * r) / 24.0)) * params.updraft * 1.6;
+                const targetVy = -params.gravity + updraftFactor + curl.y * params.curlStrength * 1.5;
+
+                // Combine velocities with smoothing
+                const targetVx = tanX * swirlV + breezeX + curl.x * params.curlStrength * 1.5;
+                const targetVz = tanZ * swirlV + breezeZ + curl.z * params.curlStrength * 1.5;
+
+                p.vx += (targetVx - p.vx) * Math.min(1.0, dt * 2.5);
+                p.vy += (targetVy - p.vy) * Math.min(1.0, dt * 2.5);
+                p.vz += (targetVz - p.vz) * Math.min(1.0, dt * 2.5);
+
+                // Integrate position
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+                p.z += p.vz * dt;
+
+                // 4. Deflection around Pumpkin Pile ellipsoid
+                const dx = (p.x - PILE_CX) / PILE_RX;
+                const dy = (p.y - PILE_CY) / PILE_RY;
+                const dz = (p.z - PILE_CZ) / PILE_RZ;
+                const distSq = dx * dx + dy * dy + dz * dz;
+
+                if (distSq < 1.0) {
+                    const normFactor = 1.0 / Math.sqrt(distSq);
+                    p.x = PILE_CX + dx * normFactor * PILE_RX * 1.02;
+                    p.y = PILE_CY + dy * normFactor * PILE_RY * 1.02;
+                    p.z = PILE_CZ + dz * normFactor * PILE_RZ * 1.02;
+                    p.vy += 1.2 * dt;
+                }
+
+                // 5. Seamless Looping Boundary Check & Reseeding
+                const currentR = Math.sqrt(p.x * p.x + p.z * p.z);
+
+                if (p.y < Y_MIN) {
+                    p.y = Y_MAX - Math.random() * 1.5;
+                    const spawnR = 1.0 + Math.random() * (R_MAX * 0.7);
+                    const spawnA = Math.random() * Math.PI * 2;
+                    p.x = Math.cos(spawnA) * spawnR;
+                    p.z = Math.sin(spawnA) * spawnR;
+                    p.vx = 0;
+                    p.vy = -params.gravity * 0.4;
+                    p.vz = 0;
+                } else if (p.y > Y_MAX) {
+                    p.y = Y_MIN + 0.1;
+                }
+
+                if (currentR > R_MAX) {
+                    const spawnR = 1.5 + Math.random() * 5.0;
+                    const spawnA = Math.random() * Math.PI * 2;
+                    p.x = Math.cos(spawnA) * spawnR;
+                    p.z = Math.sin(spawnA) * spawnR;
+                    p.y = 2.0 + Math.random() * 10.0;
+                }
+
+                // Smooth scale factor: fades to 0 at boundaries for invisible reseeding
+                const fadeY = Math.min(
+                    Math.max(0, (p.y - Y_MIN) / 1.6),
+                    Math.max(0, (Y_MAX - p.y) / 2.0)
+                );
+                const fadeR = Math.max(0, Math.min(1.0, (R_MAX - currentR) / 2.5));
+                const visibility = Math.min(fadeY, fadeR);
+                const currentScale = p.baseScale * visibility;
+
+                // 6. Aerodynamic Tumbling & Flutter
+                const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy + p.vz * p.vz);
+                p.rx += (p.wx * speed * 0.7 + Math.sin(simTime * 2.2 + p.seed) * params.leafFlutter * 1.6) * dt;
+                p.ry += (p.wy * speed * 0.7 + Math.cos(simTime * 1.8 + p.seed * 1.5) * params.leafFlutter * 1.4) * dt;
+                p.rz += (p.wz * speed * 0.7 + Math.sin(simTime * 2.6 + p.seed * 2.0) * params.leafFlutter * 1.6) * dt;
+
+                // Compose transformation matrix
+                dummyPos.set(p.x, p.y, p.z);
+                dummyEuler.set(p.rx, p.ry, p.rz);
+                dummyQuat.setFromEuler(dummyEuler);
+                dummyScale.set(currentScale, currentScale, currentScale);
+
+                dummyMatrix.compose(dummyPos, dummyQuat, dummyScale);
+
+                const targetMesh = p.isMaple ? mapleMesh : oakMesh;
+                targetMesh.setMatrixAt(p.meshIndex, dummyMatrix);
+            }
+
+            mapleMesh.instanceMatrix.needsUpdate = true;
+            oakMesh.instanceMatrix.needsUpdate = true;
+
+            // Align Godrays with sun position if enabled
+            if (postProcessor.settings.raysEnabled) {
+                postProcessor.setSunScreenPosition(camera, sunLight.position);
+            }
+
+            // Render Scene with PostProcessor Suite
+            postProcessor.renderScene(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

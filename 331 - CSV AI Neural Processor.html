@@ -1,0 +1,2140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Neural Processor Core with Integrated Circuit Traces</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (From postprocessing/PostProcessor.js)
+    // Inlined for standalone portability & file:// CORS compatibility
+    // =========================================================================
+    const orthoVertexShader = `
+      precision highp float;
+      in vec3 position;
+      out vec2 vUv;
+      void main() {
+        vUv = position.xy * 0.5 + 0.5;
+        gl_Position = vec4(position, 1.0);
+      }
+    `;
+
+    const brightFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float bloomThreshold;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+        float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float knee = 0.1;
+        float soft = luminance - bloomThreshold + knee;
+        soft = clamp(soft, 0.0, 2.0 * knee);
+        soft = (soft * soft) / (4.0 * knee + 0.00001);
+        float contribution = max(soft, luminance - bloomThreshold);
+        contribution /= max(luminance, 0.00001);
+        fragColor = vec4(color.rgb * contribution, color.a);
+      }
+    `;
+
+    const blur13ShaderChunk = `
+      vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+        vec2 resolution = vec2(textureSize(image, 0));
+        vec4 color = vec4(0.0);
+        vec2 off1 = vec2(1.411764705882353) * direction;
+        vec2 off2 = vec2(3.2941176470588234) * direction;
+        vec2 off3 = vec2(5.176470588235294) * direction;
+        color += texture(image, uv) * 0.1964825501511404;
+        color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+        color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+        return color;
+      }
+    `;
+
+    const blurFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform vec2 direction;
+      in vec2 vUv;
+      out vec4 color;
+      ${blur13ShaderChunk}
+      void main() {
+        color = blur13(inputTexture, vUv, direction);
+      }
+    `;
+
+    const finalFragmentShader = `
+      precision highp float;
+      uniform vec2 resolution;
+      uniform sampler2D inputTexture;
+      uniform sampler2D blur0Texture;
+      uniform sampler2D blur1Texture;
+      uniform sampler2D blur2Texture;
+      uniform sampler2D blur3Texture;
+      uniform sampler2D blur4Texture;
+      uniform bool bloomEnabled;
+      uniform float bloomStrength;
+      uniform float vignetteBoost;
+      uniform float vignetteReduction;
+      uniform float noiseIntensity;
+      uniform float time;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      float vignette(vec2 uv, float boost, float reduction) {
+        vec2 position = vUv - 0.5;
+        return boost - length(position) * reduction;
+      }
+
+      float hash1(uint n) {
+        n = (n << 13U) ^ n;
+        n = n * (n * n * 15731U + 789221U) + 1376312589U;
+        return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+      }
+
+      float noise(in vec2 uv, in float timeVal) {
+        uvec2 p = uvec2(uv);
+        return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+      }
+
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+
+        if (bloomEnabled && bloomStrength > 0.001) {
+          vec4 b0 = texture(blur0Texture, vUv);
+          vec4 b1 = texture(blur1Texture, vUv);
+          vec4 b2 = texture(blur2Texture, vUv);
+          vec4 b3 = texture(blur3Texture, vUv);
+          vec4 b4 = texture(blur4Texture, vUv);
+
+          vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+          color += bloomSum * bloomStrength;
+        }
+
+        color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+        color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+        fragColor = vec4(color.rgb, 1.0);
+      }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+      vec2 barrelDistortion(vec2 coord, float amt) {
+        vec2 cc = coord - 0.5;
+        float dist = dot(cc, cc);
+        return coord + cc * dist * amt;
+      }
+      float sat(float t) { return clamp(t, 0.0, 1.0); }
+      float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+      float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+      vec4 spectrum_offset(float t) {
+        float lo = step(t, 0.5);
+        float hi = 1.0 - lo;
+        float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+        vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+        return pow(ret, vec4(1.0 / 2.2));
+      }
+      const float max_distort = 2.2;
+      const int num_iter = 8;
+      const float reci_num_iter_f = 1.0 / float(num_iter);
+      vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+        vec4 sumcol = vec4(0.0);
+        vec4 sumw = vec4(0.0);
+        for (int i = 0; i < num_iter; ++i) {
+          float t = float(i) * reci_num_iter_f;
+          vec4 w = spectrum_offset(t);
+          sumw += w;
+          sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+        }
+        return sumcol / sumw;
+      }
+    `;
+
+    const colorFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float chromaticAberrationAmount;
+      uniform float minInputLevel;
+      uniform float maxInputLevel;
+      uniform float gammaLevel;
+      uniform float fisheyeStrength;
+      uniform float fisheyeRadius;
+      uniform float time;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      ${chromaticAberrationShaderChunk}
+
+      vec2 applyFisheye(vec2 uv, float strength, float radius) {
+        if (abs(strength) < 0.0001) return uv;
+        vec2 p = uv - 0.5;
+        float d = length(p);
+        if (d > radius * 1.5) return uv;
+        float r = d / max(radius, 0.001);
+        float theta = atan(p.y, p.x);
+        float rDist = r + strength * (r * r * r);
+        return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+      }
+
+      vec3 gammaCorrect(vec3 color, vec3 gamma) {
+        return pow(max(color, vec3(0.0)), 1.0 / gamma);
+      }
+      vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+        return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+      }
+      vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+        return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+      }
+      void main() {
+        vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+        fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+        fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+        fragColor.a = 1.0;
+      }
+    `;
+
+    const copyFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        fragColor = texture(inputTexture, vUv);
+      }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 1.0, radius = 0.5, threshold = 0.15, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.2,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.6,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.15,
+
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.025,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.45,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.02,
+
+          gamma: params.gamma !== undefined ? params.gamma : 0.95,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing Suite") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Suite");
+
+        const bloom = root.addFolder("Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 4.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+        const lens = root.addFolder("Lens & Cinematic");
+        lens.add(this.settings, "chromaticAberration", 0, 0.15, 0.005).name("Chromatic Aberr.").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // =========================================================================
+    // 7 SCENE ARCHITECTURES & VARIATIONS
+    // =========================================================================
+    const ARCHITECTURE_VARIATIONS = [
+      'Standard Discrete Package',
+      'Wafer-Scale Engine (Photonic)',
+      'Exploded 3D Chiplet Stack',
+      'Neuromorphic Spiking Network',
+      'CAD / Gerber Blueprint',
+      'Overclocked Thermal Runaway',
+      'Cryogenic Superconducting Core'
+    ];
+
+    // =========================================================================
+    // 18 PRECONFIGURED COLOR SCHEMES
+    // =========================================================================
+    const COLOR_SCHEMES = {
+      'Monochromatic': {
+        bg: '#040a14', substrate: '#081426', die: '#0f2747',
+        traces1: '#1b5296', traces2: '#10335e', pulses: '#40a9ff', accent: '#85ccff'
+      },
+      'Analogous': {
+        bg: '#050a1c', substrate: '#0b163b', die: '#172763',
+        traces1: '#00b4d8', traces2: '#0077b6', pulses: '#00f0ff', accent: '#7209b7'
+      },
+      'Complementary': {
+        bg: '#080c14', substrate: '#0e1624', die: '#18243c',
+        traces1: '#00e5ff', traces2: '#1a3f59', pulses: '#ff9100', accent: '#ffab40'
+      },
+      'Split-complementary': {
+        bg: '#071214', substrate: '#0d2226', die: '#14343a',
+        traces1: '#00f5d4', traces2: '#007f73', pulses: '#ff5470', accent: '#ffbe0b'
+      },
+      'Triadic': {
+        bg: '#0d0814', substrate: '#1a1029', die: '#2b1b44',
+        traces1: '#9d4edd', traces2: '#00f59b', pulses: '#ffd166', accent: '#00f59b'
+      },
+      'Tetradic': {
+        bg: '#090914', substrate: '#121226', die: '#1d1d40',
+        traces1: '#4361ee', traces2: '#4cc9f0', pulses: '#f72585', accent: '#b5e48c'
+      },
+      'Double split-complementary': {
+        bg: '#050811', substrate: '#0c1324', die: '#16233d',
+        traces1: '#00d2ff', traces2: '#ff2a6d', pulses: '#ffbe0b', accent: '#05d9e8'
+      },
+      'Achromatic (Black on White)': {
+        bg: '#f0f3f6', substrate: '#dbe2ea', die: '#b8c5d4',
+        traces1: '#1a202c', traces2: '#4a5568', pulses: '#000000', accent: '#2d3748'
+      },
+      'Achromatic (White on Black)': {
+        bg: '#050505', substrate: '#121212', die: '#1f1f1f',
+        traces1: '#e2e8f0', traces2: '#4a5568', pulses: '#ffffff', accent: '#cbd5e1'
+      },
+      'Neutral + Accent': {
+        bg: '#0e1014', substrate: '#181b22', die: '#232833',
+        traces1: '#3d4454', traces2: '#2a303c', pulses: '#39ff14', accent: '#39ff14'
+      },
+      'Amber Magma': {
+        bg: '#220901', substrate: '#941B0C', die: '#BC3908',
+        traces1: '#F6AA1C', traces2: '#BC3908', pulses: '#F6AA1C', accent: '#FFE8B2'
+      },
+      'Cyan Cyberpunk': {
+        bg: '#000000', substrate: '#0B132B', die: '#4BAD9E',
+        traces1: '#5BC0BE', traces2: '#4BAD9E', pulses: '#63D1CF', accent: '#E0FBFF'
+      },
+      'Neon Lavender': {
+        bg: '#0D001D', substrate: '#120A12', die: '#AA60C8',
+        traces1: '#D69ADE', traces2: '#C9A3C6', pulses: '#CFB5C2', accent: '#FFFFFF'
+      },
+      'Golden Teal Matrix': {
+        bg: '#061210', substrate: '#00474D', die: '#008189',
+        traces1: '#FFBA00', traces2: '#008189', pulses: '#FEF1BE', accent: '#FFFFFF'
+      },
+      'Bioluminescent Emerald': {
+        bg: '#05140A', substrate: '#0A3322', die: '#00B894',
+        traces1: '#7FFF00', traces2: '#00B894', pulses: '#D4FFB0', accent: '#FFFFFF'
+      },
+      'Deep Sunset Nebula': {
+        bg: '#0E0618', substrate: '#3D1050', die: '#C7501A',
+        traces1: '#FF8C00', traces2: '#C7501A', pulses: '#FFE8CC', accent: '#FFD199'
+      },
+      'Ultraviolet Royal': {
+        bg: '#090612', substrate: '#1A1250', die: '#6A3DE8',
+        traces1: '#B38FFF', traces2: '#6A3DE8', pulses: '#E8E0FF', accent: '#FFFFFF'
+      },
+      'Cyber Synthwave': {
+        bg: '#05020F', substrate: '#1E0A3D', die: '#D40078',
+        traces1: '#00F0FF', traces2: '#D40078', pulses: '#E0FBFF', accent: '#00F0FF'
+      }
+    };
+
+    // 8 PRECONFIGURED CAMERA ANIMATIONS
+    const ANIMATION_MODES = [
+      'Static (Circuit Activity Only)',
+      'Slow Orbit',
+      'Subtle Isometric Tilt',
+      'Deep Core Breathing',
+      'Vector Pan Scan',
+      'Figure-8 Surveillance',
+      'Clockwise Horizon Sweep',
+      'Pulse Resonance'
+    ];
+
+    // State Configuration
+    const params = {
+      // Scene Variation Architecture
+      architecture: 'Standard Discrete Package',
+      explosionHeight: 45.0, // For Exploded 3D Chiplet Stack
+      coreTemperature: 65.0, // For Overclocked Thermal Runaway (°C)
+      spikeRate: 1.2,        // For Neuromorphic SNN
+      quantumFlux: 1.0,      // For Cryogenic Superconductor
+      showDimensions: true,  // For CAD Blueprint Mode
+
+      greenScreen: false,
+      antialias: true,
+      exposure: 1.05,
+      lightIntensity: 1.3,
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+
+      colorScheme: 'Cyan Cyberpunk',
+      bgColor: '#000000',
+      substrateColor: '#0B132B',
+      dieColor: '#4BAD9E',
+      traces1Color: '#5BC0BE',
+      traces2Color: '#4BAD9E',
+      pulsesColor: '#63D1CF',
+      accentColor: '#E0FBFF',
+
+      animationMode: 'Slow Orbit',
+      animationSpeed: 1.0,
+      flowSpeed: 1.5,
+      dashSize: 22,
+      gapSize: 18,
+      neuralActivity: 1.0,
+      glowIntensity: 1.6,
+
+      clickToRandomize: true,
+      controlMode: 'Rotate & Pan',
+
+      randomizeNow: () => triggerRandomPreset(),
+      resetCamera: () => resetCameraPose()
+    };
+
+    // Scene Globals
+    let renderer, scene, camera, controls, postProcessor;
+    let container = document.getElementById('canvas-container');
+    let gui;
+    let traceUniforms = [];
+    let tensorMesh, sramMeshes = [];
+    let substrateMesh, pkgMesh, ihsMesh, innerDie, dieGroup;
+    let substrateMaterial, pkgMaterial, dieMaterial, silkscreenMaterial, capacitorMaterial, viaMaterial;
+    let waferMesh, waferGridMesh, tsvPillarsGroup, cadBlueprintGroup, thermalGlowMesh, cryoHaloMesh;
+    let clock = new THREE.Clock();
+    let initialCamZ = 540;
+
+    init();
+    buildCircuitScene();
+    setupGUI();
+    applyArchitectureVariation(params.architecture);
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+
+      const aspect = window.innerWidth / window.innerHeight;
+      camera = new THREE.PerspectiveCamera(45, aspect, 1, 4000);
+      resetCameraPose();
+
+      createRenderer();
+
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+      ambientLight.name = 'ambientLight';
+      scene.add(ambientLight);
+
+      const mainLight = new THREE.DirectionalLight(0xffffff, params.lightIntensity);
+      mainLight.position.set(250, 350, 450);
+      mainLight.name = 'mainLight';
+      scene.add(mainLight);
+
+      const rimLight = new THREE.DirectionalLight(0xffffff, params.lightIntensity * 0.45);
+      rimLight.position.set(-250, -250, 350);
+      rimLight.name = 'rimLight';
+      scene.add(rimLight);
+
+      window.addEventListener('resize', onWindowResize, false);
+
+      // 'H' key toggles lil-gui
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'h' || e.key === 'H') {
+          if (gui) {
+            gui._hidden ? gui.show() : gui.hide();
+          }
+        }
+      });
+
+      // Pointer detection for Click to Randomize
+      let pointerDownPos = { x: 0, y: 0, time: 0 };
+      container.addEventListener('pointerdown', (e) => {
+        pointerDownPos.x = e.clientX;
+        pointerDownPos.y = e.clientY;
+        pointerDownPos.time = performance.now();
+      });
+
+      container.addEventListener('pointerup', (e) => {
+        const dx = e.clientX - pointerDownPos.x;
+        const dy = e.clientY - pointerDownPos.y;
+        const dt = performance.now() - pointerDownPos.time;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist < 6 && dt < 280 && params.clickToRandomize) {
+          triggerRandomPreset();
+        }
+      });
+    }
+
+    function createRenderer() {
+      if (renderer) {
+        renderer.dispose();
+        if (renderer.domElement && renderer.domElement.parentNode) {
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        }
+      }
+
+      renderer = new THREE.WebGLRenderer({
+        antialias: params.antialias,
+        powerPreference: 'high-performance'
+      });
+      renderer.setPixelRatio(params.dpr);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = params.exposure;
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.maxDistance = 2200;
+      controls.minDistance = 60;
+      updateControlMode();
+
+      if (!postProcessor) {
+        postProcessor = new PostProcessor(renderer, {
+          enabled: true,
+          bloomEnabled: true,
+          bloomStrength: 1.25,
+          bloomRadius: 0.6,
+          bloomThreshold: 0.15,
+          chromaticAberration: 0.025,
+          vignetteBoost: 1.05,
+          vignetteReduction: 0.45,
+          noiseIntensity: 0.02,
+          gamma: 0.95
+        });
+      } else {
+        postProcessor.renderer = renderer;
+      }
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+      applyBackgroundColor();
+    }
+
+    function updateControlMode() {
+      if (!controls) return;
+      if (params.controlMode === '2D Pan Only') {
+        controls.mouseButtons = {
+          LEFT: THREE.MOUSE.PAN,
+          MIDDLE: THREE.MOUSE.DOLLY,
+          RIGHT: THREE.MOUSE.PAN
+        };
+        controls.enableRotate = false;
+      } else {
+        controls.mouseButtons = {
+          LEFT: THREE.MOUSE.ROTATE,
+          MIDDLE: THREE.MOUSE.DOLLY,
+          RIGHT: THREE.MOUSE.PAN
+        };
+        controls.enableRotate = true;
+      }
+    }
+
+    function resetCameraPose() {
+      camera.position.set(0, 0, initialCamZ);
+      camera.lookAt(0, 0, 0);
+      camera.up.set(0, 1, 0);
+      if (controls) {
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }
+    }
+
+    function onWindowResize() {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height);
+      if (postProcessor) {
+        postProcessor.setSize(width, height, params.dpr);
+      }
+    }
+
+    // =========================================================================
+    // PROCEDURAL CIRCUIT SCHEMATIC: HIGH-FIDELITY EDA MANHATTAN ROUTING
+    // =========================================================================
+    function buildCircuitScene() {
+      const p = COLOR_SCHEMES[params.colorScheme];
+      applySchemeColors(p, false);
+
+      const circuitGroup = new THREE.Group();
+      circuitGroup.name = 'circuitSystem';
+      scene.add(circuitGroup);
+
+      // 1. Motherboard PCB Substrate (Expansive, no cutoff edges)
+      const subGeom = new THREE.BoxGeometry(1800, 1800, 12);
+      substrateMaterial = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.substrateColor),
+        roughness: 0.75,
+        metalness: 0.15
+      });
+      substrateMesh = new THREE.Mesh(subGeom, substrateMaterial);
+      substrateMesh.position.z = -7;
+      circuitGroup.add(substrateMesh);
+
+      // 2. Central AI Neural Processor Die & Package
+      buildProcessorDie(circuitGroup);
+
+      // 3. Right-Angled Collision-Free Circuit Buses with Flowing Dashes
+      buildRightAngledCircuitTraces(circuitGroup);
+
+      // 4. Decoupling Capacitors & Precision Termination Vias
+      buildPerimeterComponents(circuitGroup);
+
+      // 5. Silkscreen Legend & Engineering Decals
+      buildSilkscreenOverlay(circuitGroup);
+
+      // 6. Architectural Extension Objects for the 6 Scene Variations
+      buildArchitecturalVariationObjects(circuitGroup);
+    }
+
+    function buildProcessorDie(parent) {
+      dieGroup = new THREE.Group();
+      dieGroup.position.z = 1;
+
+      // Outer Interposer Substrate Package with Symmetrical 45° Chamfers
+      const pkgHalf = 180;
+      const chamfer = 35;
+      const packageShape = new THREE.Shape();
+      packageShape.moveTo(-pkgHalf + chamfer, -pkgHalf);
+      packageShape.lineTo(pkgHalf - chamfer, -pkgHalf);
+      packageShape.lineTo(pkgHalf, -pkgHalf + chamfer);
+      packageShape.lineTo(pkgHalf, pkgHalf - chamfer);
+      packageShape.lineTo(pkgHalf - chamfer, pkgHalf);
+      packageShape.lineTo(-pkgHalf + chamfer, pkgHalf);
+      packageShape.lineTo(-pkgHalf, pkgHalf - chamfer);
+      packageShape.lineTo(-pkgHalf, -pkgHalf + chamfer);
+      packageShape.closePath();
+
+      const extrudeSettings = { depth: 3.5, bevelEnabled: true, bevelSegments: 3, steps: 1, bevelSize: 1.5, bevelThickness: 1.5 };
+      const pkgGeom = new THREE.ExtrudeGeometry(packageShape, extrudeSettings);
+      pkgGeom.center();
+
+      pkgMaterial = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.dieColor).multiplyScalar(0.7),
+        roughness: 0.35,
+        metalness: 0.65
+      });
+      pkgMesh = new THREE.Mesh(pkgGeom, pkgMaterial);
+      dieGroup.add(pkgMesh);
+
+      // Integrated Heat Spreader / Silicon Carrier Rim
+      const ihsGeom = new THREE.BoxGeometry(250, 250, 2.5);
+      const ihsMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.dieColor).multiplyScalar(0.9),
+        roughness: 0.25,
+        metalness: 0.85
+      });
+      ihsMesh = new THREE.Mesh(ihsGeom, ihsMat);
+      ihsMesh.position.z = 2.5;
+      dieGroup.add(ihsMesh);
+
+      // Pin-1 Gold Indexing Notch
+      const pin1Shape = new THREE.Shape();
+      pin1Shape.moveTo(-pkgHalf + 8, pkgHalf - 32);
+      pin1Shape.lineTo(-pkgHalf + 32, pkgHalf - 8);
+      pin1Shape.lineTo(-pkgHalf + 8, pkgHalf - 8);
+      pin1Shape.closePath();
+      const pin1Geom = new THREE.ShapeGeometry(pin1Shape);
+      const pin1Mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(params.pulsesColor) });
+      const pin1Mesh = new THREE.Mesh(pin1Geom, pin1Mat);
+      pin1Mesh.position.z = 4.0;
+      dieGroup.add(pin1Mesh);
+
+      // Central Polished Silicon Die
+      const dieSize = 200;
+      const dieGeom = new THREE.BoxGeometry(dieSize, dieSize, 2);
+      dieMaterial = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.dieColor),
+        roughness: 0.15,
+        metalness: 0.95
+      });
+      innerDie = new THREE.Mesh(dieGeom, dieMaterial);
+      innerDie.position.z = 4.0;
+      dieGroup.add(innerDie);
+
+      // 8x8 Systolic Array Tensor ALU Cores
+      const coreRows = 8;
+      const coreCols = 8;
+      const coreTileSize = 15;
+      const coreGap = 4;
+      const totalGrid = coreRows * coreTileSize + (coreRows - 1) * coreGap;
+      const startOffset = -totalGrid / 2 + coreTileSize / 2;
+
+      const tileGeom = new THREE.BoxGeometry(coreTileSize, coreTileSize, 1.8);
+      const tileMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.accentColor),
+        emissive: new THREE.Color(params.pulsesColor),
+        emissiveIntensity: 0.9,
+        roughness: 0.2,
+        metalness: 0.6
+      });
+      tensorMesh = new THREE.InstancedMesh(tileGeom, tileMat, coreRows * coreCols);
+      tensorMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+      const dummy = new THREE.Object3D();
+      let idx = 0;
+      for (let r = 0; r < coreRows; r++) {
+        for (let c = 0; c < coreCols; c++) {
+          const x = startOffset + c * (coreTileSize + coreGap);
+          const y = startOffset + r * (coreTileSize + coreGap);
+          dummy.position.set(x, y, 5.2);
+          dummy.scale.set(1, 1, 1);
+          dummy.updateMatrix();
+          tensorMesh.setMatrixAt(idx++, dummy.matrix);
+        }
+      }
+      tensorMesh.instanceMatrix.needsUpdate = true;
+      dieGroup.add(tensorMesh);
+
+      // 4 High-Bandwidth Memory (HBM3) / SRAM Caches
+      const sramConfigs = [
+        { w: totalGrid, h: 10, x: 0, y: totalGrid / 2 + 13 },
+        { w: totalGrid, h: 10, x: 0, y: -totalGrid / 2 - 13 },
+        { w: 10, h: totalGrid, x: -totalGrid / 2 - 13, y: 0 },
+        { w: 10, h: totalGrid, x: totalGrid / 2 + 13, y: 0 }
+      ];
+
+      sramMeshes = [];
+      sramConfigs.forEach(cfg => {
+        const sramGeom = new THREE.BoxGeometry(cfg.w, cfg.h, 1.5);
+        const sramMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(params.traces1Color),
+          emissive: new THREE.Color(params.traces1Color),
+          emissiveIntensity: 0.5,
+          roughness: 0.35,
+          metalness: 0.75
+        });
+        const mesh = new THREE.Mesh(sramGeom, sramMat);
+        mesh.position.set(cfg.x, cfg.y, 5.2);
+        dieGroup.add(mesh);
+        sramMeshes.push(mesh);
+      });
+
+      // Concentric Micro-Bus Interconnect Rings
+      const ringMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.traces2Color),
+        transparent: true,
+        opacity: 0.85
+      });
+      [totalGrid / 2 + 5, dieSize / 2 - 6].forEach(radius => {
+        const ringGeom = new THREE.BufferGeometry();
+        const segments = 64;
+        const pts = [];
+        for (let i = 0; i <= segments; i++) {
+          const theta = (i / segments) * Math.PI * 2;
+          pts.push(new THREE.Vector3(Math.cos(theta) * radius, Math.sin(theta) * radius, 5.1));
+        }
+        ringGeom.setFromPoints(pts);
+        const ringLine = new THREE.Line(ringGeom, ringMat);
+        dieGroup.add(ringLine);
+      });
+
+      parent.add(dieGroup);
+    }
+
+    // Architectural Extension Objects for the 6 Scene Variations
+    function buildArchitecturalVariationObjects(parent) {
+      // 1. Wafer-Scale Engine (300mm Circular Wafer with Reticle Matrix)
+      const waferGeom = new THREE.CylinderGeometry(560, 560, 6, 64);
+      const waferMat = new THREE.MeshPhysicalMaterial({
+        color: 0x0a1428,
+        metalness: 0.95,
+        roughness: 0.1,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.05,
+        reflectivity: 0.9
+      });
+      waferMesh = new THREE.Mesh(waferGeom, waferMat);
+      waferMesh.rotation.x = Math.PI / 2;
+      waferMesh.position.z = -5.5;
+      waferMesh.visible = false;
+      parent.add(waferMesh);
+
+      // Multi-die Reticle Tiles on Wafer
+      const reticleGeom = new THREE.BoxGeometry(45, 45, 2);
+      const reticleMat = new THREE.MeshStandardMaterial({
+        color: 0x00f0ff,
+        emissive: 0x0077b6,
+        emissiveIntensity: 0.3,
+        roughness: 0.3,
+        metalness: 0.8
+      });
+      const reticleCount = 49;
+      waferGridMesh = new THREE.InstancedMesh(reticleGeom, reticleMat, reticleCount);
+      const dummy = new THREE.Object3D();
+      let rIdx = 0;
+      for (let rx = -3; rx <= 3; rx++) {
+        for (let ry = -3; ry <= 3; ry++) {
+          if (Math.abs(rx) <= 1 && Math.abs(ry) <= 1) continue; // Leave center for main core
+          const px = rx * 90;
+          const py = ry * 90;
+          if (Math.hypot(px, py) < 510) {
+            dummy.position.set(px, py, 1.2);
+            dummy.scale.set(1, 1, 1);
+            dummy.updateMatrix();
+            waferGridMesh.setMatrixAt(rIdx++, dummy.matrix);
+          }
+        }
+      }
+      waferGridMesh.count = rIdx;
+      waferGridMesh.instanceMatrix.needsUpdate = true;
+      waferGridMesh.visible = false;
+      parent.add(waferGridMesh);
+
+      // 2. Exploded 3D Chiplet Stack: Vertical Through-Silicon Vias (TSVs)
+      tsvPillarsGroup = new THREE.Group();
+      const tsvBeamGeom = new THREE.CylinderGeometry(1.2, 1.2, 80, 8);
+      const tsvBeamMat = new THREE.MeshBasicMaterial({
+        color: 0x00f0ff,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending
+      });
+      const tsvPillars = new THREE.InstancedMesh(tsvBeamGeom, tsvBeamMat, 64);
+      let tIdx = 0;
+      for (let tx = -3; tx <= 3; tx++) {
+        for (let ty = -3; ty <= 3; ty++) {
+          if (Math.abs(tx) === 3 || Math.abs(ty) === 3) {
+            dummy.position.set(tx * 32, ty * 32, 20);
+            dummy.rotation.set(Math.PI / 2, 0, 0);
+            dummy.updateMatrix();
+            tsvPillars.setMatrixAt(tIdx++, dummy.matrix);
+          }
+        }
+      }
+      tsvPillars.instanceMatrix.needsUpdate = true;
+      tsvPillarsGroup.add(tsvPillars);
+      tsvPillarsGroup.visible = false;
+      parent.add(tsvPillarsGroup);
+
+      // 3. CAD / Gerber Blueprint Mode Overlays (Dimension lines, calipers, layer markers)
+      cadBlueprintGroup = new THREE.Group();
+      const cadLineMat = new THREE.LineBasicMaterial({
+        color: 0x00e5ff,
+        transparent: true,
+        opacity: 0.85
+      });
+      // Dimension bracket lines
+      const cadPts = [
+        // Top width dimension
+        new THREE.Vector3(-180, 220, 2), new THREE.Vector3(180, 220, 2),
+        new THREE.Vector3(-180, 210, 2), new THREE.Vector3(-180, 230, 2),
+        new THREE.Vector3(180, 210, 2), new THREE.Vector3(180, 230, 2),
+        // Left height dimension
+        new THREE.Vector3(-220, -180, 2), new THREE.Vector3(-220, 180, 2),
+        new THREE.Vector3(-210, -180, 2), new THREE.Vector3(-230, -180, 2),
+        new THREE.Vector3(-210, 180, 2), new THREE.Vector3(-230, 180, 2),
+        // Diagonal keepout calipers
+        new THREE.Vector3(190, 190, 2), new THREE.Vector3(260, 260, 2),
+        new THREE.Vector3(-190, 190, 2), new THREE.Vector3(-260, 260, 2),
+        new THREE.Vector3(190, -190, 2), new THREE.Vector3(260, -260, 2),
+        new THREE.Vector3(-190, -190, 2), new THREE.Vector3(-260, -260, 2)
+      ];
+      const cadGeom = new THREE.BufferGeometry().setFromPoints(cadPts);
+      const cadLines = new THREE.LineSegments(cadGeom, cadLineMat);
+      cadBlueprintGroup.add(cadLines);
+      cadBlueprintGroup.visible = false;
+      parent.add(cadBlueprintGroup);
+
+      // 4. Overclocked Thermal Runaway Heat Haze Glow
+      const thermalGeom = new THREE.PlaneGeometry(360, 360);
+      const thermalMat = new THREE.MeshBasicMaterial({
+        color: 0xff3300,
+        transparent: true,
+        opacity: 0.0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+      thermalGlowMesh = new THREE.Mesh(thermalGeom, thermalMat);
+      thermalGlowMesh.position.z = 6.2;
+      thermalGlowMesh.visible = false;
+      parent.add(thermalGlowMesh);
+
+      // 5. Cryogenic Superconducting Core Halo
+      const cryoGeom = new THREE.RingGeometry(210, 270, 64);
+      const cryoMat = new THREE.MeshBasicMaterial({
+        color: 0x00f0ff,
+        transparent: true,
+        opacity: 0.0,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      });
+      cryoHaloMesh = new THREE.Mesh(cryoGeom, cryoMat);
+      cryoHaloMesh.position.z = 2.0;
+      cryoHaloMesh.visible = false;
+      parent.add(cryoHaloMesh);
+    }
+
+    // Strict Manhattan Routing: No Crossings, Symmetrical Busses, Dedicated Channels
+    function buildRightAngledCircuitTraces(parent) {
+      const tracePaths = [];
+      const pkgHalf = 180;
+      const busEnd = 680;
+      const zPlane = 0.5;
+
+      // 1. North Cardinal Bus (24 Parallel Traces)
+      const numTraces = 24;
+      for (let i = 0; i < numTraces; i++) {
+        const u = (i - (numTraces - 1) / 2) / ((numTraces - 1) / 2);
+        const startX = u * 115;
+        const startY = pkgHalf;
+        const jogY1 = pkgHalf + 25 + Math.abs(u) * 22;
+        const endX = u * 190;
+        const jogY2 = jogY1 + Math.abs(endX - startX);
+
+        const pts = [
+          new THREE.Vector3(startX, startY, zPlane),
+          new THREE.Vector3(startX, jogY1, zPlane),
+          new THREE.Vector3(endX, jogY2, zPlane)
+        ];
+
+        // Serpentine delay matching on specific lanes without colliding
+        if (i === 4 || i === 19) {
+          let curY = jogY2 + 30;
+          pts.push(new THREE.Vector3(endX, curY, zPlane));
+          for (let s = 0; s < 4; s++) {
+            const side = (s % 2 === 0 ? 8 : -8);
+            curY += 12;
+            pts.push(new THREE.Vector3(endX + side, curY - 4, zPlane));
+            pts.push(new THREE.Vector3(endX + side, curY, zPlane));
+            pts.push(new THREE.Vector3(endX, curY, zPlane));
+          }
+        }
+
+        pts.push(new THREE.Vector3(endX, busEnd, zPlane));
+
+        tracePaths.push({
+          pts,
+          type: i % 2 === 0 ? 1 : 2,
+          dir: i % 3 === 0 ? -1.0 : 1.0,
+          speedMod: 0.9 + (i % 4) * 0.15,
+          endPad: new THREE.Vector3(endX, busEnd, zPlane),
+          startPad: new THREE.Vector3(startX, startY, zPlane)
+        });
+      }
+
+      // 2. South Cardinal Bus (24 Parallel Traces)
+      for (let i = 0; i < numTraces; i++) {
+        const u = (i - (numTraces - 1) / 2) / ((numTraces - 1) / 2);
+        const startX = u * 115;
+        const startY = -pkgHalf;
+        const jogY1 = -pkgHalf - 25 - Math.abs(u) * 22;
+        const endX = u * 190;
+        const jogY2 = jogY1 - Math.abs(endX - startX);
+
+        const pts = [
+          new THREE.Vector3(startX, startY, zPlane),
+          new THREE.Vector3(startX, jogY1, zPlane),
+          new THREE.Vector3(endX, jogY2, zPlane)
+        ];
+
+        if (i === 4 || i === 19) {
+          let curY = jogY2 - 30;
+          pts.push(new THREE.Vector3(endX, curY, zPlane));
+          for (let s = 0; s < 4; s++) {
+            const side = (s % 2 === 0 ? 8 : -8);
+            curY -= 12;
+            pts.push(new THREE.Vector3(endX + side, curY + 4, zPlane));
+            pts.push(new THREE.Vector3(endX + side, curY, zPlane));
+            pts.push(new THREE.Vector3(endX, curY, zPlane));
+          }
+        }
+
+        pts.push(new THREE.Vector3(endX, -busEnd, zPlane));
+
+        tracePaths.push({
+          pts,
+          type: i % 2 === 0 ? 1 : 2,
+          dir: i % 3 === 0 ? 1.0 : -1.0,
+          speedMod: 0.9 + (i % 4) * 0.15,
+          endPad: new THREE.Vector3(endX, -busEnd, zPlane),
+          startPad: new THREE.Vector3(startX, startY, zPlane)
+        });
+      }
+
+      // 3. East Cardinal Bus (24 Parallel Traces)
+      for (let i = 0; i < numTraces; i++) {
+        const u = (i - (numTraces - 1) / 2) / ((numTraces - 1) / 2);
+        const startX = pkgHalf;
+        const startY = u * 115;
+        const jogX1 = pkgHalf + 25 + Math.abs(u) * 22;
+        const endY = u * 190;
+        const jogX2 = jogX1 + Math.abs(endY - startY);
+
+        const pts = [
+          new THREE.Vector3(startX, startY, zPlane),
+          new THREE.Vector3(jogX1, startY, zPlane),
+          new THREE.Vector3(jogX2, endY, zPlane)
+        ];
+
+        if (i === 4 || i === 19) {
+          let curX = jogX2 + 30;
+          pts.push(new THREE.Vector3(curX, endY, zPlane));
+          for (let s = 0; s < 4; s++) {
+            const side = (s % 2 === 0 ? 8 : -8);
+            curX += 12;
+            pts.push(new THREE.Vector3(curX - 4, endY + side, zPlane));
+            pts.push(new THREE.Vector3(curX, endY + side, zPlane));
+            pts.push(new THREE.Vector3(curX, endY, zPlane));
+          }
+        }
+
+        pts.push(new THREE.Vector3(busEnd, endY, zPlane));
+
+        tracePaths.push({
+          pts,
+          type: i % 2 === 0 ? 1 : 2,
+          dir: 1.0,
+          speedMod: 0.9 + (i % 4) * 0.15,
+          endPad: new THREE.Vector3(busEnd, endY, zPlane),
+          startPad: new THREE.Vector3(startX, startY, zPlane)
+        });
+      }
+
+      // 4. West Cardinal Bus (24 Parallel Traces)
+      for (let i = 0; i < numTraces; i++) {
+        const u = (i - (numTraces - 1) / 2) / ((numTraces - 1) / 2);
+        const startX = -pkgHalf;
+        const startY = u * 115;
+        const jogX1 = -pkgHalf - 25 - Math.abs(u) * 22;
+        const endY = u * 190;
+        const jogX2 = jogX1 - Math.abs(endY - startY);
+
+        const pts = [
+          new THREE.Vector3(startX, startY, zPlane),
+          new THREE.Vector3(jogX1, startY, zPlane),
+          new THREE.Vector3(jogX2, endY, zPlane)
+        ];
+
+        if (i === 4 || i === 19) {
+          let curX = jogX2 - 30;
+          pts.push(new THREE.Vector3(curX, endY, zPlane));
+          for (let s = 0; s < 4; s++) {
+            const side = (s % 2 === 0 ? 8 : -8);
+            curX -= 12;
+            pts.push(new THREE.Vector3(curX + 4, endY + side, zPlane));
+            pts.push(new THREE.Vector3(curX, endY + side, zPlane));
+            pts.push(new THREE.Vector3(curX, endY, zPlane));
+          }
+        }
+
+        pts.push(new THREE.Vector3(-busEnd, endY, zPlane));
+
+        tracePaths.push({
+          pts,
+          type: i % 2 === 0 ? 1 : 2,
+          dir: -1.0,
+          speedMod: 0.9 + (i % 4) * 0.15,
+          endPad: new THREE.Vector3(-busEnd, endY, zPlane),
+          startPad: new THREE.Vector3(startX, startY, zPlane)
+        });
+      }
+
+      // 5. Four Corner Diagonal Breakouts (NE, NW, SE, SW: 12 Traces each)
+      const corners = [
+        { signX: 1, signY: 1 },
+        { signX: -1, signY: 1 },
+        { signX: -1, signY: -1 },
+        { signX: 1, signY: -1 }
+      ];
+
+      corners.forEach(corner => {
+        const count = 12;
+        for (let k = 0; k < count; k++) {
+          const t = (k + 0.5) / count;
+          const sx = corner.signX * (145 + t * 35);
+          const sy = corner.signY * (180 - t * 35);
+
+          const diagDist = 55 + k * 14;
+          const mx = sx + corner.signX * diagDist;
+          const my = sy + corner.signY * diagDist;
+
+          let ex, ey;
+          const pts = [
+            new THREE.Vector3(sx, sy, zPlane),
+            new THREE.Vector3(mx, my, zPlane)
+          ];
+
+          if (k < 6) {
+            ex = corner.signX * 650;
+            ey = my;
+            pts.push(new THREE.Vector3(ex, ey, zPlane));
+          } else {
+            ex = mx;
+            ey = corner.signY * 650;
+            pts.push(new THREE.Vector3(ex, ey, zPlane));
+          }
+
+          tracePaths.push({
+            pts,
+            type: 1,
+            dir: (k + corner.signX) % 2 === 0 ? 1.0 : -1.0,
+            speedMod: 1.0 + (k % 3) * 0.18,
+            endPad: new THREE.Vector3(ex, ey, zPlane),
+            startPad: new THREE.Vector3(sx, sy, zPlane)
+          });
+        }
+      });
+
+      window._circuitTracePaths = tracePaths;
+
+      // Flowing Dash Shader
+      const dashVertexShader = `
+        attribute float aDist;
+        attribute float aDir;
+        attribute float aSpeed;
+        varying float vDist;
+        varying float vDir;
+        varying float vSpeed;
+        void main() {
+          vDist = aDist;
+          vDir = aDir;
+          vSpeed = aSpeed;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `;
+
+      const dashFragmentShader = `
+        uniform float uTime;
+        uniform float uDashSize;
+        uniform float uGapSize;
+        uniform float uGlobalSpeed;
+        uniform vec3 uBaseColor;
+        uniform vec3 uPulseColor;
+        uniform float uGlowIntensity;
+        uniform int uArchMode; // 0=standard, 1=photonic, 2=exploded, 3=spiking, 4=blueprint, 5=thermal, 6=cryo
+        varying float vDist;
+        varying float vDir;
+        varying float vSpeed;
+
+        void main() {
+          float totalPattern = uDashSize + uGapSize;
+          float flowOffset = mod(vDist * vDir - uTime * uGlobalSpeed * vSpeed * 70.0, totalPattern);
+          float inDash = step(flowOffset, uDashSize);
+
+          float packet = 0.0;
+          if (uArchMode == 3) {
+            // Neuromorphic Spiking Network: Asynchronous Dirac-delta spike bursts
+            float spikePhase = sin(vDist * 0.03 - uTime * uGlobalSpeed * 6.0 + sin(vDist * 0.1));
+            packet = pow(max(0.0, spikePhase), 22.0) * 5.0;
+          } else if (uArchMode == 6) {
+            // Cryogenic Superconductor: Coherent quantum standing wave
+            float standingWave = sin(vDist * 0.04) * cos(uTime * uGlobalSpeed * 4.0);
+            packet = pow(abs(standingWave), 4.0) * 3.5;
+          } else {
+            // Standard / Photonic / Thermal: Voltage data pulse waves
+            packet = pow(max(0.0, sin(vDist * 0.018 - uTime * uGlobalSpeed * vSpeed * 3.8)), 7.0) * 3.2;
+          }
+
+          vec3 baseCol = uBaseColor * 0.4;
+          if (uArchMode == 4) {
+            // Blueprint mode: Crisp CAD lines without heavy bloom bleed
+            baseCol = uBaseColor * 0.6;
+          }
+
+          vec3 activeDash = mix(baseCol, uPulseColor, inDash);
+          vec3 finalColor = activeDash + (uPulseColor * packet * inDash * uGlowIntensity);
+
+          float alpha = inDash * 0.95 + 0.18;
+          gl_FragColor = vec4(finalColor, alpha);
+        }
+      `;
+
+      const positions = [];
+      const distances = [];
+      const directions = [];
+      const speeds = [];
+
+      tracePaths.forEach(tp => {
+        let cumulativeDist = 0;
+        for (let j = 0; j < tp.pts.length - 1; j++) {
+          const p1 = tp.pts[j];
+          const p2 = tp.pts[j + 1];
+          const segLen = p1.distanceTo(p2);
+
+          positions.push(p1.x, p1.y, p1.z);
+          distances.push(cumulativeDist);
+          directions.push(tp.dir);
+          speeds.push(tp.speedMod);
+
+          cumulativeDist += segLen;
+          positions.push(p2.x, p2.y, p2.z);
+          distances.push(cumulativeDist);
+          directions.push(tp.dir);
+          speeds.push(tp.speedMod);
+        }
+      });
+
+      const traceGeom = new THREE.BufferGeometry();
+      traceGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      traceGeom.setAttribute('aDist', new THREE.Float32BufferAttribute(distances, 1));
+      traceGeom.setAttribute('aDir', new THREE.Float32BufferAttribute(directions, 1));
+      traceGeom.setAttribute('aSpeed', new THREE.Float32BufferAttribute(speeds, 1));
+
+      const traceUniform = {
+        uTime: { value: 0.0 },
+        uDashSize: { value: params.dashSize },
+        uGapSize: { value: params.gapSize },
+        uGlobalSpeed: { value: params.animationSpeed * params.flowSpeed },
+        uBaseColor: { value: new THREE.Color(params.traces2Color) },
+        uPulseColor: { value: new THREE.Color(params.pulsesColor) },
+        uGlowIntensity: { value: params.glowIntensity },
+        uArchMode: { value: 0 }
+      };
+      traceUniforms.push(traceUniform);
+
+      const traceShaderMat = new THREE.ShaderMaterial({
+        vertexShader: dashVertexShader,
+        fragmentShader: dashFragmentShader,
+        uniforms: traceUniform,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+
+      const lineSegments = new THREE.LineSegments(traceGeom, traceShaderMat);
+      parent.add(lineSegments);
+
+      const baseTrackMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.traces1Color),
+        transparent: true,
+        opacity: 0.4
+      });
+      const baseTrackLines = new THREE.LineSegments(traceGeom, baseTrackMat);
+      baseTrackLines.position.z = 0.2;
+      parent.add(baseTrackLines);
+    }
+
+    // Authentic Vias & Surface Mount Decoupling Capacitors
+    function buildPerimeterComponents(parent) {
+      const compGroup = new THREE.Group();
+      const dummy = new THREE.Object3D();
+      const tracePaths = window._circuitTracePaths || [];
+
+      // Vias at all trace terminations
+      const viaCount = tracePaths.length * 2 + 80;
+      const viaGeom = new THREE.CylinderGeometry(2.8, 2.8, 1, 16);
+      viaMaterial = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.accentColor),
+        emissive: new THREE.Color(params.pulsesColor),
+        emissiveIntensity: 0.6,
+        roughness: 0.2,
+        metalness: 0.95
+      });
+      const viaMesh = new THREE.InstancedMesh(viaGeom, viaMaterial, viaCount);
+
+      let vIdx = 0;
+      tracePaths.forEach(tp => {
+        dummy.position.set(tp.endPad.x, tp.endPad.y, 0.8);
+        dummy.rotation.set(Math.PI / 2, 0, 0);
+        dummy.updateMatrix();
+        viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+
+        dummy.position.set(tp.startPad.x, tp.startPad.y, 0.8);
+        dummy.updateMatrix();
+        viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+      });
+
+      // Linear ground guard fences along bus flanks
+      const fenceCoords = [-205, 205];
+      fenceCoords.forEach(fx => {
+        for (let y = 200; y <= 660; y += 45) {
+          dummy.position.set(fx, y, 0.8);
+          dummy.updateMatrix();
+          viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+
+          dummy.position.set(fx, -y, 0.8);
+          dummy.updateMatrix();
+          viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+
+          dummy.position.set(y, fx, 0.8);
+          dummy.updateMatrix();
+          viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+
+          dummy.position.set(-y, fx, 0.8);
+          dummy.updateMatrix();
+          viaMesh.setMatrixAt(vIdx++, dummy.matrix);
+        }
+      });
+      viaMesh.instanceMatrix.needsUpdate = true;
+      compGroup.add(viaMesh);
+
+      // Decoupling Capacitors (0402 package style)
+      const capCount = 96;
+      const capGeom = new THREE.BoxGeometry(11, 6, 2.8);
+      capacitorMaterial = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.traces2Color).multiplyScalar(0.75),
+        roughness: 0.3,
+        metalness: 0.85
+      });
+      const capMesh = new THREE.InstancedMesh(capGeom, capacitorMaterial, capCount);
+
+      let cIdx = 0;
+      for (let i = 0; i < 24; i++) {
+        const x = -190 + (i / 23) * 380;
+        dummy.position.set(x, 690, 1.4);
+        dummy.rotation.set(0, 0, 0);
+        dummy.updateMatrix();
+        capMesh.setMatrixAt(cIdx++, dummy.matrix);
+
+        dummy.position.set(x, -690, 1.4);
+        dummy.updateMatrix();
+        capMesh.setMatrixAt(cIdx++, dummy.matrix);
+      }
+      for (let i = 0; i < 24; i++) {
+        const y = -190 + (i / 23) * 380;
+        dummy.position.set(690, y, 1.4);
+        dummy.rotation.set(0, 0, Math.PI / 2);
+        dummy.updateMatrix();
+        capMesh.setMatrixAt(cIdx++, dummy.matrix);
+
+        dummy.position.set(-690, y, 1.4);
+        dummy.updateMatrix();
+        capMesh.setMatrixAt(cIdx++, dummy.matrix);
+      }
+      capMesh.instanceMatrix.needsUpdate = true;
+      compGroup.add(capMesh);
+
+      parent.add(compGroup);
+    }
+
+    // High-Resolution Procedural Vector Silkscreen Overlay
+    function buildSilkscreenOverlay(parent) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 2048;
+      canvas.height = 2048;
+      const ctx = canvas.getContext('2d');
+
+      ctx.clearRect(0, 0, 2048, 2048);
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.lineWidth = 3;
+      ctx.font = 'bold 22px monospace';
+
+      // Outer Board Perimeter Frame
+      ctx.strokeRect(60, 60, 1928, 1928);
+      ctx.strokeRect(75, 75, 1898, 1898);
+
+      // Corner Fiducials
+      const fids = [[120, 120], [1928, 120], [120, 1928], [1928, 1928]];
+      fids.forEach(([fx, fy]) => {
+        ctx.beginPath();
+        ctx.arc(fx, fy, 22, 0, Math.PI * 2);
+        ctx.moveTo(fx - 32, fy);
+        ctx.lineTo(fx + 32, fy);
+        ctx.moveTo(fx, fy - 32);
+        ctx.lineTo(fx, fy + 32);
+        ctx.stroke();
+      });
+
+      // Clear Border Legends (Outside trace corridors)
+      ctx.fillText('CORE: NEURAL-X9 TENSOR ACCELERATOR // 16384 MACs // 4.85 GHz', 160, 120);
+      ctx.fillText('PROCESS: 3nm FINFET // MULTI-DIE INTERPOSER REV 4.2', 160, 150);
+      ctx.fillText('BUS INTERCONNECT: 1024-BIT DIFFERENTIAL SYSTOLIC RING', 160, 180);
+
+      ctx.textAlign = 'right';
+      ctx.fillText('MEMORY: 8x HBM3e HIGH-BANDWIDTH STACK // 1.2 TB/s', 1888, 120);
+      ctx.fillText('HOST: PCIe 6.0 x16 PAM4 // 128 GT/s PHY LINKS', 1888, 150);
+      ctx.fillText('STATUS: NEURAL WEIGHT MATRIX ACTIVE // 0 ERRORS', 1888, 180);
+
+      // Millimeter Scale Calibration Ticks along borders
+      ctx.textAlign = 'center';
+      for (let x = 200; x <= 1848; x += 100) {
+        ctx.beginPath();
+        ctx.moveTo(x, 75);
+        ctx.lineTo(x, 90);
+        ctx.stroke();
+        ctx.fillText(`${x / 10}`, x, 110);
+
+        ctx.beginPath();
+        ctx.moveTo(x, 1973);
+        ctx.lineTo(x, 1958);
+        ctx.stroke();
+        ctx.fillText(`${x / 10}`, x, 1945);
+      }
+
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText('ARCH: NPU-TENSOR-X9', 1024, 980);
+      ctx.fillText('DIE ID: #88F-092-B', 1024, 1070);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.anisotropy = 16;
+
+      const silkscreenGeom = new THREE.PlaneGeometry(1600, 1600);
+      silkscreenMaterial = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        opacity: 0.65,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+      const silkscreenMesh = new THREE.Mesh(silkscreenGeom, silkscreenMaterial);
+      silkscreenMesh.position.z = 0.6;
+      parent.add(silkscreenMesh);
+    }
+
+    // =========================================================================
+    // SCENE VARIATION CONTROLLER & DYNAMICS
+    // =========================================================================
+    function applyArchitectureVariation(archName) {
+      params.architecture = archName;
+
+      // Map mode index for shaders
+      const modeIdx = ARCHITECTURE_VARIATIONS.indexOf(archName);
+      traceUniforms.forEach(u => {
+        u.uArchMode.value = (modeIdx >= 0 ? modeIdx : 0);
+      });
+
+      // Reset base visibility
+      if (waferMesh) waferMesh.visible = false;
+      if (waferGridMesh) waferGridMesh.visible = false;
+      if (tsvPillarsGroup) tsvPillarsGroup.visible = false;
+      if (cadBlueprintGroup) cadBlueprintGroup.visible = false;
+      if (thermalGlowMesh) thermalGlowMesh.visible = false;
+      if (cryoHaloMesh) cryoHaloMesh.visible = false;
+
+      // Reset 3D layer vertical offsets
+      if (substrateMesh) substrateMesh.position.z = -7;
+      if (pkgMesh) pkgMesh.position.z = 0;
+      if (ihsMesh) ihsMesh.position.z = 2.5;
+      if (innerDie) innerDie.position.z = 4.0;
+      if (tensorMesh) tensorMesh.position.z = 0;
+
+      // Configure each variation
+      if (archName === 'Wafer-Scale Engine (Photonic)') {
+        if (waferMesh) waferMesh.visible = true;
+        if (waferGridMesh) waferGridMesh.visible = true;
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 1.6;
+          postProcessor.settings.chromaticAberration = 0.04;
+          postProcessor.updateSettings();
+        }
+      } else if (archName === 'Exploded 3D Chiplet Stack') {
+        if (tsvPillarsGroup) tsvPillarsGroup.visible = true;
+        updateExplodedLayerPositions(params.explosionHeight);
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 1.35;
+          postProcessor.settings.chromaticAberration = 0.025;
+          postProcessor.updateSettings();
+        }
+      } else if (archName === 'Neuromorphic Spiking Network') {
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 1.8;
+          postProcessor.settings.chromaticAberration = 0.035;
+          postProcessor.updateSettings();
+        }
+      } else if (archName === 'CAD / Gerber Blueprint') {
+        if (cadBlueprintGroup) cadBlueprintGroup.visible = params.showDimensions;
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 0.45; // Clean, sharp vector lines
+          postProcessor.settings.chromaticAberration = 0.005;
+          postProcessor.updateSettings();
+        }
+      } else if (archName === 'Overclocked Thermal Runaway') {
+        if (thermalGlowMesh) thermalGlowMesh.visible = true;
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 2.4;
+          postProcessor.settings.chromaticAberration = 0.05;
+          postProcessor.updateSettings();
+        }
+      } else if (archName === 'Cryogenic Superconducting Core') {
+        if (cryoHaloMesh) cryoHaloMesh.visible = true;
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 1.5;
+          postProcessor.settings.chromaticAberration = 0.02;
+          postProcessor.updateSettings();
+        }
+      } else {
+        // Standard Discrete Package
+        if (postProcessor) {
+          postProcessor.settings.bloomStrength = 1.25;
+          postProcessor.settings.chromaticAberration = 0.025;
+          postProcessor.updateSettings();
+        }
+      }
+
+      applyCurrentColors();
+    }
+
+    function updateExplodedLayerPositions(height) {
+      if (!pkgMesh) return;
+      const h = height;
+      if (substrateMesh) substrateMesh.position.z = -7 - h * 0.4;
+      if (pkgMesh) pkgMesh.position.z = h * 0.2;
+      if (ihsMesh) ihsMesh.position.z = 2.5 + h * 0.6;
+      if (innerDie) innerDie.position.z = 4.0 + h * 1.0;
+      if (tensorMesh) tensorMesh.position.z = h * 1.0;
+      if (tsvPillarsGroup) {
+        tsvPillarsGroup.position.z = h * 0.3;
+        tsvPillarsGroup.scale.set(1, 1, 0.4 + h * 0.02);
+      }
+    }
+
+    // =========================================================================
+    // COLOR THEME ENGINE
+    // =========================================================================
+    function applySchemeColors(colors, updateGUI = true) {
+      params.bgColor = colors.bg;
+      params.substrateColor = colors.substrate;
+      params.dieColor = colors.die;
+      params.traces1Color = colors.traces1;
+      params.traces2Color = colors.traces2;
+      params.pulsesColor = colors.pulses;
+      params.accentColor = colors.accent;
+
+      applyCurrentColors();
+      if (updateGUI && gui) {
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    function applyCurrentColors() {
+      applyBackgroundColor();
+
+      const cSub = new THREE.Color(params.substrateColor);
+      const cDie = new THREE.Color(params.dieColor);
+      const cTr1 = new THREE.Color(params.traces1Color);
+      const cTr2 = new THREE.Color(params.traces2Color);
+      const cPulse = new THREE.Color(params.pulsesColor);
+      const cAcc = new THREE.Color(params.accentColor);
+
+      if (substrateMaterial) substrateMaterial.color.copy(cSub);
+      if (pkgMaterial) pkgMaterial.color.copy(cDie).multiplyScalar(0.7);
+      if (dieMaterial) dieMaterial.color.copy(cDie);
+      if (silkscreenMaterial) silkscreenMaterial.color.copy(cAcc);
+      if (capacitorMaterial) capacitorMaterial.color.copy(cTr2).multiplyScalar(0.75);
+      if (viaMaterial) {
+        viaMaterial.color.copy(cAcc);
+        viaMaterial.emissive.copy(cPulse);
+      }
+      if (tensorMesh && tensorMesh.material) {
+        tensorMesh.material.color.copy(cAcc);
+        tensorMesh.material.emissive.copy(cPulse);
+      }
+      sramMeshes.forEach(m => {
+        m.material.color.copy(cTr1);
+        m.material.emissive.copy(cTr1);
+      });
+
+      traceUniforms.forEach(u => {
+        u.uBaseColor.value.copy(cTr2);
+        u.uPulseColor.value.copy(cPulse);
+      });
+    }
+
+    function applyBackgroundColor() {
+      if (params.greenScreen) {
+        scene.background = new THREE.Color('#00ff00');
+        if (renderer) renderer.setClearColor(0x00ff00, 1.0);
+      } else {
+        scene.background = new THREE.Color(params.bgColor);
+        if (renderer) renderer.setClearColor(new THREE.Color(params.bgColor), 1.0);
+      }
+    }
+
+    function triggerRandomPreset() {
+      // Randomize color scheme
+      const schemeKeys = Object.keys(COLOR_SCHEMES);
+      const randomKey = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+      params.colorScheme = randomKey;
+
+      // Randomize architecture variation
+      const randomArch = ARCHITECTURE_VARIATIONS[Math.floor(Math.random() * ARCHITECTURE_VARIATIONS.length)];
+      params.architecture = randomArch;
+
+      // Randomize motion dynamics
+      params.animationSpeed = parseFloat((0.75 + Math.random() * 0.8).toFixed(2));
+      params.flowSpeed = parseFloat((1.1 + Math.random() * 1.3).toFixed(2));
+      params.dashSize = Math.floor(16 + Math.random() * 20);
+      params.gapSize = Math.floor(12 + Math.random() * 16);
+      params.neuralActivity = parseFloat((0.85 + Math.random() * 0.7).toFixed(2));
+      params.exposure = parseFloat((0.9 + Math.random() * 0.35).toFixed(2));
+
+      // Randomize camera animation
+      const randomMode = ANIMATION_MODES[Math.floor(Math.random() * ANIMATION_MODES.length)];
+      params.animationMode = randomMode;
+
+      applySchemeColors(COLOR_SCHEMES[randomKey], false);
+      applyArchitectureVariation(randomArch);
+      updateShaderParameters();
+      if (renderer) renderer.toneMappingExposure = params.exposure;
+
+      if (gui) {
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    function updateShaderParameters() {
+      traceUniforms.forEach(u => {
+        u.uDashSize.value = params.dashSize;
+        u.uGapSize.value = params.gapSize;
+        u.uGlobalSpeed.value = params.animationSpeed * params.flowSpeed;
+        u.uGlowIntensity.value = params.glowIntensity;
+      });
+    }
+
+    // =========================================================================
+    // LIL-GUI INTERFACE
+    // =========================================================================
+    function setupGUI() {
+      gui = new GUI({ title: 'AI Neural Core Settings' });
+
+      // 1. Architecture & Scene Variations Folder
+      const archFolder = gui.addFolder('Scene Variations & Architecture');
+      archFolder.add(params, 'architecture', ARCHITECTURE_VARIATIONS)
+        .name('Architecture Mode')
+        .onChange(v => applyArchitectureVariation(v));
+
+      archFolder.add(params, 'explosionHeight', 10.0, 90.0, 1.0)
+        .name('3D Layer Explosion')
+        .onChange(v => updateExplodedLayerPositions(v));
+
+      archFolder.add(params, 'coreTemperature', 45.0, 115.0, 1.0)
+        .name('Core Temp (°C)');
+
+      archFolder.add(params, 'spikeRate', 0.2, 3.0, 0.1)
+        .name('SNN Spike Rate');
+
+      archFolder.add(params, 'quantumFlux', 0.2, 2.5, 0.1)
+        .name('Cryo Quantum Flux');
+
+      archFolder.add(params, 'showDimensions')
+        .name('CAD Dimension Overlay')
+        .onChange(v => {
+          if (cadBlueprintGroup) cadBlueprintGroup.visible = v && (params.architecture === 'CAD / Gerber Blueprint');
+        });
+
+      // 2. Display & View
+      const displayFolder = gui.addFolder('Display & View');
+      displayFolder.add(params, 'greenScreen')
+        .name('Green Screen (#00ff00)')
+        .onChange(() => applyBackgroundColor());
+
+      displayFolder.add(params, 'antialias')
+        .name('Three.js Antialias')
+        .onChange(() => createRenderer());
+
+      displayFolder.add(params, 'dpr', 0.5, 3.0, 0.25)
+        .name('Pixel Ratio (DPR)')
+        .onChange(v => {
+          renderer.setPixelRatio(v);
+          if (postProcessor) postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+        });
+
+      displayFolder.add(params, 'exposure', 0.2, 2.5, 0.05)
+        .name('Exposure')
+        .onChange(v => {
+          renderer.toneMappingExposure = v;
+        });
+
+      displayFolder.add(params, 'lightIntensity', 0.1, 3.0, 0.1)
+        .name('Light Intensity')
+        .onChange(v => {
+          const l1 = scene.getObjectByName('mainLight');
+          if (l1) l1.intensity = v;
+          const l2 = scene.getObjectByName('rimLight');
+          if (l2) l2.intensity = v * 0.45;
+        });
+
+      displayFolder.add(params, 'controlMode', ['Rotate & Pan', '2D Pan Only'])
+        .name('Mouse Control')
+        .onChange(() => updateControlMode());
+
+      // 3. Post Processor Suite
+      if (postProcessor) {
+        postProcessor.attachGUI(gui, 'Post Processor Suite');
+      }
+
+      // 4. Color Schemes (18 Presets)
+      const colorFolder = gui.addFolder('Color Schemes (18 Presets)');
+      colorFolder.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES))
+        .name('Preset Scheme')
+        .onChange(val => {
+          applySchemeColors(COLOR_SCHEMES[val], true);
+        });
+
+      colorFolder.addColor(params, 'bgColor').name('Background').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'substrateColor').name('PCB Substrate').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'dieColor').name('Silicon Die').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'traces1Color').name('Primary Traces').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'traces2Color').name('Secondary Traces').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'pulsesColor').name('Data Pulses').onChange(() => applyCurrentColors());
+      colorFolder.addColor(params, 'accentColor').name('Neural Nodes').onChange(() => applyCurrentColors());
+
+      // 5. Animation & Motion
+      const animFolder = gui.addFolder('Animation & Motion');
+      animFolder.add(params, 'animationMode', ANIMATION_MODES).name('Camera Animation');
+      animFolder.add(params, 'animationSpeed', 0.0, 3.0, 0.05).name('Global Speed').onChange(() => updateShaderParameters());
+      animFolder.add(params, 'flowSpeed', 0.2, 4.0, 0.1).name('Pulse Flow Speed').onChange(() => updateShaderParameters());
+      animFolder.add(params, 'dashSize', 5, 60, 1).name('Dash Length').onChange(() => updateShaderParameters());
+      animFolder.add(params, 'gapSize', 5, 60, 1).name('Dash Gap').onChange(() => updateShaderParameters());
+      animFolder.add(params, 'neuralActivity', 0.1, 3.0, 0.1).name('Core Activity Rate');
+      animFolder.add(params, 'glowIntensity', 0.5, 3.5, 0.1).name('Glow Intensity').onChange(() => updateShaderParameters());
+
+      // 6. Procedural Randomizer
+      const procFolder = gui.addFolder('Procedural Randomizer');
+      procFolder.add(params, 'clickToRandomize').name('Click Scene to Randomize');
+      procFolder.add(params, 'randomizeNow').name('Randomize Now');
+      procFolder.add(params, 'resetCamera').name('Reset Camera');
+    }
+
+    // =========================================================================
+    // MAIN RENDERING & DYNAMICS LOOP
+    // =========================================================================
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const time = clock.getElapsedTime();
+
+      // 1. Update Circuit Dash Shader Uniforms
+      traceUniforms.forEach(u => {
+        u.uTime.value = time;
+      });
+
+      // 2. Animate Architecture Specific Variation Dynamics
+      const arch = params.architecture;
+      if (arch === 'Overclocked Thermal Runaway') {
+        const heatNorm = Math.min(1.0, Math.max(0.0, (params.coreTemperature - 45.0) / 65.0));
+        if (thermalGlowMesh) {
+          thermalGlowMesh.material.opacity = 0.35 * heatNorm + 0.15 * Math.sin(time * 6.0) * heatNorm;
+          const heatCol = new THREE.Color().lerpColors(new THREE.Color(0xff4400), new THREE.Color(0xffffff), heatNorm * 0.8);
+          thermalGlowMesh.material.color.copy(heatCol);
+        }
+        if (tensorMesh && tensorMesh.material) {
+          tensorMesh.material.emissiveIntensity = 0.8 + heatNorm * 2.2 + Math.sin(time * 8.0) * 0.5 * heatNorm;
+        }
+      } else if (arch === 'Cryogenic Superconducting Core') {
+        if (cryoHaloMesh) {
+          const flux = params.quantumFlux;
+          cryoHaloMesh.material.opacity = 0.4 + 0.25 * Math.sin(time * 3.5 * flux);
+          cryoHaloMesh.rotation.z = time * 0.2 * flux;
+        }
+      } else if (arch === 'Wafer-Scale Engine (Photonic)') {
+        if (waferMesh) {
+          waferMesh.rotation.z = time * 0.05;
+        }
+      }
+
+      // 3. Animate 64 Neural Tensor ALU Cores (Dynamic Systolic Computation Waves)
+      if (tensorMesh) {
+        const dummy = new THREE.Object3D();
+        const coreRows = 8;
+        const coreCols = 8;
+        const coreTileSize = 15;
+        const coreGap = 4;
+        const totalGrid = coreRows * coreTileSize + (coreRows - 1) * coreGap;
+        const startOffset = -totalGrid / 2 + coreTileSize / 2;
+
+        let idx = 0;
+        const speed = params.animationSpeed * params.neuralActivity;
+        for (let r = 0; r < coreRows; r++) {
+          for (let c = 0; c < coreCols; c++) {
+            const x = startOffset + c * (coreTileSize + coreGap);
+            const y = startOffset + r * (coreTileSize + coreGap);
+
+            let intensity = 0.0;
+            if (arch === 'Neuromorphic Spiking Network') {
+              // Asynchronous spiking bursts across ALU units
+              const spike = Math.sin((r * 3.1 + c * 2.7) - time * 5.0 * params.spikeRate);
+              intensity = Math.pow(Math.max(0.0, spike), 18.0) * 3.0;
+            } else {
+              // Smooth systolic array matrix calculation ripple waves
+              const distFromCenter = Math.hypot(x, y);
+              const wave = Math.sin(distFromCenter * 0.075 - time * 3.6 * speed + (r + c) * 0.4);
+              intensity = Math.pow(Math.max(0.0, wave), 2.5);
+            }
+
+            const scaleZ = 1.0 + intensity * 1.5;
+            dummy.position.set(x, y, 5.2 + scaleZ * 0.5);
+            dummy.scale.set(1.0, 1.0, scaleZ);
+            dummy.updateMatrix();
+            tensorMesh.setMatrixAt(idx++, dummy.matrix);
+          }
+        }
+        tensorMesh.instanceMatrix.needsUpdate = true;
+      }
+
+      // 4. Smooth Camera Motion Animations
+      applyCameraAnimation(time);
+
+      controls.update();
+
+      // 5. Render Scene through PostProcessor Suite
+      if (postProcessor) {
+        postProcessor.renderScene(scene, camera);
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+
+    function applyCameraAnimation(t) {
+      const mode = params.animationMode;
+      const spd = params.animationSpeed * 0.25;
+
+      if (mode === 'Static (Circuit Activity Only)') {
+        // Camera remains stationary
+      } else if (mode === 'Slow Orbit') {
+        const radius = initialCamZ;
+        const angle = t * spd * 0.65;
+        camera.position.x = Math.sin(angle) * 75;
+        camera.position.y = Math.cos(angle) * 50;
+        camera.position.z = radius - 15 * Math.sin(angle * 0.5);
+        camera.lookAt(0, 0, 0);
+      } else if (mode === 'Subtle Isometric Tilt') {
+        const tilt = (Math.sin(t * spd * 1.1) * 0.5 + 0.5) * 0.52;
+        const dist = initialCamZ;
+        camera.position.x = Math.sin(tilt) * dist * 0.35;
+        camera.position.y = -Math.sin(tilt) * dist * 0.5;
+        camera.position.z = Math.cos(tilt) * dist;
+        camera.lookAt(0, 0, 0);
+      } else if (mode === 'Deep Core Breathing') {
+        const zoomOsc = Math.sin(t * spd * 1.4) * 160;
+        camera.position.set(0, 0, initialCamZ - 80 + zoomOsc);
+        camera.lookAt(0, 0, 0);
+      } else if (mode === 'Vector Pan Scan') {
+        const panX = Math.sin(t * spd * 1.3) * 90;
+        const panY = Math.cos(t * spd * 1.05) * 70;
+        camera.position.set(panX, panY, initialCamZ - 40);
+        controls.target.set(panX * 0.7, panY * 0.7, 0);
+      } else if (mode === 'Figure-8 Surveillance') {
+        const angle = t * spd * 1.15;
+        const figX = Math.sin(angle) * 110;
+        const figY = Math.sin(angle * 2.0) * 60;
+        camera.position.set(figX, figY, initialCamZ - 30);
+        camera.lookAt(figX * 0.25, figY * 0.25, 0);
+      } else if (mode === 'Clockwise Horizon Sweep') {
+        const sweepAngle = t * spd * 0.75;
+        const r = 400;
+        camera.position.x = Math.cos(sweepAngle) * r;
+        camera.position.y = Math.sin(sweepAngle) * r;
+        camera.position.z = 330;
+        camera.lookAt(0, 0, 0);
+      } else if (mode === 'Pulse Resonance') {
+        const burst = Math.pow(Math.sin(t * spd * 2.8) * 0.5 + 0.5, 6.0) * 70;
+        camera.position.set(0, 0, initialCamZ - burst);
+        camera.lookAt(0, 0, 0);
+      }
+    }
+  </script>
+</body>
+</html>

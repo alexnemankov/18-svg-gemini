@@ -1,0 +1,2466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Haunted Grandfather Clock with Erratic Pendulum</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #060814;
+    }
+    #webgl-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (Inlined from postprocessing/PostProcessor.js)
+    // =========================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const godRaysDepthMaskShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float factor = smoothstep(threshold, threshold + 0.15, lum);
+      fragColor = vec4(vec3(factor), 1.0);
+    }
+    `;
+
+    const godRaysGenerateShader = `
+    precision highp float;
+    #define TAPS_PER_PASS 6.0
+
+    uniform sampler2D inputTexture;
+    uniform vec3 vSunPositionScreenSpace;
+    uniform float fStepSize;
+    uniform float distanceAttenuation;
+    uniform float maxDensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec2 delta = vSunPositionScreenSpace.xy - vUv;
+      float dist = length(delta);
+      vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+      float iters = dist / max(fStepSize, 0.00001);
+
+      vec2 uv = vUv;
+      float col = 0.0;
+      float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+
+      float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+
+      if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+
+      float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+      fragColor = vec4(vec3(finalVal), 1.0);
+    }
+    `;
+
+    const anamorphicBrightShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    uniform float smoothWidth;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+      fragColor = mix(vec4(0.0), color, alpha);
+    }
+    `;
+
+    const anamorphicBlurShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    uniform float samples;
+    uniform float intensity;
+    uniform vec3 tintColor;
+    uniform float bloomRadius;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      int halfSamples = max(1, int(samples) / 2);
+      float fHalfSamples = float(halfSamples);
+      vec2 invSize = 1.0 / resolution;
+      vec4 total = vec4(0.0);
+
+      for (int i = -64; i <= 64; i++) {
+        if (i < -halfSamples || i > halfSamples) continue;
+        float softness = 1.0 - abs(float(i)) / fHalfSamples;
+        softness = pow(softness, 2.0);
+        vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+        shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+        total += texture(inputTexture, shiftedUV) * softness;
+      }
+
+      fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform sampler2D raysTexture;
+    uniform sampler2D anamorphicTexture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform bool raysEnabled;
+    uniform float raysStrength;
+    uniform vec3 raysColor;
+    uniform bool anamorphicEnabled;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+    }
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      if (raysEnabled && raysStrength > 0.001) {
+        vec4 r = texture(raysTexture, vUv);
+        color.rgb += r.rgb * raysColor * raysStrength;
+      }
+
+      if (anamorphicEnabled) {
+        vec4 a = texture(anamorphicTexture, vUv);
+        color.rgb += a.rgb;
+      }
+
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    uniform int visionMode;
+    uniform float thermalSensitivity;
+    uniform float nightVisionNoise;
+    uniform float nightVisionGain;
+    uniform float crtIntensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+
+    vec3 applyNightVision(vec3 color, vec2 uv, float timeVal, float noiseAmt, float gain, float crt) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float amplified = pow(lum * gain, 0.72);
+      vec3 phosphorColor = mix(vec3(0.02, 0.12, 0.03), vec3(0.18, 1.0, 0.32), clamp(amplified, 0.0, 1.0));
+      phosphorColor += vec3(0.7, 1.0, 0.8) * max(0.0, amplified - 0.75) * 1.8;
+
+      vec2 p = uv - 0.5;
+      float tubeDist = length(p);
+      float tubeMask = smoothstep(0.72, 0.44, tubeDist);
+
+      float n = fract(sin(dot(uv * 280.0 + timeVal * 0.05, vec2(12.9898, 78.233))) * 43758.5453);
+      float scanline = sin(uv.y * 650.0) * crt;
+
+      phosphorColor += (n - 0.5) * noiseAmt * 2.0 + scanline;
+      return clamp(phosphorColor * tubeMask, 0.0, 1.0);
+    }
+
+    vec3 ironbow(float t) {
+      t = clamp(t, 0.0, 1.0);
+      vec3 c0 = vec3(0.02, 0.01, 0.18);
+      vec3 c1 = vec3(0.22, 0.02, 0.48);
+      vec3 c2 = vec3(0.82, 0.05, 0.25);
+      vec3 c3 = vec3(1.0, 0.62, 0.02);
+      vec3 c4 = vec3(1.0, 1.0, 0.92);
+
+      if (t < 0.25) return mix(c0, c1, t * 4.0);
+      if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+      if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+      return mix(c3, c4, (t - 0.75) * 4.0);
+    }
+
+    vec3 applyThermal(vec3 color, vec2 uv, float sensitivity, float crt, bool whiteHot) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float heat = clamp(lum * sensitivity, 0.0, 1.0);
+      float sensorRaster = sin(uv.y * 900.0) * (crt * 0.3);
+      heat = clamp(heat + sensorRaster, 0.0, 1.0);
+
+      if (whiteHot) {
+        float grad = pow(heat, 0.85);
+        return vec3(grad);
+      } else {
+        return ironbow(heat);
+      }
+    }
+
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      vec3 finalCol = col.rgb;
+
+      if (visionMode == 1) {
+        finalCol = applyNightVision(finalCol, uv, time, nightVisionNoise, nightVisionGain, crtIntensity);
+      } else if (visionMode == 2) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, false);
+      } else if (visionMode == 3) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, true);
+      } else {
+        vec3 exposedColor = finalCol * exposure;
+        vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+        finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+      }
+
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    const VISION_MODE_MAP = {
+      'Normal (Cinematic)': 0,
+      'Night Vision (Phosphor)': 1,
+      'Thermal (Ironbow)': 2,
+      'Thermal (White-Hot)': 3,
+    };
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.1,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.55,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.16,
+
+          raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : true,
+          raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.7,
+          raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+          raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+          raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+          raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.12,
+          raysColor: params.raysColor ? (params.raysColor.isColor ? params.raysColor.clone() : new THREE.Color(params.raysColor)) : new THREE.Color(0xff9922),
+          raysColorHex: params.raysColorHex || '#ff9922',
+
+          anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+          anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+          anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.35,
+          anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 48,
+          anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+          anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+          anamorphicColor: params.anamorphicColor ? (params.anamorphicColor.isColor ? params.anamorphicColor.clone() : new THREE.Color(params.anamorphicColor)) : new THREE.Color(0x7a8aff),
+          anamorphicColorHex: params.anamorphicColorHex || '#7a8aff',
+
+          visionMode: params.visionMode !== undefined ? params.visionMode : 'Normal (Cinematic)',
+          thermalSensitivity: params.thermalSensitivity !== undefined ? params.thermalSensitivity : 1.4,
+          nightVisionGain: params.nightVisionGain !== undefined ? params.nightVisionGain : 2.1,
+          nightVisionNoise: params.nightVisionNoise !== undefined ? params.nightVisionNoise : 0.05,
+          crtIntensity: params.crtIntensity !== undefined ? params.crtIntensity : 0.0,
+
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.018,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.15,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.72,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+          exposure: params.exposure !== undefined ? params.exposure : 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+        this.bloomPass = new BloomPass(this.settings.bloomStrength, this.settings.bloomRadius, this.settings.bloomThreshold, 5);
+
+        this.moonScreenPos = new THREE.Vector3(0.5, 0.5, 1.0);
+        this.moonInFront = true;
+
+        this.godRaysMaskShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.raysThreshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysDepthMaskShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysMaskPass = new ShaderPass(this.godRaysMaskShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.godRaysGenShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            vSunPositionScreenSpace: { value: this.moonScreenPos },
+            fStepSize: { value: 1.0 },
+            distanceAttenuation: { value: this.settings.raysDistanceAttenuation },
+            maxDensity: { value: this.settings.raysMaxDensity },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysGenerateShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysPingPong = new ShaderPingPongPass(this.godRaysGenShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.anamorphicThreshold },
+            smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBrightShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+            samples: { value: this.settings.anamorphicSamples },
+            intensity: { value: this.settings.anamorphicIntensity },
+            tintColor: { value: this.settings.anamorphicColor },
+            bloomRadius: { value: this.settings.anamorphicRadius },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBlurShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            raysEnabled: { value: this.settings.raysEnabled },
+            raysStrength: { value: this.settings.raysStrength },
+            raysColor: { value: this.settings.raysColor },
+            anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            raysTexture: { value: null },
+            anamorphicTexture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+            visionMode: { value: VISION_MODE_MAP[this.settings.visionMode] ?? 0 },
+            thermalSensitivity: { value: this.settings.thermalSensitivity },
+            nightVisionGain: { value: this.settings.nightVisionGain },
+            nightVisionNoise: { value: this.settings.nightVisionNoise },
+            crtIntensity: { value: this.settings.crtIntensity },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+        this.godRaysGenShader.uniforms.distanceAttenuation.value = this.settings.raysDistanceAttenuation;
+        this.godRaysGenShader.uniforms.maxDensity.value = this.settings.raysMaxDensity;
+
+        this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+        this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+        this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+        this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+        this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+        this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.raysEnabled.value = this.settings.raysEnabled && this.moonInFront;
+        this.finalShader.uniforms.raysStrength.value = this.settings.raysStrength;
+        this.finalShader.uniforms.raysColor.value.copy(this.settings.raysColor);
+        this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+        this.rgbShader.uniforms.visionMode.value = VISION_MODE_MAP[this.settings.visionMode] ?? 0;
+        this.rgbShader.uniforms.thermalSensitivity.value = this.settings.thermalSensitivity;
+        this.rgbShader.uniforms.nightVisionGain.value = this.settings.nightVisionGain;
+        this.rgbShader.uniforms.nightVisionNoise.value = this.settings.nightVisionNoise;
+        this.rgbShader.uniforms.crtIntensity.value = this.settings.crtIntensity;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+
+        const grW = Math.max(1, Math.round(w / 2));
+        const grH = Math.max(1, Math.round(h / 2));
+        this.godRaysMaskPass.setSize(grW, grH);
+        this.godRaysPingPong.setSize(grW, grH);
+
+        const anW = Math.max(1, Math.round(w / 4));
+        const anH = Math.max(1, Math.round(h / 4));
+        this.anamorphicBrightPass.setSize(anW, anH);
+        this.anamorphicBlurPass.setSize(anW, anH);
+        this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      setMoonScreenPosition(camera, moonWorldPos) {
+        if (!this._camDir) {
+          this._camDir = new THREE.Vector3();
+          this._toMoon = new THREE.Vector3();
+          this._ndc = new THREE.Vector3();
+        }
+        camera.getWorldDirection(this._camDir);
+        this._toMoon.copy(moonWorldPos).sub(camera.position).normalize();
+        const dot = this._camDir.dot(this._toMoon);
+
+        if (dot <= 0.02) {
+          this.moonInFront = false;
+          this.finalShader.uniforms.raysEnabled.value = false;
+          return;
+        }
+
+        this.moonInFront = true;
+        const fade = THREE.MathUtils.clamp((dot - 0.02) / 0.15, 0.0, 1.0);
+        this._ndc.copy(moonWorldPos).project(camera);
+        const screenX = this._ndc.x * 0.5 + 0.5;
+        const screenY = this._ndc.y * 0.5 + 0.5;
+        const screenZ = fade;
+
+        this.moonScreenPos.set(screenX, screenY, screenZ);
+        this.godRaysGenShader.uniforms.vSunPositionScreenSpace.value.set(screenX, screenY, screenZ);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        if (this.settings.raysEnabled && this.settings.raysStrength > 0.001 && this.moonInFront) {
+          this.godRaysMaskShader.uniforms.inputTexture.value = sourceTexture;
+          this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+          this.godRaysMaskPass.render(this.renderer);
+
+          const filterLen = this.settings.raysDensity;
+          const tapsPerPass = 6.0;
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -1.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysMaskPass.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -2.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -3.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.finalPass.shader.uniforms.raysTexture.value = this.godRaysPingPong.texture;
+          this.finalPass.shader.uniforms.raysEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.raysEnabled.value = false;
+        }
+
+        if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+          this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+          this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+          this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+          this.anamorphicBrightPass.render(this.renderer);
+
+          this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+          this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+          this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+          this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+          this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+          this.anamorphicBlurPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+        }
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing Suite") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Post-Process");
+
+        const vision = root.addFolder("Thermal & Night Vision");
+        vision.add(this.settings, "visionMode", Object.keys(VISION_MODE_MAP)).name("Vision Mode").onChange(() => this.updateSettings());
+        vision.add(this.settings, "nightVisionGain", 0.5, 5.0, 0.1).name("NVG Amplification").onChange(() => this.updateSettings());
+        vision.add(this.settings, "nightVisionNoise", 0.0, 0.3, 0.01).name("NVG Sensor Noise").onChange(() => this.updateSettings());
+        vision.add(this.settings, "thermalSensitivity", 0.5, 3.5, 0.05).name("Thermal Sensitivity").onChange(() => this.updateSettings());
+        vision.add(this.settings, "crtIntensity", 0.0, 0.1, 0.005).name("CRT Scanlines").onChange(() => this.updateSettings());
+
+        const rays = root.addFolder("Three.js Godrays");
+        rays.add(this.settings, "raysEnabled").name("Enable Godrays").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysStrength", 0, 3.0, 0.05).name("Intensity").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysDensity", 0.1, 2.5, 0.05).name("Density (Spread)").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysMaxDensity", 0.1, 1.0, 0.05).name("Max Density").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysDistanceAttenuation", 0.5, 4.0, 0.1).name("Distance Atten").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysThreshold", 0.0, 0.8, 0.01).name("Light Threshold").onChange(() => this.updateSettings());
+        rays.addColor(this.settings, "raysColorHex").name("Ray Tint").onChange((v) => {
+          this.settings.raysColor.set(v);
+          this.updateSettings();
+        });
+
+        const anamorphic = root.addFolder("Three.js Anamorphic Flare");
+        anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Anamorphic").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicSamples", 2, 128, 1).name("Samples").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicRadius", 0.0, 1.0, 0.01).name("Bloom Radius").onChange(() => this.updateSettings());
+        anamorphic.addColor(this.settings, "anamorphicColorHex").name("Tint Color").onChange((v) => {
+          this.settings.anamorphicColor.set(v);
+          this.updateSettings();
+        });
+
+        const bloom = root.addFolder("Atmospheric Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Bloom Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Bloom Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Bloom Threshold").onChange(() => this.updateSettings());
+
+        const lens = root.addFolder("Lens, Optics & Film Grain");
+        lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+        lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+        lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+        lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+        lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // =========================================================================
+    // 18 PRECONFIGURED COLOR SCHEMES
+    // =========================================================================
+    const COLOR_SCHEMES = {
+      'Monochromatic': {
+        bg: '#060814', fog: '#0b1026', woodPrimary: '#101730', woodSecondary: '#1b2752',
+        metalBrass: '#4d6eb2', dialFace: '#182348', dialHands: '#8cb4ff',
+        internalGlow: '#6699ff', rimLight: '#8ab4f8', floor: '#0c1022'
+      },
+      'Analogous': {
+        bg: '#140507', fog: '#24090e', woodPrimary: '#2c0c12', woodSecondary: '#4a151f',
+        metalBrass: '#c96f2e', dialFace: '#3a121b', dialHands: '#ffaa44',
+        internalGlow: '#ff7722', rimLight: '#ff4433', floor: '#1a060a'
+      },
+      'Complementary': {
+        bg: '#051117', fog: '#091e2a', woodPrimary: '#0f2e3d', woodSecondary: '#18455c',
+        metalBrass: '#e06a28', dialFace: '#123242', dialHands: '#ffa64d',
+        internalGlow: '#ff6e20', rimLight: '#38bdf8', floor: '#081720'
+      },
+      'Split-complementary': {
+        bg: '#12081c', fog: '#200e33', woodPrimary: '#26123d', woodSecondary: '#3d1d61',
+        metalBrass: '#d4a017', dialFace: '#2a1443', dialHands: '#34d399',
+        internalGlow: '#fbbf24', rimLight: '#a855f7', floor: '#160b24'
+      },
+      'Triadic': {
+        bg: '#0d0818', fog: '#180e2b', woodPrimary: '#22143d', woodSecondary: '#124036',
+        metalBrass: '#c78c28', dialFace: '#2a1a4a', dialHands: '#f59e0b',
+        internalGlow: '#10b981', rimLight: '#ec4899', floor: '#120c22'
+      },
+      'Tetradic': {
+        bg: '#080f18', fog: '#101e30', woodPrimary: '#182b45', woodSecondary: '#421a30',
+        metalBrass: '#e6a23c', dialFace: '#1a3354', dialHands: '#48bb78',
+        internalGlow: '#e53e3e', rimLight: '#38b2ac', floor: '#0c1624'
+      },
+      'Double split-complementary': {
+        bg: '#0b0d1a', fog: '#141930', woodPrimary: '#1b2242', woodSecondary: '#4d2a1b',
+        metalBrass: '#d97706', dialFace: '#20284e', dialHands: '#06b6d4',
+        internalGlow: '#f97316', rimLight: '#818cf8', floor: '#0e1122'
+      },
+      'Achromatic (black and white version)': {
+        bg: '#030303', fog: '#0a0a0a', woodPrimary: '#141414', woodSecondary: '#262626',
+        metalBrass: '#a3a3a3', dialFace: '#1a1a1a', dialHands: '#f5f5f5',
+        internalGlow: '#ffffff', rimLight: '#d4d4d4', floor: '#080808'
+      },
+      'Achromatic (white and black)': {
+        bg: '#e5e5e5', fog: '#cccccc', woodPrimary: '#202020', woodSecondary: '#0a0a0a',
+        metalBrass: '#404040', dialFace: '#f8f8f8', dialHands: '#050505',
+        internalGlow: '#ffffff', rimLight: '#888888', floor: '#b8b8b8'
+      },
+      'Neutral + accent': {
+        bg: '#0f1115', fog: '#191c22', woodPrimary: '#1f232b', woodSecondary: '#2d323e',
+        metalBrass: '#525a6c', dialFace: '#262b35', dialHands: '#ff3300',
+        internalGlow: '#ff3b00', rimLight: '#ff5500', floor: '#14161c'
+      },
+      'Palette 1 (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)': {
+        bg: '#220901', fog: '#3a1003', woodPrimary: '#941B0C', woodSecondary: '#BC3908',
+        metalBrass: '#F6AA1C', dialFace: '#330c02', dialHands: '#F6AA1C',
+        internalGlow: '#F6AA1C', rimLight: '#BC3908', floor: '#2c0b02'
+      },
+      'Palette 2 (63D1CF, 5BC0BE, 4BAD9E, 4BAD9E, 0B132B, 000000)': {
+        bg: '#000000', fog: '#0B132B', woodPrimary: '#0B132B', woodSecondary: '#4BAD9E',
+        metalBrass: '#5BC0BE', dialFace: '#070d1e', dialHands: '#63D1CF',
+        internalGlow: '#63D1CF', rimLight: '#5BC0BE', floor: '#040813'
+      },
+      'Palette 3 (AA60C8, D69ADE, C9A3C6, CFB5C2, 0D001D, 120A12)': {
+        bg: '#0D001D', fog: '#120A12', woodPrimary: '#1f082e', woodSecondary: '#AA60C8',
+        metalBrass: '#D69ADE', dialFace: '#160722', dialHands: '#CFB5C2',
+        internalGlow: '#D69ADE', rimLight: '#C9A3C6', floor: '#120A12'
+      },
+      'Palette 4 (FEF1BE, FFBA00, 008189, 00474D, 061210)': {
+        bg: '#061210', fog: '#0b211d', woodPrimary: '#00474D', woodSecondary: '#008189',
+        metalBrass: '#FFBA00', dialFace: '#041a17', dialHands: '#FEF1BE',
+        internalGlow: '#FFBA00', rimLight: '#008189', floor: '#091a17'
+      },
+      'Palette 5 (D4FFB0, 7FFF00, 00B894, 0A3322, 05140A)': {
+        bg: '#05140A', fog: '#0A3322', woodPrimary: '#0A3322', woodSecondary: '#00B894',
+        metalBrass: '#7FFF00', dialFace: '#062013', dialHands: '#D4FFB0',
+        internalGlow: '#7FFF00', rimLight: '#00B894', floor: '#071a0e'
+      },
+      'Palette 6 (FFE8CC, FF8C00, C7501A, 3D1050, 0E0618)': {
+        bg: '#0E0618', fog: '#1f0a33', woodPrimary: '#3D1050', woodSecondary: '#C7501A',
+        metalBrass: '#FF8C00', dialFace: '#20072d', dialHands: '#FFE8CC',
+        internalGlow: '#FF8C00', rimLight: '#C7501A', floor: '#160925'
+      },
+      'Palette 7 (E8E0FF, B38FFF, 6A3DE8, 1A1250, 090612)': {
+        bg: '#090612', fog: '#130d26', woodPrimary: '#1A1250', woodSecondary: '#6A3DE8',
+        metalBrass: '#B38FFF', dialFace: '#120c38', dialHands: '#E8E0FF',
+        internalGlow: '#B38FFF', rimLight: '#6A3DE8', floor: '#0f0a20'
+      },
+      'Palette 8 (E0FBFF, 00F0FF, D40078, 1E0A3D, 05020F)': {
+        bg: '#05020F', fog: '#110526', woodPrimary: '#1E0A3D', woodSecondary: '#D40078',
+        metalBrass: '#00F0FF', dialFace: '#140529', dialHands: '#E0FBFF',
+        internalGlow: '#00F0FF', rimLight: '#D40078', floor: '#0a031e'
+      }
+    };
+
+    // --- 8 PRECONFIGURED ANIMATIONS ---
+    const ANIMATION_PRESETS = [
+      'Static (No Camera Motion)',
+      'Haunted Drift (Default)',
+      'Hypnotic Pendulum Focus',
+      'Slow Gothic Orbit',
+      'Spooky Dial Macro',
+      'Haunted Elevation Crane',
+      'Sinister Harmonic Sway',
+      'Phantom Spiral Ascent'
+    ];
+
+    const initialSchemeKey = 'Palette 1 (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)';
+    const defaultScheme = COLOR_SCHEMES[initialSchemeKey];
+
+    // --- APPLICATION PARAMETERS ---
+    const params = {
+      greenscreen: false,
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+      animation: 'Haunted Drift (Default)',
+      speed: 1.0,
+      clickToRandomize: true,
+
+      colorScheme: initialSchemeKey,
+      bgColor: defaultScheme.bg,
+      fogColor: defaultScheme.fog,
+      woodPrimary: defaultScheme.woodPrimary,
+      woodSecondary: defaultScheme.woodSecondary,
+      metalBrass: defaultScheme.metalBrass,
+      dialFace: defaultScheme.dialFace,
+      dialHands: defaultScheme.dialHands,
+      internalGlow: defaultScheme.internalGlow,
+      rimLight: defaultScheme.rimLight,
+      floorColor: defaultScheme.floor,
+
+      // Pendulum dynamics tuned so the bob stays strictly inside the cabinet
+      pendulumAmp: 0.22,
+      pendulumFreq: 1.2,
+      erraticWobble: 0.25,
+      handSpeed: 2.0,
+      lightIntensity: 2.4,
+      flickerAmount: 0.55,
+      showGhost: true,
+      ghostVisibility: true,
+      ghostSpeed: 1.0,
+
+      reroll: () => rerollScene()
+    };
+
+    // --- SETUP RENDERER & CANVAS ---
+    const canvas = document.getElementById('webgl-canvas');
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: 'high-performance'
+    });
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // --- INITIALIZE POSTPROCESSOR ---
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomEnabled: true,
+      bloomStrength: 1.1,
+      bloomRadius: 0.55,
+      bloomThreshold: 0.16,
+      raysEnabled: true,
+      raysStrength: 0.75,
+      raysThreshold: 0.14,
+      anamorphicEnabled: false,
+      chromaticAberration: 0.015,
+      vignetteBoost: 1.14,
+      vignetteReduction: 0.7,
+      noiseIntensity: 0.012
+    });
+    postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+    // --- SCENE & CAMERA ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.bgColor);
+    scene.fog = new THREE.Fog(params.fogColor, 6.0, 26);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 50);
+    camera.position.set(0, 2.4, 6.2);
+
+    // --- ORBIT CONTROLS ---
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.enableZoom = true;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.minDistance = 1.6;
+    controls.maxDistance = 22.0;
+    controls.target.set(0, 2.3, 0);
+
+    let isUserInteracting = false;
+    controls.addEventListener('start', () => { isUserInteracting = true; });
+    controls.addEventListener('end', () => { isUserInteracting = false; });
+
+    // --- LIGHTING ---
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const rimLight = new THREE.DirectionalLight(params.rimLight, 1.6);
+    rimLight.position.set(-4.0, 5.5, -3.5);
+    scene.add(rimLight);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    keyLight.position.set(3.5, 6.5, 4.5);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.width = 1024;
+    keyLight.shadow.mapSize.height = 1024;
+    keyLight.shadow.camera.near = 0.5;
+    keyLight.shadow.camera.far = 16;
+    keyLight.shadow.bias = -0.001;
+    scene.add(keyLight);
+
+    // --- INTERNAL POINTLIGHT ---
+    const internalPointLight = new THREE.PointLight(params.internalGlow, params.lightIntensity, 10, 1.8);
+    internalPointLight.position.set(0, 2.45, -0.02);
+    internalPointLight.castShadow = true;
+    internalPointLight.shadow.mapSize.width = 1024;
+    internalPointLight.shadow.mapSize.height = 1024;
+    internalPointLight.shadow.bias = -0.0012;
+    internalPointLight.shadow.camera.near = 0.05;
+    internalPointLight.shadow.camera.far = 10;
+    scene.add(internalPointLight);
+
+    const lightBulbGeo = new THREE.SphereGeometry(0.045, 16, 16);
+    const lightBulbMat = new THREE.MeshBasicMaterial({ color: params.internalGlow });
+    const lightBulbMesh = new THREE.Mesh(lightBulbGeo, lightBulbMat);
+    lightBulbMesh.position.copy(internalPointLight.position);
+    scene.add(lightBulbMesh);
+
+    // Side Sconce Point Lights (Flickering Candle flames on exterior of clock)
+    const sconceLightLeft = new THREE.PointLight(params.internalGlow, 0.9, 5, 2);
+    sconceLightLeft.position.set(-0.88, 2.4, 0.22);
+    scene.add(sconceLightLeft);
+
+    const sconceLightRight = new THREE.PointLight(params.internalGlow, 0.9, 5, 2);
+    sconceLightRight.position.set(0.88, 2.4, 0.22);
+    scene.add(sconceLightRight);
+
+    // --- PROCEDURAL WOOD TEXTURE ---
+    function createWoodTexture() {
+      const cv = document.createElement('canvas');
+      cv.width = 512;
+      cv.height = 512;
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, 512, 512);
+
+      for (let i = 0; i < 600; i++) {
+        const x = Math.random() * 512;
+        const w = 1 + Math.random() * 3;
+        const alpha = 0.04 + Math.random() * 0.08;
+        ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+        ctx.fillRect(x, 0, w, 512);
+      }
+      for (let y = 0; y < 512; y += 32) {
+        ctx.fillStyle = 'rgba(0,0,0,0.03)';
+        ctx.beginPath();
+        ctx.arc(256, y + Math.sin(y * 0.05) * 20, 200 + Math.sin(y * 0.03) * 60, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      const tex = new THREE.CanvasTexture(cv);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(1, 3);
+      return tex;
+    }
+    const woodTexture = createWoodTexture();
+
+    // --- MATERIALS ---
+    const woodPrimaryMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.woodPrimary),
+      roughness: 0.65,
+      metalness: 0.08,
+      map: woodTexture
+    });
+
+    const woodSecondaryMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.woodSecondary),
+      roughness: 0.58,
+      metalness: 0.12,
+      map: woodTexture
+    });
+
+    const brassMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.metalBrass),
+      roughness: 0.26,
+      metalness: 0.90
+    });
+
+    const darkMetalMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(0x1a1a1e),
+      roughness: 0.45,
+      metalness: 0.8
+    });
+
+    const glassMat = new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
+      roughness: 0.06,
+      transmission: 0.92,
+      thickness: 0.25,
+      ior: 1.52,
+      transparent: true,
+      opacity: 0.85,
+      reflectivity: 0.95
+    });
+
+    const candleWaxMat = new THREE.MeshStandardMaterial({
+      color: 0xd4cfc5,
+      roughness: 0.35,
+      metalness: 0.05
+    });
+
+    const candleFlameMat = new THREE.MeshBasicMaterial({
+      color: 0xffaa33
+    });
+
+    // --- PROCEDURAL CLOCK DIAL TEXTURE ---
+    const dialCanvas = document.createElement('canvas');
+    dialCanvas.width = 1024;
+    dialCanvas.height = 1024;
+    const dialCtx = dialCanvas.getContext('2d');
+    const dialTexture = new THREE.CanvasTexture(dialCanvas);
+
+    function updateDialTexture() {
+      const cx = 512, cy = 512;
+      dialCtx.clearRect(0, 0, 1024, 1024);
+
+      const bgGrad = dialCtx.createRadialGradient(cx, cy, 50, cx, cy, 480);
+      bgGrad.addColorStop(0, params.dialFace);
+      bgGrad.addColorStop(0.85, params.dialFace);
+      bgGrad.addColorStop(1, '#000000');
+      dialCtx.fillStyle = bgGrad;
+      dialCtx.beginPath();
+      dialCtx.arc(cx, cy, 480, 0, Math.PI * 2);
+      dialCtx.fill();
+
+      dialCtx.strokeStyle = params.metalBrass;
+      dialCtx.lineWidth = 14;
+      dialCtx.beginPath();
+      dialCtx.arc(cx, cy, 465, 0, Math.PI * 2);
+      dialCtx.stroke();
+
+      dialCtx.lineWidth = 4;
+      dialCtx.beginPath();
+      dialCtx.arc(cx, cy, 440, 0, Math.PI * 2);
+      dialCtx.stroke();
+
+      dialCtx.lineWidth = 6;
+      dialCtx.beginPath();
+      dialCtx.arc(cx, cy, 335, 0, Math.PI * 2);
+      dialCtx.stroke();
+
+      for (let i = 0; i < 60; i++) {
+        const angle = (i * Math.PI * 2) / 60 - Math.PI / 2;
+        const isMajor = i % 5 === 0;
+        const r1 = isMajor ? 415 : 425;
+        const r2 = 438;
+        dialCtx.lineWidth = isMajor ? 6 : 3;
+        dialCtx.strokeStyle = isMajor ? params.dialHands : params.metalBrass;
+        dialCtx.beginPath();
+        dialCtx.moveTo(cx + Math.cos(angle) * r1, cy + Math.sin(angle) * r1);
+        dialCtx.lineTo(cx + Math.cos(angle) * r2, cy + Math.sin(angle) * r2);
+        dialCtx.stroke();
+      }
+
+      const numerals = ['XII', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI'];
+      dialCtx.fillStyle = params.dialHands;
+      dialCtx.font = 'bold 64px "Georgia", "Times New Roman", serif';
+      dialCtx.textAlign = 'center';
+      dialCtx.textBaseline = 'middle';
+
+      for (let i = 0; i < 12; i++) {
+        const angle = (i * Math.PI * 2) / 12 - Math.PI / 2;
+        dialCtx.fillText(numerals[i], cx + Math.cos(angle) * 385, cy + Math.sin(angle) * 385);
+      }
+
+      dialCtx.strokeStyle = params.metalBrass;
+      dialCtx.lineWidth = 3;
+      for (let i = 0; i < 8; i++) {
+        const a = (i * Math.PI * 2) / 8;
+        dialCtx.beginPath();
+        dialCtx.arc(cx + Math.cos(a) * 75, cy + Math.sin(a) * 75, 75, 0, Math.PI * 2);
+        dialCtx.stroke();
+      }
+
+      dialCtx.fillStyle = params.metalBrass;
+      dialCtx.font = 'italic 28px "Georgia", serif';
+      dialCtx.fillText('TEMPUS VORAT OMNIA', cx, cy + 120);
+
+      dialTexture.needsUpdate = true;
+    }
+    updateDialTexture();
+
+    const dialMat = new THREE.MeshStandardMaterial({
+      map: dialTexture,
+      roughness: 0.35,
+      metalness: 0.65
+    });
+
+    const handsMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.dialHands),
+      roughness: 0.25,
+      metalness: 0.92
+    });
+
+    // Floor
+    const floorGeo = new THREE.PlaneGeometry(32, 32);
+    const floorMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.floorColor),
+      roughness: 0.75,
+      metalness: 0.15
+    });
+    const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+    floorMesh.rotation.x = -Math.PI / 2;
+    floorMesh.position.y = 0;
+    floorMesh.receiveShadow = true;
+    scene.add(floorMesh);
+
+    // =========================================================================
+    // OCCULT ALL-SEEING EYE (Interactive Eye on Pendulum Bob)
+    // =========================================================================
+    const eyeCanvas = document.createElement('canvas');
+    eyeCanvas.width = 256;
+    eyeCanvas.height = 256;
+    const eyeCtx = eyeCanvas.getContext('2d');
+    const eyeTexture = new THREE.CanvasTexture(eyeCanvas);
+
+    function updateOccultEyeTexture(pupilOffsetX = 0, pupilScale = 1.0) {
+      const cx = 128, cy = 128;
+      eyeCtx.clearRect(0, 0, 256, 256);
+
+      // Dark ancient sclera
+      eyeCtx.fillStyle = '#100508';
+      eyeCtx.beginPath();
+      eyeCtx.arc(cx, cy, 115, 0, Math.PI * 2);
+      eyeCtx.fill();
+
+      // Bloodshot mystic veins
+      eyeCtx.strokeStyle = 'rgba(220, 25, 25, 0.75)';
+      eyeCtx.lineWidth = 2.0;
+      for (let i = 0; i < 14; i++) {
+        const a = (i * Math.PI * 2) / 14;
+        eyeCtx.beginPath();
+        eyeCtx.moveTo(cx, cy);
+        eyeCtx.quadraticCurveTo(
+          cx + Math.cos(a + 0.35) * 65, cy + Math.sin(a + 0.35) * 65,
+          cx + Math.cos(a) * 110, cy + Math.sin(a) * 110
+        );
+        eyeCtx.stroke();
+      }
+
+      // Glowing Iris
+      const px = cx + pupilOffsetX * 35;
+      const irisGrad = eyeCtx.createRadialGradient(px, cy, 10, px, cy, 70);
+      irisGrad.addColorStop(0, '#ffe566');
+      irisGrad.addColorStop(0.4, '#ff5500');
+      irisGrad.addColorStop(0.85, '#990011');
+      irisGrad.addColorStop(1, '#200005');
+      eyeCtx.fillStyle = irisGrad;
+      eyeCtx.beginPath();
+      eyeCtx.arc(px, cy, 68, 0, Math.PI * 2);
+      eyeCtx.fill();
+
+      // Demonic Slit Pupil
+      eyeCtx.fillStyle = '#050103';
+      eyeCtx.beginPath();
+      eyeCtx.ellipse(px, cy, 12 * pupilScale, 56, 0, 0, Math.PI * 2);
+      eyeCtx.fill();
+
+      // Uncanny specular glint
+      eyeCtx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+      eyeCtx.beginPath();
+      eyeCtx.arc(px - 14, cy - 18, 9, 0, Math.PI * 2);
+      eyeCtx.fill();
+
+      eyeTexture.needsUpdate = true;
+    }
+    updateOccultEyeTexture(0, 1.0);
+
+    const occultEyeMat = new THREE.MeshStandardMaterial({
+      map: eyeTexture,
+      roughness: 0.15,
+      metalness: 0.1,
+      emissive: new THREE.Color(params.internalGlow),
+      emissiveIntensity: 0.25
+    });
+
+    // =========================================================================
+    // HIERARCHICAL GOTHIC CLOCK MODEL
+    // =========================================================================
+    const clockGroup = new THREE.Group();
+    scene.add(clockGroup);
+
+    // 1. BASE / PEDESTAL
+    const baseGroup = new THREE.Group();
+    clockGroup.add(baseGroup);
+
+    // Lower Stepped Plinth (Wider, solid gothic foundation)
+    const plinthGeo = new THREE.BoxGeometry(1.68, 0.22, 1.04);
+    const plinth = new THREE.Mesh(plinthGeo, woodPrimaryMat);
+    plinth.position.y = 0.11;
+    plinth.castShadow = true;
+    plinth.receiveShadow = true;
+    baseGroup.add(plinth);
+
+    // Mid-base tier
+    const midBaseGeo = new THREE.BoxGeometry(1.52, 0.42, 0.94);
+    const midBase = new THREE.Mesh(midBaseGeo, woodPrimaryMat);
+    midBase.position.y = 0.42;
+    midBase.castShadow = true;
+    midBase.receiveShadow = true;
+    baseGroup.add(midBase);
+
+    // Carved gothic front base relief
+    const baseReliefGeo = new THREE.BoxGeometry(1.18, 0.30, 0.05);
+    const baseRelief = new THREE.Mesh(baseReliefGeo, woodSecondaryMat);
+    baseRelief.position.set(0, 0.42, 0.48);
+    baseRelief.castShadow = true;
+    baseGroup.add(baseRelief);
+
+    // Upper Base Moulding
+    const baseMouldGeo = new THREE.BoxGeometry(1.44, 0.16, 0.88);
+    const baseMould = new THREE.Mesh(baseMouldGeo, woodSecondaryMat);
+    baseMould.position.y = 0.70;
+    baseMould.castShadow = true;
+    baseGroup.add(baseMould);
+
+    // 4 Corner Bracket/Claw Feet
+    const footGeo = new THREE.BoxGeometry(0.20, 0.14, 0.20);
+    const footPositions = [
+      [-0.74, 0.07, 0.44], [0.74, 0.07, 0.44],
+      [-0.74, 0.07, -0.44], [0.74, 0.07, -0.44]
+    ];
+    footPositions.forEach(([x, y, z]) => {
+      const foot = new THREE.Mesh(footGeo, woodSecondaryMat);
+      foot.position.set(x, y, z);
+      foot.castShadow = true;
+      baseGroup.add(foot);
+    });
+
+    // 2. WAIST (TRUNK & PENDULUM CABINET)
+    // Width: 1.40, Depth: 0.80, Height: 2.15 -> spacious interior clearance
+    const waistGroup = new THREE.Group();
+    clockGroup.add(waistGroup);
+
+    // Solid Backboard
+    const backboardGeo = new THREE.BoxGeometry(1.36, 2.15, 0.06);
+    const backboard = new THREE.Mesh(backboardGeo, woodPrimaryMat);
+    backboard.position.set(0, 1.85, -0.36);
+    backboard.receiveShadow = true;
+    waistGroup.add(backboard);
+
+    // Waist Floor & Ceiling
+    const waistFloorGeo = new THREE.BoxGeometry(1.36, 0.08, 0.76);
+    const waistFloor = new THREE.Mesh(waistFloorGeo, woodPrimaryMat);
+    waistFloor.position.set(0, 0.80, 0);
+    waistFloor.receiveShadow = true;
+    waistGroup.add(waistFloor);
+
+    const waistCeil = new THREE.Mesh(waistFloorGeo, woodPrimaryMat);
+    waistCeil.position.set(0, 2.92, 0);
+    waistCeil.receiveShadow = true;
+    waistGroup.add(waistCeil);
+
+    // 4 Fluted Corner Pillars
+    const pilasterGeo = new THREE.CylinderGeometry(0.055, 0.055, 2.15, 16);
+    const pilCoords = [
+      [-0.67, 1.85, 0.36], [0.67, 1.85, 0.36],
+      [-0.67, 1.85, -0.36], [0.67, 1.85, -0.36]
+    ];
+    pilCoords.forEach(([px, py, pz]) => {
+      const pil = new THREE.Mesh(pilasterGeo, woodSecondaryMat);
+      pil.position.set(px, py, pz);
+      pil.castShadow = true;
+      waistGroup.add(pil);
+    });
+
+    // Front Gothic Door Frame & Glass
+    const frontDoorGroup = new THREE.Group();
+    frontDoorGroup.position.set(0, 1.85, 0.36);
+    waistGroup.add(frontDoorGroup);
+
+    const frontStileGeo = new THREE.BoxGeometry(0.08, 2.08, 0.04);
+    const fStileL = new THREE.Mesh(frontStileGeo, woodSecondaryMat);
+    fStileL.position.set(-0.58, 0, 0);
+    frontDoorGroup.add(fStileL);
+
+    const fStileR = new THREE.Mesh(frontStileGeo, woodSecondaryMat);
+    fStileR.position.set(0.58, 0, 0);
+    frontDoorGroup.add(fStileR);
+
+    const frontRailGeo = new THREE.BoxGeometry(1.24, 0.08, 0.04);
+    const fRailB = new THREE.Mesh(frontRailGeo, woodSecondaryMat);
+    fRailB.position.set(0, -1.0, 0);
+    frontDoorGroup.add(fRailB);
+
+    const fRailT = new THREE.Mesh(frontRailGeo, woodSecondaryMat);
+    fRailT.position.set(0, 1.0, 0);
+    frontDoorGroup.add(fRailT);
+
+    const frontGlassGeo = new THREE.BoxGeometry(1.10, 1.94, 0.015);
+    const frontGlass = new THREE.Mesh(frontGlassGeo, glassMat);
+    frontGlass.receiveShadow = true;
+    frontDoorGroup.add(frontGlass);
+
+    // Front Gothic Mullions / Arches
+    const centerMullionGeo = new THREE.BoxGeometry(0.025, 1.90, 0.02);
+    const frontCenterMullion = new THREE.Mesh(centerMullionGeo, woodSecondaryMat);
+    frontCenterMullion.position.set(0, 0, 0.014);
+    frontCenterMullion.castShadow = true;
+    frontDoorGroup.add(frontCenterMullion);
+
+    const archGeo = new THREE.CylinderGeometry(0.26, 0.26, 0.02, 24, 1, true, 0, Math.PI);
+    [-0.26, 0.26].forEach(ax => {
+      const arch = new THREE.Mesh(archGeo, woodSecondaryMat);
+      arch.rotation.x = Math.PI / 2;
+      arch.position.set(ax, 0.65, 0.014);
+      arch.castShadow = true;
+      frontDoorGroup.add(arch);
+    });
+
+    // Side Arched Glass Windows (Left & Right)
+    [-0.67, 0.67].forEach((sx) => {
+      const sideWindowGroup = new THREE.Group();
+      sideWindowGroup.position.set(sx, 1.85, 0);
+      waistGroup.add(sideWindowGroup);
+
+      const sideGlassGeo = new THREE.BoxGeometry(0.015, 1.90, 0.60);
+      const sideGlass = new THREE.Mesh(sideGlassGeo, glassMat);
+      sideGlass.receiveShadow = true;
+      sideWindowGroup.add(sideGlass);
+
+      const sideFrameGeo = new THREE.BoxGeometry(0.03, 1.90, 0.05);
+      const sfF = new THREE.Mesh(sideFrameGeo, woodSecondaryMat);
+      sfF.position.set(0, 0, 0.30);
+      sideWindowGroup.add(sfF);
+
+      const sfB = new THREE.Mesh(sideFrameGeo, woodSecondaryMat);
+      sfB.position.set(0, 0, -0.30);
+      sideWindowGroup.add(sfB);
+
+      const sideMullionGeo = new THREE.BoxGeometry(0.02, 1.86, 0.02);
+      const sideMullion = new THREE.Mesh(sideMullionGeo, woodSecondaryMat);
+      sideMullion.position.set(sx > 0 ? 0.012 : -0.012, 0, 0);
+      sideWindowGroup.add(sideMullion);
+    });
+
+    // 3. INTERNAL CLOCKWORK & WEIGHTS
+    const weightsGroup = new THREE.Group();
+    weightsGroup.position.set(0, 2.72, -0.05);
+    waistGroup.add(weightsGroup);
+
+    const weightGeo = new THREE.CylinderGeometry(0.07, 0.07, 0.44, 24);
+    const weightChainGeo = new THREE.CylinderGeometry(0.007, 0.007, 0.95, 8);
+
+    [-0.34, 0.34].forEach((wx, idx) => {
+      const chain = new THREE.Mesh(weightChainGeo, brassMat);
+      chain.position.set(wx, -0.48, 0);
+      chain.castShadow = true;
+      weightsGroup.add(chain);
+
+      const weight = new THREE.Mesh(weightGeo, brassMat);
+      weight.position.set(wx, -0.92 - (idx * 0.18), 0);
+      weight.castShadow = true;
+      weightsGroup.add(weight);
+    });
+
+    // Escapement Gears & Anchor
+    const gearTrainGroup = new THREE.Group();
+    gearTrainGroup.position.set(0, 2.76, -0.08);
+    waistGroup.add(gearTrainGroup);
+
+    const escapeWheelGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.025, 24);
+    const escapeWheel = new THREE.Mesh(escapeWheelGeo, brassMat);
+    escapeWheel.rotation.x = Math.PI / 2;
+    escapeWheel.position.set(-0.10, 0, 0);
+    escapeWheel.castShadow = true;
+    gearTrainGroup.add(escapeWheel);
+
+    const spurGearGeo = new THREE.CylinderGeometry(0.20, 0.20, 0.025, 28);
+    const spurGear = new THREE.Mesh(spurGearGeo, brassMat);
+    spurGear.rotation.x = Math.PI / 2;
+    spurGear.position.set(0.14, -0.04, 0.02);
+    spurGear.castShadow = true;
+    gearTrainGroup.add(spurGear);
+
+    const anchorVergeGeo = new THREE.BoxGeometry(0.20, 0.045, 0.02);
+    const anchorVerge = new THREE.Mesh(anchorVergeGeo, darkMetalMat);
+    anchorVerge.position.set(-0.10, 0.15, 0);
+    anchorVerge.castShadow = true;
+    gearTrainGroup.add(anchorVerge);
+
+    // 4. HIERARCHICAL PENDULUM ASSEMBLY
+    // Pivot at (0, 2.70, -0.04). Bob center at y = -1.24 from pivot.
+    const pendulumPivot = new THREE.Group();
+    pendulumPivot.position.set(0, 2.70, -0.04);
+    waistGroup.add(pendulumPivot);
+
+    const suspGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.06, 16);
+    const suspMesh = new THREE.Mesh(suspGeo, brassMat);
+    suspMesh.rotation.z = Math.PI / 2;
+    pendulumPivot.add(suspMesh);
+
+    const rodLength = 1.42;
+    const rodGeo = new THREE.CylinderGeometry(0.016, 0.016, rodLength, 16);
+    const pendulumRod = new THREE.Mesh(rodGeo, brassMat);
+    pendulumRod.position.set(0, -rodLength / 2, 0);
+    pendulumRod.castShadow = true;
+    pendulumPivot.add(pendulumRod);
+
+    const rosetteGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.10, 16);
+    const rosette = new THREE.Mesh(rosetteGeo, brassMat);
+    rosette.position.set(0, -0.65, 0);
+    rosette.castShadow = true;
+    pendulumPivot.add(rosette);
+
+    // Pendulum Bob Group
+    const bobGroup = new THREE.Group();
+    bobGroup.position.set(0, -1.24, 0);
+    bobGroup.castShadow = true;
+    pendulumPivot.add(bobGroup);
+
+    // Heavy Brass Bob Disc (Radius: 0.17 -> perfectly fits within cabinet)
+    const bobDiscGeo = new THREE.CylinderGeometry(0.17, 0.17, 0.05, 32);
+    const bobDisc = new THREE.Mesh(bobDiscGeo, brassMat);
+    bobDisc.rotation.x = Math.PI / 2;
+    bobDisc.castShadow = true;
+    bobDisc.receiveShadow = true;
+    bobGroup.add(bobDisc);
+
+    const bobRimGeo = new THREE.TorusGeometry(0.155, 0.018, 16, 32);
+    const bobRim = new THREE.Mesh(bobRimGeo, woodSecondaryMat);
+    bobRim.castShadow = true;
+    bobGroup.add(bobRim);
+
+    // Occult All-Seeing Eye Center Medallion
+    const occultEyeGeo = new THREE.CircleGeometry(0.095, 32);
+    const occultEyeMesh = new THREE.Mesh(occultEyeGeo, occultEyeMat);
+    occultEyeMesh.position.set(0, 0, 0.028);
+    bobGroup.add(occultEyeMesh);
+
+    // 5. HOOD (HEAD, GOTHIC SPIRES, GARGOYLES & DIAL)
+    const hoodGroup = new THREE.Group();
+    hoodGroup.position.set(0, 2.95, 0);
+    clockGroup.add(hoodGroup);
+
+    const corniceGeo = new THREE.BoxGeometry(1.52, 0.16, 0.96);
+    const cornice = new THREE.Mesh(corniceGeo, woodSecondaryMat);
+    cornice.position.y = 0.08;
+    cornice.castShadow = true;
+    hoodGroup.add(cornice);
+
+    const hoodBoxGeo = new THREE.BoxGeometry(1.36, 1.25, 0.88);
+    const hoodBox = new THREE.Mesh(hoodBoxGeo, woodPrimaryMat);
+    hoodBox.position.y = 0.78;
+    hoodBox.castShadow = true;
+    hoodBox.receiveShadow = true;
+    hoodGroup.add(hoodBox);
+
+    // Gothic Pediment (Gable)
+    const pedimentGroup = new THREE.Group();
+    pedimentGroup.position.set(0, 1.40, 0);
+    hoodGroup.add(pedimentGroup);
+
+    const gableShape = new THREE.Shape();
+    gableShape.moveTo(-0.70, 0);
+    gableShape.lineTo(0.70, 0);
+    gableShape.lineTo(0, 0.65);
+    gableShape.closePath();
+
+    const extrudeSettings = { depth: 0.90, bevelEnabled: true, bevelSegments: 3, steps: 1, bevelSize: 0.03, bevelThickness: 0.03 };
+    const gableGeo = new THREE.ExtrudeGeometry(gableShape, extrudeSettings);
+    const gableMesh = new THREE.Mesh(gableGeo, woodSecondaryMat);
+    gableMesh.position.set(0, 0, -0.45);
+    gableMesh.castShadow = true;
+    pedimentGroup.add(gableMesh);
+
+    // Center Spire Finial
+    const spireGeo = new THREE.ConeGeometry(0.09, 0.60, 12);
+    const spireMesh = new THREE.Mesh(spireGeo, woodSecondaryMat);
+    spireMesh.position.set(0, 0.95, 0);
+    spireMesh.castShadow = true;
+    pedimentGroup.add(spireMesh);
+
+    const spireBallGeo = new THREE.SphereGeometry(0.08, 16, 16);
+    const spireBall = new THREE.Mesh(spireBallGeo, brassMat);
+    spireBall.position.set(0, 0.65, 0);
+    spireBall.castShadow = true;
+    pedimentGroup.add(spireBall);
+
+    // 4 Corner Pinnacles
+    const pinnacleGeo = new THREE.ConeGeometry(0.055, 0.35, 8);
+    const pinCoords = [
+      [-0.64, 1.55, 0.42], [0.64, 1.55, 0.42],
+      [-0.64, 1.55, -0.42], [0.64, 1.55, -0.42]
+    ];
+    pinCoords.forEach(([px, py, pz]) => {
+      const pin = new THREE.Mesh(pinnacleGeo, brassMat);
+      pin.position.set(px, py, pz);
+      pin.castShadow = true;
+      hoodGroup.add(pin);
+    });
+
+    // Spooky Gothic Winged Gargoyles on Hood Cornice Corners
+    function createGargoyle(facingAngle) {
+      const gargGroup = new THREE.Group();
+      // Body & Horned Head
+      const bodyGeo = new THREE.ConeGeometry(0.06, 0.18, 6);
+      const body = new THREE.Mesh(bodyGeo, darkMetalMat);
+      gargGroup.add(body);
+
+      const headGeo = new THREE.SphereGeometry(0.05, 8, 8);
+      const head = new THREE.Mesh(headGeo, darkMetalMat);
+      head.position.y = 0.11;
+      gargGroup.add(head);
+
+      // Horns
+      const hornGeo = new THREE.ConeGeometry(0.015, 0.06, 4);
+      const hL = new THREE.Mesh(hornGeo, brassMat);
+      hL.position.set(-0.03, 0.15, 0);
+      hL.rotation.z = 0.3;
+      gargGroup.add(hL);
+
+      const hR = new THREE.Mesh(hornGeo, brassMat);
+      hR.position.set(0.03, 0.15, 0);
+      hR.rotation.z = -0.3;
+      gargGroup.add(hR);
+
+      // Bat Wings
+      const wingGeo = new THREE.PlaneGeometry(0.12, 0.16);
+      const wL = new THREE.Mesh(wingGeo, darkMetalMat);
+      wL.position.set(-0.08, 0.06, -0.02);
+      wL.rotation.y = 0.6;
+      gargGroup.add(wL);
+
+      const wR = new THREE.Mesh(wingGeo, darkMetalMat);
+      wR.position.set(0.08, 0.06, -0.02);
+      wR.rotation.y = -0.6;
+      gargGroup.add(wR);
+
+      gargGroup.rotation.y = facingAngle;
+      return gargGroup;
+    }
+
+    const gargoyleL = createGargoyle(Math.PI * 0.25);
+    gargoyleL.position.set(-0.70, 0.20, 0.44);
+    hoodGroup.add(gargoyleL);
+
+    const gargoyleR = createGargoyle(-Math.PI * 0.25);
+    gargoyleR.position.set(0.70, 0.20, 0.44);
+    hoodGroup.add(gargoyleR);
+
+    // Clock Face Bezel & Dial
+    const bezelGeo = new THREE.TorusGeometry(0.48, 0.045, 16, 48);
+    const bezelMesh = new THREE.Mesh(bezelGeo, brassMat);
+    bezelMesh.position.set(0, 0.74, 0.45);
+    bezelMesh.castShadow = true;
+    hoodGroup.add(bezelMesh);
+
+    const dialDiscGeo = new THREE.CircleGeometry(0.475, 48);
+    const dialMesh = new THREE.Mesh(dialDiscGeo, dialMat);
+    dialMesh.position.set(0, 0.74, 0.452);
+    dialMesh.receiveShadow = true;
+    hoodGroup.add(dialMesh);
+
+    const dialGlassGeo = new THREE.CircleGeometry(0.48, 48);
+    const dialGlass = new THREE.Mesh(dialGlassGeo, glassMat);
+    dialGlass.position.set(0, 0.74, 0.468);
+    hoodGroup.add(dialGlass);
+
+    // 6. CLOCK HANDS (Spinning rapidly backward)
+    const handsCenterPivot = new THREE.Group();
+    handsCenterPivot.position.set(0, 0.74, 0.46);
+    hoodGroup.add(handsCenterPivot);
+
+    const centerCapGeo = new THREE.SphereGeometry(0.035, 16, 16);
+    const centerCap = new THREE.Mesh(centerCapGeo, brassMat);
+    centerCap.position.z = 0.015;
+    handsCenterPivot.add(centerCap);
+
+    const hourHandGroup = new THREE.Group();
+    handsCenterPivot.add(hourHandGroup);
+
+    const hourHandStem = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.22, 0.008), handsMat);
+    hourHandStem.position.set(0, 0.11, 0.003);
+    hourHandGroup.add(hourHandStem);
+
+    const hourHead = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.09, 4), handsMat);
+    hourHead.position.set(0, 0.24, 0.003);
+    hourHandGroup.add(hourHead);
+
+    const minuteHandGroup = new THREE.Group();
+    handsCenterPivot.add(minuteHandGroup);
+
+    const minHandStem = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.35, 0.008), handsMat);
+    minHandStem.position.set(0, 0.175, 0.008);
+    minuteHandGroup.add(minHandStem);
+
+    const minHead = new THREE.Mesh(new THREE.ConeGeometry(0.04, 0.11, 4), handsMat);
+    minHead.position.set(0, 0.37, 0.008);
+    minuteHandGroup.add(minHead);
+
+    const secondHandGroup = new THREE.Group();
+    handsCenterPivot.add(secondHandGroup);
+
+    const secStem = new THREE.Mesh(new THREE.BoxGeometry(0.009, 0.42, 0.006), handsMat);
+    secStem.position.set(0, 0.16, 0.012);
+    secondHandGroup.add(secStem);
+
+    const crescent = new THREE.Mesh(new THREE.TorusGeometry(0.045, 0.008, 8, 24, Math.PI * 1.3), handsMat);
+    crescent.position.set(0, -0.07, 0.012);
+    secondHandGroup.add(crescent);
+
+    // =========================================================================
+    // SPOOKY ELEMENTS: CANDELABRA SCONCES & ETHEREAL GHOST
+    // =========================================================================
+    // Twin Cursed Sconces on Clock Flanks
+    function createSconce() {
+      const group = new THREE.Group();
+      // Curved wrought-iron arm
+      const armGeo = new THREE.TorusGeometry(0.12, 0.018, 8, 24, Math.PI * 0.7);
+      const arm = new THREE.Mesh(armGeo, darkMetalMat);
+      arm.rotation.z = Math.PI * 0.2;
+      group.add(arm);
+
+      // Candle holder cup
+      const cupGeo = new THREE.CylinderGeometry(0.04, 0.025, 0.04, 12);
+      const cup = new THREE.Mesh(cupGeo, brassMat);
+      cup.position.set(0.12, 0.10, 0);
+      group.add(cup);
+
+      // Dripping wax candle
+      const candleGeo = new THREE.CylinderGeometry(0.024, 0.026, 0.18, 12);
+      const candle = new THREE.Mesh(candleGeo, candleWaxMat);
+      candle.position.set(0.12, 0.21, 0);
+      group.add(candle);
+
+      // Flickering flame mesh
+      const flameGeo = new THREE.ConeGeometry(0.022, 0.08, 8);
+      const flame = new THREE.Mesh(flameGeo, candleFlameMat);
+      flame.position.set(0.12, 0.34, 0);
+      group.add(flame);
+
+      return { group, flame };
+    }
+
+    const sconceL = createSconce();
+    sconceL.group.position.set(-0.76, 2.3, 0.20);
+    waistGroup.add(sconceL.group);
+
+    const sconceR = createSconce();
+    sconceR.group.position.set(0.76, 2.3, 0.20);
+    sconceR.group.rotation.y = Math.PI;
+    waistGroup.add(sconceR.group);
+
+    // =========================================================================
+    // THE HAUNTED GOTHIC WRAITH (Cinematic Ethereal Specter)
+    // =========================================================================
+    const ghostGroup = new THREE.Group();
+    ghostGroup.position.set(0, 2.4, 0);
+    ghostGroup.visible = params.showGhost;
+    scene.add(ghostGroup);
+
+    const wraithVertexShader = `
+      varying vec2 vUv;
+      varying vec3 vNormal;
+      varying vec3 vViewPosition;
+      uniform float time;
+
+      void main() {
+        vUv = uv;
+        vec3 pos = position;
+
+        // Dynamic ethereal billowing cloth ripples towards bottom hem
+        float hemWeight = smoothstep(0.4, -0.9, pos.y);
+        float wave1 = sin(pos.y * 6.0 - time * 3.2 + pos.x * 4.0) * 0.08 * hemWeight;
+        float wave2 = cos(time * 2.0 + pos.y * 4.5 + pos.z * 3.0) * 0.06 * hemWeight;
+        pos.x += wave1 + wave2;
+        pos.z += wave1 * 0.7;
+
+        vNormal = normalize(normalMatrix * normal);
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        vViewPosition = -mvPosition.xyz;
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `;
+
+    const wraithFragmentShader = `
+      uniform vec3 ghostColor;
+      uniform float opacity;
+      uniform float time;
+      varying vec2 vUv;
+      varying vec3 vNormal;
+      varying vec3 vViewPosition;
+
+      void main() {
+        vec3 normal = normalize(vNormal);
+        vec3 viewDir = normalize(vViewPosition);
+
+        // Subtle Fresnel edge rim glow (luminous silhouette)
+        float fresnel = pow(1.0 - abs(dot(viewDir, normal)), 2.2);
+
+        // Soft vertical dissolve towards bottom hem (no sharp cut)
+        float vertFade = smoothstep(0.02, 0.45, vUv.y);
+
+        // Smoky undulating wisps along the fabric
+        float wisps = 0.8 + 0.2 * sin(vUv.x * 28.0 + sin(vUv.y * 12.0 - time * 2.5));
+
+        float alpha = (fresnel * 0.75 + 0.25) * vertFade * opacity * wisps;
+        vec3 finalCol = mix(ghostColor, vec3(1.0), fresnel * 0.45);
+
+        gl_FragColor = vec4(finalCol, clamp(alpha, 0.0, 1.0));
+      }
+    `;
+
+    const wraithMat = new THREE.ShaderMaterial({
+      uniforms: {
+        ghostColor: { value: new THREE.Color(params.internalGlow) },
+        opacity: { value: 0.75 },
+        time: { value: 0 }
+      },
+      vertexShader: wraithVertexShader,
+      fragmentShader: wraithFragmentShader,
+      transparent: true,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    // 1. Gothic Hood / Cowl (Pointed cowl draped around head)
+    const hoodGeo = new THREE.CylinderGeometry(0.06, 0.28, 0.55, 32, 16, true, Math.PI * 0.15, Math.PI * 1.7);
+    const hoodMesh = new THREE.Mesh(hoodGeo, wraithMat);
+    hoodMesh.position.set(0, 0.35, -0.02);
+    ghostGroup.add(hoodMesh);
+
+    // Deep hollow dark cowl interior (void where face should be)
+    const cowlVoidGeo = new THREE.SphereGeometry(0.14, 16, 16);
+    const cowlVoidMat = new THREE.MeshStandardMaterial({
+      color: 0x020104,
+      roughness: 0.95,
+      metalness: 0.0
+    });
+    const cowlVoidMesh = new THREE.Mesh(cowlVoidGeo, cowlVoidMat);
+    cowlVoidMesh.position.set(0, 0.38, -0.02);
+    ghostGroup.add(cowlVoidMesh);
+
+    // Two piercing, sunken spectral soul embers (eyes deep inside the cowl)
+    const soulEyeGeo = new THREE.SphereGeometry(0.016, 12, 12);
+    const soulEyeMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.95
+    });
+    const soulEyeL = new THREE.Mesh(soulEyeGeo, soulEyeMat);
+    soulEyeL.position.set(-0.045, 0.40, 0.08);
+    ghostGroup.add(soulEyeL);
+
+    const soulEyeR = new THREE.Mesh(soulEyeGeo, soulEyeMat);
+    soulEyeR.position.set(0.045, 0.40, 0.08);
+    ghostGroup.add(soulEyeR);
+
+    // 2. Billowing Mantle & Robes (Open front gothic shroud)
+    const shroudGeo = new THREE.CylinderGeometry(0.24, 0.46, 1.4, 48, 32, true, Math.PI * 0.12, Math.PI * 1.76);
+    const shroudMesh = new THREE.Mesh(shroudGeo, wraithMat);
+    shroudMesh.position.set(0, -0.45, 0);
+    ghostGroup.add(shroudMesh);
+
+    // 3. Trailing Tattered Hem Tendrils (Wisps of spectral cloth hanging down)
+    const tendrilCount = 6;
+    for (let i = 0; i < tendrilCount; i++) {
+      const angle = (i / tendrilCount) * Math.PI * 1.6 + Math.PI * 0.2;
+      const tGeo = new THREE.PlaneGeometry(0.08, 0.55, 4, 16);
+      const tMesh = new THREE.Mesh(tGeo, wraithMat);
+      tMesh.position.set(Math.cos(angle) * 0.38, -1.25, Math.sin(angle) * 0.38);
+      tMesh.rotation.y = -angle + Math.PI / 2;
+      ghostGroup.add(tMesh);
+    }
+
+    // 4. Gaunt Skeletal Phantom Hands (Eerie claw gesture emerging from sleeves)
+    const handMat = new THREE.MeshStandardMaterial({
+      color: 0x8a9ba8,
+      roughness: 0.4,
+      metalness: 0.2,
+      transparent: true,
+      opacity: 0.6
+    });
+
+    [-0.28, 0.28].forEach((hx, idx) => {
+      const armGroup = new THREE.Group();
+      armGroup.position.set(hx, 0.15, 0.12);
+      armGroup.rotation.z = idx === 0 ? 0.35 : -0.35;
+      armGroup.rotation.x = 0.4;
+
+      const sleeveGeo = new THREE.CylinderGeometry(0.06, 0.12, 0.42, 16, 8, true);
+      const sleeve = new THREE.Mesh(sleeveGeo, wraithMat);
+      sleeve.position.y = -0.15;
+      armGroup.add(sleeve);
+
+      const palmGeo = new THREE.BoxGeometry(0.025, 0.05, 0.015);
+      const palm = new THREE.Mesh(palmGeo, handMat);
+      palm.position.y = -0.38;
+      armGroup.add(palm);
+
+      for (let f = -1; f <= 1; f++) {
+        const fingerGeo = new THREE.CylinderGeometry(0.003, 0.005, 0.07, 6);
+        const finger = new THREE.Mesh(fingerGeo, handMat);
+        finger.position.set(f * 0.01, -0.42, 0);
+        finger.rotation.z = f * 0.15;
+        armGroup.add(finger);
+      }
+
+      ghostGroup.add(armGroup);
+    });
+
+    // Ethereal Dust Motes
+    const dustCount = 180;
+    const dustGeo = new THREE.BufferGeometry();
+    const dustPositions = new Float32Array(dustCount * 3);
+    const dustData = [];
+
+    for (let i = 0; i < dustCount; i++) {
+      const dx = (Math.random() - 0.5) * 4.4;
+      const dy = 0.2 + Math.random() * 4.6;
+      const dz = (Math.random() - 0.5) * 4.4;
+      dustPositions[i * 3] = dx;
+      dustPositions[i * 3 + 1] = dy;
+      dustPositions[i * 3 + 2] = dz;
+
+      dustData.push({
+        baseX: dx, baseY: dy, baseZ: dz,
+        speedX: (Math.random() - 0.5) * 0.4,
+        speedY: 0.1 + Math.random() * 0.3,
+        phase: Math.random() * Math.PI * 2
+      });
+    }
+
+    dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPositions, 3));
+    const dustMat = new THREE.PointsMaterial({
+      color: new THREE.Color(params.internalGlow),
+      size: 0.045,
+      transparent: true,
+      opacity: 0.65,
+      blending: THREE.AdditiveBlending
+    });
+    const dustPoints = new THREE.Points(dustGeo, dustMat);
+    scene.add(dustPoints);
+
+    // --- APPLY COLOR SCHEME HELPER ---
+    function applyColorScheme(scheme) {
+      params.bgColor = scheme.bg;
+      params.fogColor = scheme.fog;
+      params.woodPrimary = scheme.woodPrimary;
+      params.woodSecondary = scheme.woodSecondary;
+      params.metalBrass = scheme.metalBrass;
+      params.dialFace = scheme.dialFace;
+      params.dialHands = scheme.dialHands;
+      params.internalGlow = scheme.internalGlow;
+      params.rimLight = scheme.rimLight;
+      params.floorColor = scheme.floor;
+
+      updateMaterialsAndScene();
+    }
+
+    function updateMaterialsAndScene() {
+      if (params.greenscreen) {
+        scene.background = new THREE.Color(0x00ff00);
+        scene.fog = null;
+        floorMesh.visible = false;
+      } else {
+        scene.background = new THREE.Color(params.bgColor);
+        scene.fog = new THREE.Fog(params.fogColor, 6.0, 26);
+        floorMesh.visible = true;
+      }
+
+      woodPrimaryMat.color.set(params.woodPrimary);
+      woodSecondaryMat.color.set(params.woodSecondary);
+      brassMat.color.set(params.metalBrass);
+      handsMat.color.set(params.dialHands);
+      floorMat.color.set(params.floorColor);
+
+      rimLight.color.set(params.rimLight);
+      internalPointLight.color.set(params.internalGlow);
+      lightBulbMat.color.set(params.internalGlow);
+      sconceLightLeft.color.set(params.internalGlow);
+      sconceLightRight.color.set(params.internalGlow);
+      dustMat.color.set(params.internalGlow);
+      wraithMat.uniforms.ghostColor.value.set(params.internalGlow);
+      soulEyeMat.color.set(params.internalGlow);
+      occultEyeMat.emissive.set(params.internalGlow);
+
+      updateDialTexture();
+    }
+
+    // =========================================================================
+    // PROCEDURAL RANDOMIZER (Does NOT modify PostProcessor settings)
+    // =========================================================================
+    function rerollScene() {
+      const schemeKeys = Object.keys(COLOR_SCHEMES);
+      const chosenKey = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+      params.colorScheme = chosenKey;
+      const s = COLOR_SCHEMES[chosenKey];
+
+      params.bgColor = s.bg;
+      params.fogColor = s.fog;
+      params.woodPrimary = s.woodPrimary;
+      params.woodSecondary = s.woodSecondary;
+      params.metalBrass = s.metalBrass;
+      params.dialFace = s.dialFace;
+      params.dialHands = s.dialHands;
+      params.internalGlow = s.internalGlow;
+      params.rimLight = s.rimLight;
+      params.floorColor = s.floor;
+
+      // Safe motion dynamics that guarantee the pendulum remains inside cabinet
+      params.pendulumAmp = THREE.MathUtils.clamp(0.18 + Math.random() * 0.08, 0.12, 0.26);
+      params.pendulumFreq = THREE.MathUtils.clamp(0.85 + Math.random() * 0.9, 0.6, 2.2);
+      params.erraticWobble = THREE.MathUtils.clamp(0.12 + Math.random() * 0.35, 0.0, 0.55);
+      params.handSpeed = THREE.MathUtils.clamp(1.2 + Math.random() * 2.5, 0.5, 5.0);
+      params.lightIntensity = THREE.MathUtils.clamp(1.6 + Math.random() * 1.4, 0.8, 3.5);
+      params.flickerAmount = THREE.MathUtils.clamp(0.3 + Math.random() * 0.5, 0.1, 0.9);
+
+      updateMaterialsAndScene();
+
+      // Only update GUI folders for Scene, Theme, and Clock dynamics
+      fDisplay.controllersRecursive().forEach(c => c.updateDisplay());
+      fColor.controllersRecursive().forEach(c => c.updateDisplay());
+      fDynamics.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // =========================================================================
+    // LIL-GUI SETUP
+    // =========================================================================
+    const gui = new GUI({ title: 'Haunted Clock Settings' });
+
+    const fDisplay = gui.addFolder('Scene & Display');
+    fDisplay.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => updateMaterialsAndScene());
+    fDisplay.add(params, 'dpr', 0.5, 3.0, 0.1).name('Pixel Ratio (DPR)').onChange(v => {
+      renderer.setPixelRatio(v);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+    });
+    fDisplay.add(params, 'animation', ANIMATION_PRESETS).name('Camera Animation');
+    fDisplay.add(params, 'speed', 0.1, 3.0, 0.1).name('Animation Speed');
+    fDisplay.add(params, 'showGhost').name('Show Ghost').onChange(v => {
+      ghostGroup.visible = v;
+      params.ghostVisibility = v;
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    });
+    fDisplay.add(params, 'clickToRandomize').name('Click to Randomize');
+    fDisplay.add(params, 'reroll').name('Reroll Procedural Scene');
+
+    const fColor = gui.addFolder('Color Themes (18 Palettes)');
+    fColor.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Palette Preset').onChange(key => {
+      applyColorScheme(COLOR_SCHEMES[key]);
+      fColor.controllersRecursive().forEach(c => c.updateDisplay());
+    });
+    fColor.addColor(params, 'bgColor').name('Background Color').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'fogColor').name('Fog Color').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'woodPrimary').name('Primary Wood').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'woodSecondary').name('Moulding & Trim').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'metalBrass').name('Brass & Pendulum').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'dialFace').name('Dial Face').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'dialHands').name('Clock Hands').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'internalGlow').name('Internal PointLight').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'rimLight').name('Rim Silhouette Light').onChange(() => updateMaterialsAndScene());
+    fColor.addColor(params, 'floorColor').name('Floor Base').onChange(() => updateMaterialsAndScene());
+
+    const fDynamics = gui.addFolder('Haunted Clock Dynamics');
+    fDynamics.add(params, 'pendulumAmp', 0.10, 0.28, 0.01).name('Pendulum Arc (Safe)');
+    fDynamics.add(params, 'pendulumFreq', 0.5, 3.0, 0.05).name('Pendulum Frequency');
+    fDynamics.add(params, 'erraticWobble', 0.0, 0.6, 0.02).name('Erratic Wobble');
+    fDynamics.add(params, 'handSpeed', 0.5, 5.0, 0.1).name('Hand Reverse Speed');
+    fDynamics.add(params, 'lightIntensity', 0.5, 4.0, 0.1).name('PointLight Power');
+    fDynamics.add(params, 'flickerAmount', 0.0, 1.0, 0.05).name('Flicker Intensity');
+    fDynamics.add(params, 'showGhost').name('Show Ghost').onChange(v => {
+      ghostGroup.visible = v;
+      params.ghostVisibility = v;
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    });
+    fDynamics.add(params, 'ghostSpeed', 0.2, 3.0, 0.1).name('Ghost Glide Speed');
+
+    // Attach PostProcessor Suite Controls Folder
+    postProcessor.attachGUI(gui, 'Post-Processing (PostProcessor.js)');
+
+    // --- CLICK TO RANDOMIZE LISTENER ---
+    let pointerStartX = 0, pointerStartY = 0, pointerStartTime = 0;
+
+    window.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.lil-gui')) return;
+      pointerStartX = e.clientX;
+      pointerStartY = e.clientY;
+      pointerStartTime = performance.now();
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (e.target.closest('.lil-gui')) return;
+      const dist = Math.hypot(e.clientX - pointerStartX, e.clientY - pointerStartY);
+      const duration = performance.now() - pointerStartTime;
+      if (dist < 6 && duration < 350 && params.clickToRandomize) {
+        rerollScene();
+      }
+    });
+
+    // --- KEYBOARD "H" TO TOGGLE UI ---
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        const guiElement = gui.domElement;
+        if (guiElement) {
+          guiElement.style.display = (guiElement.style.display === 'none') ? '' : 'none';
+        }
+      }
+    });
+
+    // --- ANIMATION LOOP ---
+    const clock = new THREE.Clock();
+    let totalTime = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const scaledDelta = delta * params.speed;
+      totalTime += scaledDelta;
+
+      // 1. CAMERA ANIMATION PRESETS
+      if (!isUserInteracting) {
+        const t = totalTime;
+        switch (params.animation) {
+          case 'Static (No Camera Motion)':
+            break;
+          case 'Haunted Drift (Default)':
+            camera.position.x = Math.sin(t * 0.22) * 1.5;
+            camera.position.y = 2.4 + Math.sin(t * 0.30) * 0.35;
+            camera.position.z = 6.2 + Math.cos(t * 0.18) * 0.45;
+            controls.target.set(0, 2.3, 0);
+            break;
+          case 'Hypnotic Pendulum Focus':
+            camera.position.x = Math.sin(t * 0.28) * 0.75;
+            camera.position.y = 1.45 + Math.sin(t * 0.18) * 0.15;
+            camera.position.z = 3.8 + Math.cos(t * 0.22) * 0.3;
+            controls.target.set(0, 1.45, 0);
+            break;
+          case 'Slow Gothic Orbit':
+            camera.position.x = Math.sin(t * 0.12) * 6.4;
+            camera.position.z = Math.cos(t * 0.12) * 6.4;
+            camera.position.y = 2.5 + Math.sin(t * 0.08) * 0.5;
+            controls.target.set(0, 2.3, 0);
+            break;
+          case 'Spooky Dial Macro':
+            camera.position.x = Math.sin(t * 0.20) * 0.38;
+            camera.position.y = 3.65 + Math.sin(t * 0.16) * 0.16;
+            camera.position.z = 2.6 + Math.cos(t * 0.14) * 0.22;
+            controls.target.set(0, 3.65, 0.45);
+            break;
+          case 'Haunted Elevation Crane':
+            const craneY = 1.2 + (Math.sin(t * 0.20) * 0.5 + 0.5) * 2.6;
+            camera.position.x = Math.sin(t * 0.10) * 1.8;
+            camera.position.y = craneY;
+            camera.position.z = 5.6;
+            controls.target.set(0, craneY * 0.8 + 0.4, 0);
+            break;
+          case 'Sinister Harmonic Sway':
+            camera.position.x = Math.sin(t * params.pendulumFreq * 0.5) * 1.6;
+            camera.position.y = 2.4 + Math.cos(t * 0.22) * 0.2;
+            camera.position.z = 5.8;
+            controls.target.set(0, 2.3, 0);
+            break;
+          case 'Phantom Spiral Ascent':
+            const spiralAngle = t * 0.16;
+            const spiralRadius = 5.4 + Math.sin(t * 0.1) * 0.4;
+            camera.position.x = Math.sin(spiralAngle) * spiralRadius;
+            camera.position.z = Math.cos(spiralAngle) * spiralRadius;
+            camera.position.y = 1.5 + (Math.sin(t * 0.14) * 0.5 + 0.5) * 2.1;
+            controls.target.set(0, 2.3, 0);
+            break;
+        }
+      }
+
+      controls.update();
+
+      // 2. PENDULUM OSCILLATION (Strictly clamped so it NEVER moves outside the clock!)
+      const omega = params.pendulumFreq * Math.PI;
+      const baseHarmonic = params.pendulumAmp * Math.sin(omega * totalTime);
+      const erraticHarmonic = params.erraticWobble * (
+        0.05 * Math.sin(omega * 3.0 * totalTime + 0.4) +
+        0.025 * Math.sin(omega * 7.0 * totalTime) * Math.cos(omega * totalTime)
+      );
+
+      // Maximum safe swing angle (0.28 rad ~ 16°), ensures bob never clips wooden case
+      const maxSafeAngle = 0.28;
+      const totalPendulumAngle = THREE.MathUtils.clamp(baseHarmonic + erraticHarmonic, -maxSafeAngle, maxSafeAngle);
+
+      pendulumPivot.rotation.z = totalPendulumAngle;
+      pendulumPivot.rotation.y = params.erraticWobble * 0.03 * Math.cos(omega * 2.0 * totalTime);
+
+      // Occult Eye Pupil Tracking
+      const trackingOffset = THREE.MathUtils.clamp(-totalPendulumAngle * 2.5, -0.75, 0.75);
+      const pupilPulse = 1.0 + Math.sin(totalTime * 3.5) * 0.2;
+      updateOccultEyeTexture(trackingOffset, pupilPulse);
+
+      // 3. GEAR TRAIN & ESCAPEMENT COUPLING
+      anchorVerge.rotation.z = Math.sin(omega * totalTime) * 0.24;
+      escapeWheel.rotation.z -= scaledDelta * params.pendulumFreq * 1.2;
+      spurGear.rotation.z += scaledDelta * params.pendulumFreq * 0.6;
+
+      // 4. CLOCK HANDS (Spinning rapidly backward)
+      hourHandGroup.rotation.z += scaledDelta * params.handSpeed * 0.8;
+      minuteHandGroup.rotation.z += scaledDelta * params.handSpeed * 9.6;
+      secondHandGroup.rotation.z += scaledDelta * params.handSpeed * 32.0 + Math.sin(totalTime * 12.0) * 0.08;
+
+      // 5. INTERNAL POINTLIGHT & SCONCE FLICKER
+      const flicker = (
+        Math.sin(totalTime * 14.3) * 0.16 +
+        Math.sin(totalTime * 27.8) * 0.11 +
+        Math.sin(totalTime * 6.2) * 0.14 +
+        (Math.random() - 0.5) * 0.08
+      ) * params.flickerAmount;
+
+      internalPointLight.intensity = Math.max(0.1, params.lightIntensity * (1.0 + flicker));
+
+      const sconceFlickerL = Math.sin(totalTime * 18.0) * 0.15 + (Math.random() - 0.5) * 0.1;
+      sconceLightLeft.intensity = Math.max(0.2, 0.9 * (1.0 + sconceFlickerL * params.flickerAmount));
+      sconceL.flame.scale.set(1.0 + sconceFlickerL * 0.3, 1.0 + sconceFlickerL * 0.5, 1.0 + sconceFlickerL * 0.3);
+
+      const sconceFlickerR = Math.sin(totalTime * 22.0 + 1.5) * 0.15 + (Math.random() - 0.5) * 0.1;
+      sconceLightRight.intensity = Math.max(0.2, 0.9 * (1.0 + sconceFlickerR * params.flickerAmount));
+      sconceR.flame.scale.set(1.0 + sconceFlickerR * 0.3, 1.0 + sconceFlickerR * 0.5, 1.0 + sconceFlickerR * 0.3);
+
+      // 6. GOTHIC WRAITH HOVERING MOTION
+      if ((params.showGhost || params.ghostVisibility) && ghostGroup.visible) {
+        wraithMat.uniforms.time.value = totalTime;
+        const gt = totalTime * 0.65 * params.ghostSpeed;
+        ghostGroup.position.x = Math.sin(gt) * 2.3;
+        ghostGroup.position.z = Math.cos(gt) * 1.6 + 0.15;
+        ghostGroup.position.y = 2.45 + Math.sin(gt * 1.6) * 0.35;
+        ghostGroup.rotation.y = -gt + Math.PI / 2;
+        ghostGroup.rotation.z = Math.sin(gt * 2.0) * 0.12;
+        soulEyeMat.opacity = 0.75 + Math.sin(totalTime * 4.0) * 0.25;
+      }
+
+      // 7. DUST MOTES FLOATING
+      const posAttr = dustGeo.attributes.position;
+      for (let i = 0; i < dustCount; i++) {
+        const d = dustData[i];
+        let py = posAttr.getY(i) + (d.speedY * 0.007 + Math.sin(totalTime + d.phase) * 0.002);
+        let px = posAttr.getX(i) + Math.sin(totalTime * 0.4 + d.phase) * 0.002;
+        let pz = posAttr.getZ(i) + Math.cos(totalTime * 0.4 + d.phase) * 0.002;
+        if (py > 4.6) py = 0.3;
+        posAttr.setXYZ(i, px, py, pz);
+      }
+      posAttr.needsUpdate = true;
+
+      // 8. RENDER THROUGH POSTPROCESSOR SUITE
+      postProcessor.setMoonScreenPosition(camera, internalPointLight.position);
+      postProcessor.renderScene(scene, camera);
+    }
+    animate();
+
+    // --- RESPONSIVE RESIZE ---
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+    });
+  </script>
+</body>
+</html>

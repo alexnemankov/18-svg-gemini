@@ -1,0 +1,1916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Shopping Cart Flow - 3D Conveyor Stream</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+    }
+    #webgl-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+  </style>
+
+  <!-- Import map with standard dependencies & postprocessing -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js",
+      "postprocessing/PostProcessor.js": "./postprocessing/PostProcessor.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (Three.js Shader Post-Processing Pipeline)
+    // Inline implementation ensures full cross-origin compatibility on file://
+    // =========================================================================
+    const orthoVertexShader = `
+      precision highp float;
+      in vec3 position;
+      out vec2 vUv;
+      void main() {
+        vUv = position.xy * 0.5 + 0.5;
+        gl_Position = vec4(position, 1.0);
+      }
+    `;
+
+    const brightFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float bloomThreshold;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+        float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float knee = 0.1;
+        float soft = luminance - bloomThreshold + knee;
+        soft = clamp(soft, 0.0, 2.0 * knee);
+        soft = (soft * soft) / (4.0 * knee + 0.00001);
+        float contribution = max(soft, luminance - bloomThreshold);
+        contribution /= max(luminance, 0.00001);
+        fragColor = vec4(color.rgb * contribution, color.a);
+      }
+    `;
+
+    const blur13ShaderChunk = `
+      vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+        vec2 resolution = vec2(textureSize(image, 0));
+        vec4 color = vec4(0.0);
+        vec2 off1 = vec2(1.411764705882353) * direction;
+        vec2 off2 = vec2(3.2941176470588234) * direction;
+        vec2 off3 = vec2(5.176470588235294) * direction;
+        color += texture(image, uv) * 0.1964825501511404;
+        color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+        color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+        color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+        color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+        return color;
+      }
+    `;
+
+    const blurFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform vec2 direction;
+      in vec2 vUv;
+      out vec4 color;
+      ${blur13ShaderChunk}
+      void main() {
+        color = blur13(inputTexture, vUv, direction);
+      }
+    `;
+
+    const godRaysDepthMaskShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float threshold;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+        float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float factor = smoothstep(threshold, threshold + 0.15, lum);
+        fragColor = vec4(vec3(factor), 1.0);
+      }
+    `;
+
+    const godRaysGenerateShader = `
+      precision highp float;
+      #define TAPS_PER_PASS 6.0
+      uniform sampler2D inputTexture;
+      uniform vec3 vSunPositionScreenSpace;
+      uniform float fStepSize;
+      uniform float distanceAttenuation;
+      uniform float maxDensity;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        vec2 delta = vSunPositionScreenSpace.xy - vUv;
+        float dist = length(delta);
+        vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+        float iters = dist / max(fStepSize, 0.00001);
+        vec2 uv = vUv;
+        float col = 0.0;
+        float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+        float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+        if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        uv += stepv;
+        if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        uv += stepv;
+        if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        uv += stepv;
+        if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        uv += stepv;
+        if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        uv += stepv;
+        if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+        float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+        fragColor = vec4(vec3(finalVal), 1.0);
+      }
+    `;
+
+    const anamorphicBrightShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float threshold;
+      uniform float smoothWidth;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+        float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+        fragColor = mix(vec4(0.0), color, alpha);
+      }
+    `;
+
+    const anamorphicBlurShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform vec2 resolution;
+      uniform float samples;
+      uniform float intensity;
+      uniform vec3 tintColor;
+      uniform float bloomRadius;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        int halfSamples = max(1, int(samples) / 2);
+        float fHalfSamples = float(halfSamples);
+        vec2 invSize = 1.0 / resolution;
+        vec4 total = vec4(0.0);
+        for (int i = -64; i <= 64; i++) {
+          if (i < -halfSamples || i > halfSamples) continue;
+          float softness = 1.0 - abs(float(i)) / fHalfSamples;
+          softness = pow(softness, 2.0);
+          vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+          shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+          total += texture(inputTexture, shiftedUV) * softness;
+        }
+        fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+      }
+    `;
+
+    const finalFragmentShader = `
+      precision highp float;
+      uniform vec2 resolution;
+      uniform sampler2D inputTexture;
+      uniform sampler2D blur0Texture;
+      uniform sampler2D blur1Texture;
+      uniform sampler2D blur2Texture;
+      uniform sampler2D blur3Texture;
+      uniform sampler2D blur4Texture;
+      uniform sampler2D raysTexture;
+      uniform sampler2D anamorphicTexture;
+      uniform bool bloomEnabled;
+      uniform float bloomStrength;
+      uniform bool raysEnabled;
+      uniform float raysStrength;
+      uniform vec3 raysColor;
+      uniform bool anamorphicEnabled;
+      uniform float vignetteBoost;
+      uniform float vignetteReduction;
+      uniform float noiseIntensity;
+      uniform float time;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      float vignette(vec2 uv, float boost, float reduction) {
+        vec2 position = vUv - 0.5;
+        return boost - length(position) * reduction;
+      }
+
+      float hash1(uint n) {
+        n = (n << 13U) ^ n;
+        n = n * (n * n * 15731U + 789221U) + 1376312589U;
+        return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+      }
+
+      float noise(in vec2 uv, in float timeVal) {
+        uvec2 p = uvec2(uv);
+        return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+      }
+
+      void main() {
+        vec4 color = texture(inputTexture, vUv);
+        if (bloomEnabled && bloomStrength > 0.001) {
+          vec4 b0 = texture(blur0Texture, vUv);
+          vec4 b1 = texture(blur1Texture, vUv);
+          vec4 b2 = texture(blur2Texture, vUv);
+          vec4 b3 = texture(blur3Texture, vUv);
+          vec4 b4 = texture(blur4Texture, vUv);
+          vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+          color += bloomSum * bloomStrength;
+        }
+        if (raysEnabled && raysStrength > 0.001) {
+          vec4 r = texture(raysTexture, vUv);
+          color.rgb += r.rgb * raysColor * raysStrength;
+        }
+        if (anamorphicEnabled) {
+          vec4 a = texture(anamorphicTexture, vUv);
+          color.rgb += a.rgb;
+        }
+        color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+        color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+        fragColor = vec4(color.rgb, 1.0);
+      }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+      vec2 barrelDistortion(vec2 coord, float amt) {
+        vec2 cc = coord - 0.5;
+        float dist = dot(cc, cc);
+        return coord + cc * dist * amt;
+      }
+      float sat(float t) { return clamp(t, 0.0, 1.0); }
+      float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+      float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+      vec4 spectrum_offset(float t) {
+        float lo = step(t, 0.5);
+        float hi = 1.0 - lo;
+        float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+        vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+        return pow(ret, vec4(1.0 / 2.2));
+      }
+      const float max_distort = 2.2;
+      const int num_iter = 8;
+      const float reci_num_iter_f = 1.0 / float(num_iter);
+      vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+        vec4 sumcol = vec4(0.0);
+        vec4 sumw = vec4(0.0);
+        for (int i = 0; i < num_iter; ++i) {
+          float t = float(i) * reci_num_iter_f;
+          vec4 w = spectrum_offset(t);
+          sumw += w;
+          sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+        }
+        return sumcol / sumw;
+      }
+    `;
+
+    const colorFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      uniform float chromaticAberrationAmount;
+      uniform float minInputLevel;
+      uniform float maxInputLevel;
+      uniform float gammaLevel;
+      uniform float exposure;
+      uniform float fisheyeStrength;
+      uniform float fisheyeRadius;
+      uniform float time;
+      uniform int visionMode;
+      uniform float thermalSensitivity;
+      uniform float nightVisionNoise;
+      uniform float nightVisionGain;
+      uniform float crtIntensity;
+      in vec2 vUv;
+      out vec4 fragColor;
+
+      ${chromaticAberrationShaderChunk}
+
+      vec2 applyFisheye(vec2 uv, float strength, float radius) {
+        if (abs(strength) < 0.0001) return uv;
+        vec2 p = uv - 0.5;
+        float d = length(p);
+        if (d > radius * 1.5) return uv;
+        float r = d / max(radius, 0.001);
+        float theta = atan(p.y, p.x);
+        float rDist = r + strength * (r * r * r);
+        return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+      }
+
+      vec3 ACESFilmicToneMapping(vec3 color) {
+        float a = 2.51;
+        float b = 0.03;
+        float c = 2.43;
+        float d = 0.59;
+        float e = 0.14;
+        return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+      }
+
+      vec3 gammaCorrect(vec3 color, vec3 gamma) {
+        return pow(max(color, vec3(0.0)), 1.0 / gamma);
+      }
+      vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+        return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+      }
+      vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+        return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+      }
+
+      void main() {
+        vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+        vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+        vec3 finalCol = col.rgb;
+        vec3 exposedColor = finalCol * exposure;
+        vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+        finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+        fragColor = vec4(finalCol, 1.0);
+      }
+    `;
+
+    const copyFragmentShader = `
+      precision highp float;
+      uniform sampler2D inputTexture;
+      in vec2 vUv;
+      out vec4 fragColor;
+      void main() {
+        fragColor = texture(inputTexture, vUv);
+      }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+          this.blurShader.uniforms.direction.value.set(stepOffset, 0);
+          this.blurShader.uniforms.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+          this.blurShader.uniforms.direction.value.set(0, stepOffset);
+          this.blurShader.uniforms.inputTexture.value = blurPass.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.85,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.55,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.18,
+          raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : false,
+          raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.6,
+          raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+          raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+          raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+          raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.15,
+          raysColor: new THREE.Color(0xffffff),
+          anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+          anamorphicIntensity: 4.0,
+          anamorphicThreshold: 0.3,
+          anamorphicSamples: 64,
+          anamorphicRadius: 0.0,
+          anamorphicSmoothWidth: 0.05,
+          anamorphicColor: new THREE.Color(0x7a8aff),
+          fisheyeStrength: 0.0,
+          fisheyeRadius: 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.012,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.1,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.6,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+          gamma: params.gamma !== undefined ? params.gamma : 1.05,
+          minInputLevel: 0.0,
+          maxInputLevel: 1.0,
+          exposure: 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+        this.bloomPass = new BloomPass(this.settings.bloomStrength, this.settings.bloomRadius, this.settings.bloomThreshold, 5);
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            raysEnabled: { value: false },
+            raysStrength: { value: 0 },
+            raysColor: { value: this.settings.raysColor },
+            anamorphicEnabled: { value: false },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            raysTexture: { value: null },
+            anamorphicTexture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: 0.0 },
+            fisheyeRadius: { value: 1.0 },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: 1.0 },
+            visionMode: { value: 0 },
+            thermalSensitivity: { value: 1.4 },
+            nightVisionGain: { value: 2.1 },
+            nightVisionNoise: { value: 0.05 },
+            crtIntensity: { value: 0.0 },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: { inputTexture: { value: null } },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+      }
+
+      setSize(w, h) {
+        this.sceneTarget.setSize(w, h);
+        this.bloomPass.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+
+        this.updateSettings();
+
+        this.bloomPass.source = this.sceneTarget.texture;
+        this.finalPass.shader.uniforms.inputTexture.value = this.sceneTarget.texture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.shader.uniforms.inputTexture.value = this.finalPass.texture;
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = 'Post-Processing Suite') {
+        const root = gui.addFolder(title);
+        root.add(this.settings, 'enabled').name('Enable Pipeline');
+
+        const bloom = root.addFolder('Atmospheric Bloom');
+        bloom.add(this.settings, 'bloomEnabled').name('Bloom Active').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomStrength', 0, 3.0, 0.05).name('Strength').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomRadius', 0, 2.0, 0.05).name('Radius').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomThreshold', 0, 1.0, 0.01).name('Threshold').onChange(() => this.updateSettings());
+
+        const lens = root.addFolder('Optics & Color Grade');
+        lens.add(this.settings, 'chromaticAberration', 0, 0.1, 0.002).name('Chromatic Aberration').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteBoost', 0.5, 2.0, 0.05).name('Vignette Boost').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteReduction', 0.1, 1.5, 0.05).name('Vignette Falloff').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'noiseIntensity', 0, 0.08, 0.002).name('Film Grain').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'gamma', 0.5, 2.0, 0.05).name('Gamma').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'exposure', 0.5, 2.0, 0.05).name('Exposure').onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // --- 18 PRECONFIGURED COLOR SCHEMES ---
+    const COLOR_SCHEMES = {
+      '1. Monochromatic': {
+        cartColor: '#2563eb',
+        wireColor: '#60a5fa',
+        accentColor: '#93c5fd',
+        frameColor: '#1d4ed8',
+        conveyorColor: '#1e293b',
+        bgColor: '#070d1e',
+        lightColor: '#bfdbfe'
+      },
+      '2. Analogous': {
+        cartColor: '#ea580c',
+        wireColor: '#f97316',
+        accentColor: '#f43f5e',
+        frameColor: '#c2410c',
+        conveyorColor: '#2b1016',
+        bgColor: '#16080e',
+        lightColor: '#fed7aa'
+      },
+      '3. Complementary': {
+        cartColor: '#0891b2',
+        wireColor: '#22d3ee',
+        accentColor: '#f97316',
+        frameColor: '#0e7490',
+        conveyorColor: '#13212c',
+        bgColor: '#04151e',
+        lightColor: '#cffafe'
+      },
+      '4. Split-complementary': {
+        cartColor: '#c026d3',
+        wireColor: '#e879f9',
+        accentColor: '#84cc16',
+        frameColor: '#9333ea',
+        conveyorColor: '#27112c',
+        bgColor: '#120516',
+        lightColor: '#fae8ff'
+      },
+      '5. Triadic': {
+        cartColor: '#4f46e5',
+        wireColor: '#818cf8',
+        accentColor: '#f43f5e',
+        frameColor: '#3730a3',
+        conveyorColor: '#065f46',
+        bgColor: '#0c0d21',
+        lightColor: '#e0e7ff'
+      },
+      '6. Tetradic': {
+        cartColor: '#2563eb',
+        wireColor: '#ec4899',
+        accentColor: '#eab308',
+        frameColor: '#059669',
+        conveyorColor: '#1e293b',
+        bgColor: '#080d1a',
+        lightColor: '#f0fdf4'
+      },
+      '7. Double split-complementary': {
+        cartColor: '#7c3aed',
+        wireColor: '#f43f5e',
+        accentColor: '#10b981',
+        frameColor: '#6d28d9',
+        conveyorColor: '#2a123d',
+        bgColor: '#10051b',
+        lightColor: '#f5f3ff'
+      },
+      '8. Achromatic (black and white)': {
+        cartColor: '#18181b',
+        wireColor: '#3f3f46',
+        accentColor: '#ffffff',
+        frameColor: '#27272a',
+        conveyorColor: '#121214',
+        bgColor: '#070709',
+        lightColor: '#ffffff'
+      },
+      '9. Achromatic (white and black)': {
+        cartColor: '#f8fafc',
+        wireColor: '#cbd5e1',
+        accentColor: '#0f172a',
+        frameColor: '#e2e8f0',
+        conveyorColor: '#334155',
+        bgColor: '#f1f5f9',
+        lightColor: '#ffffff'
+      },
+      '10. Neutral + accent': {
+        cartColor: '#78716c',
+        wireColor: '#a8a29e',
+        accentColor: '#ff5400',
+        frameColor: '#57534e',
+        conveyorColor: '#292524',
+        bgColor: '#141211',
+        lightColor: '#ffedd5'
+      },
+      '11. Palette (F6AA1C, BC3908...)': {
+        cartColor: '#F6AA1C',
+        wireColor: '#BC3908',
+        accentColor: '#941B0C',
+        frameColor: '#BC3908',
+        conveyorColor: '#F6AA1C',
+        bgColor: '#220901',
+        lightColor: '#F6AA1C'
+      },
+      '12. Palette (63D1CF, 5BC0BE...)': {
+        cartColor: '#63D1CF',
+        wireColor: '#5BC0BE',
+        accentColor: '#4BAD9E',
+        frameColor: '#4BAD9E',
+        conveyorColor: '#0B132B',
+        bgColor: '#000000',
+        lightColor: '#63D1CF'
+      },
+      '13. Palette (AA60C8, D69ADE...)': {
+        cartColor: '#AA60C8',
+        wireColor: '#D69ADE',
+        accentColor: '#C9A3C6',
+        frameColor: '#CFB5C2',
+        conveyorColor: '#120A12',
+        bgColor: '#0D001D',
+        lightColor: '#D69ADE'
+      },
+      '14. Palette (FEF1BE, FFBA00...)': {
+        cartColor: '#FFBA00',
+        wireColor: '#008189',
+        accentColor: '#FEF1BE',
+        frameColor: '#00474D',
+        conveyorColor: '#00474D',
+        bgColor: '#061210',
+        lightColor: '#FEF1BE'
+      },
+      '15. Palette (D4FFB0, 7FFF00...)': {
+        cartColor: '#7FFF00',
+        wireColor: '#00B894',
+        accentColor: '#D4FFB0',
+        frameColor: '#0A3322',
+        conveyorColor: '#0A3322',
+        bgColor: '#05140A',
+        lightColor: '#D4FFB0'
+      },
+      '16. Palette (FFE8CC, FF8C00...)': {
+        cartColor: '#FF8C00',
+        wireColor: '#C7501A',
+        accentColor: '#FFE8CC',
+        frameColor: '#3D1050',
+        conveyorColor: '#3D1050',
+        bgColor: '#0E0618',
+        lightColor: '#FFE8CC'
+      },
+      '17. Palette (E8E0FF, B38FFF...)': {
+        cartColor: '#6A3DE8',
+        wireColor: '#B38FFF',
+        accentColor: '#E8E0FF',
+        frameColor: '#1A1250',
+        conveyorColor: '#1A1250',
+        bgColor: '#090612',
+        lightColor: '#E8E0FF'
+      },
+      '18. Palette (E0FBFF, 00F0FF...)': {
+        cartColor: '#00F0FF',
+        wireColor: '#D40078',
+        accentColor: '#E0FBFF',
+        frameColor: '#1E0A3D',
+        conveyorColor: '#1E0A3D',
+        bgColor: '#05020F',
+        lightColor: '#E0FBFF'
+      }
+    };
+
+    // --- MATERIAL STYLES ---
+    const MATERIAL_STYLES = {
+      'Chrome / Metallic': { metalness: 0.95, roughness: 0.12, clearcoat: 0.8 },
+      'Clay Render': { metalness: 0.05, roughness: 0.88, clearcoat: 0.0 },
+      'Glossy Enamel': { metalness: 0.20, roughness: 0.25, clearcoat: 0.9 },
+      'Frosted Translucent': { metalness: 0.15, roughness: 0.45, clearcoat: 0.4 },
+      'Satin Metal': { metalness: 0.80, roughness: 0.35, clearcoat: 0.3 }
+    };
+
+    // --- 8 CAMERA ANIMATION PRESETS ---
+    const ANIM_PRESETS = [
+      '1. Diagonal Conveyor Glide',
+      '2. Smooth Orbit Turntable',
+      '3. Conveyor Tracking Follow',
+      '4. Ascending Wave Drift',
+      '5. Isometric Architectural Stream',
+      '6. Cinematic Low-Angle Float',
+      '7. Spiral Vortex Rise',
+      '8. Static Camera (Zero Move)'
+    ];
+
+    // --- APPLICATION PARAMETERS ---
+    const params = {
+      colorScheme: '1. Monochromatic',
+      greenscreen: false,
+      cartColor: COLOR_SCHEMES['1. Monochromatic'].cartColor,
+      wireColor: COLOR_SCHEMES['1. Monochromatic'].wireColor,
+      accentColor: COLOR_SCHEMES['1. Monochromatic'].accentColor,
+      frameColor: COLOR_SCHEMES['1. Monochromatic'].frameColor,
+      conveyorColor: COLOR_SCHEMES['1. Monochromatic'].conveyorColor,
+      bgColor: COLOR_SCHEMES['1. Monochromatic'].bgColor,
+      lightColor: COLOR_SCHEMES['1. Monochromatic'].lightColor,
+
+      materialStyle: 'Chrome / Metallic',
+      metalness: MATERIAL_STYLES['Chrome / Metallic'].metalness,
+      roughness: MATERIAL_STYLES['Chrome / Metallic'].roughness,
+      clearcoat: MATERIAL_STYLES['Chrome / Metallic'].clearcoat,
+
+      animPreset: '1. Diagonal Conveyor Glide',
+      speed: 1.0,
+      wobble: 0.25,
+
+      itemCount: 26,
+      showGroceries: true,
+      conveyorRails: true,
+      floorShadow: true,
+
+      clickRandomize: true,
+      dpr: Math.min(window.devicePixelRatio || 1, 2)
+    };
+
+    // --- SETUP THREE.JS SCENE ---
+    const canvas = document.getElementById('webgl-canvas');
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      alpha: false,
+      powerPreference: 'high-performance'
+    });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(params.dpr);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.bgColor);
+    scene.fog = new THREE.FogExp2(params.bgColor, 0.015);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 220);
+    camera.position.set(19, 13, 23);
+
+    // OrbitControls: Full wheel zoom and screen drag support
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enableZoom = true;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.target.set(0, 1.2, 0);
+    controls.maxDistance = 85;
+    controls.minDistance = 3;
+
+    // --- LIGHTING SETUP ---
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+    scene.add(ambientLight);
+
+    const dirLightKey = new THREE.DirectionalLight(params.lightColor, 2.4);
+    dirLightKey.position.set(26, 34, 22);
+    dirLightKey.castShadow = true;
+    dirLightKey.shadow.mapSize.width = 2048;
+    dirLightKey.shadow.mapSize.height = 2048;
+    dirLightKey.shadow.camera.near = 5;
+    dirLightKey.shadow.camera.far = 90;
+    dirLightKey.shadow.camera.left = -32;
+    dirLightKey.shadow.camera.right = 32;
+    dirLightKey.shadow.camera.top = 32;
+    dirLightKey.shadow.camera.bottom = -32;
+    dirLightKey.shadow.bias = -0.0004;
+    dirLightKey.shadow.normalBias = 0.02;
+    scene.add(dirLightKey);
+
+    const dirLightFill = new THREE.DirectionalLight(0xffffff, 0.9);
+    dirLightFill.position.set(-22, 16, -20);
+    scene.add(dirLightFill);
+
+    const dirLightRim = new THREE.DirectionalLight(params.lightColor, 1.8);
+    dirLightRim.position.set(0, 12, -34);
+    scene.add(dirLightRim);
+
+    // --- SHARED MATERIAL INSTANCES ---
+    const matCartMain = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.cartColor),
+      metalness: params.metalness,
+      roughness: params.roughness
+    });
+
+    const matCartWire = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.wireColor),
+      metalness: params.metalness,
+      roughness: params.roughness
+    });
+
+    const matCartAccent = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.accentColor),
+      metalness: 0.12,
+      roughness: 0.28
+    });
+
+    const matCartFrame = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.frameColor),
+      metalness: Math.max(params.metalness, 0.75),
+      roughness: Math.min(params.roughness, 0.3)
+    });
+
+    const matCartWheels = new THREE.MeshStandardMaterial({
+      color: 0x18181b,
+      metalness: 0.2,
+      roughness: 0.75
+    });
+
+    const matGoodsA = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35 });
+    const matGoodsB = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
+
+    // Conveyor procedural texture
+    function createConveyorTexture() {
+      const texCanvas = document.createElement('canvas');
+      texCanvas.width = 512;
+      texCanvas.height = 1024;
+      const ctx = texCanvas.getContext('2d');
+
+      ctx.fillStyle = '#171920';
+      ctx.fillRect(0, 0, 512, 1024);
+
+      // Grooves / ribbed rubber slats
+      for (let y = 0; y < 1024; y += 16) {
+        ctx.fillStyle = '#262934';
+        ctx.fillRect(0, y, 512, 11);
+        ctx.fillStyle = '#0e1014';
+        ctx.fillRect(0, y + 11, 512, 5);
+      }
+
+      // Yellow / accent safety warning edge borders
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(16, 0, 10, 1024);
+      ctx.fillRect(512 - 26, 0, 10, 1024);
+
+      // Center dashed guidance markers
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      for (let y = 0; y < 1024; y += 48) {
+        ctx.fillRect(251, y, 10, 24);
+      }
+
+      const texture = new THREE.CanvasTexture(texCanvas);
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.repeat.set(1, 14);
+      return texture;
+    }
+
+    const conveyorTexture = createConveyorTexture();
+
+    const matConveyorBelt = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.conveyorColor),
+      map: conveyorTexture,
+      roughness: 0.38,
+      metalness: 0.22
+    });
+
+    const matConveyorRail = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.frameColor),
+      metalness: 0.92,
+      roughness: 0.15
+    });
+
+    // Floor contact shadow receiver plane
+    const geoFloor = new THREE.PlaneGeometry(180, 180);
+    const matFloor = new THREE.ShadowMaterial({ opacity: 0.38 });
+    const floorMesh = new THREE.Mesh(geoFloor, matFloor);
+    floorMesh.rotation.x = -Math.PI / 2;
+    floorMesh.position.y = -9.0;
+    floorMesh.receiveShadow = true;
+    scene.add(floorMesh);
+
+    // --- CONVEYOR SPLINE & PATH (GRACEFUL FLOWING S-CURVE) ---
+    const curvePoints = [
+      new THREE.Vector3(-38, 9.5, -24),
+      new THREE.Vector3(-22, 6.2, -15),
+      new THREE.Vector3(-8, 3.2, -5),
+      new THREE.Vector3(6, 0.8, 6),
+      new THREE.Vector3(20, -1.2, 16),
+      new THREE.Vector3(34, -3.2, 24),
+      new THREE.Vector3(46, -5.0, 30)
+    ];
+    const curve = new THREE.CatmullRomCurve3(curvePoints);
+    curve.curveType = 'centripetal';
+    curve.tension = 0.5;
+
+    // Build extruded ribbon conveyor geometry
+    const conveyorGroup = new THREE.Group();
+    scene.add(conveyorGroup);
+
+    function buildConveyorGeometry() {
+      while (conveyorGroup.children.length > 0) {
+        const obj = conveyorGroup.children[0];
+        conveyorGroup.remove(obj);
+        if (obj.geometry) obj.geometry.dispose();
+      }
+
+      const numSegments = 160;
+      const beltWidth = 3.6;
+      const vertices = [];
+      const uvs = [];
+      const indices = [];
+
+      for (let i = 0; i <= numSegments; i++) {
+        const t = i / numSegments;
+        const pt = curve.getPointAt(t);
+        const tangent = curve.getTangentAt(t).normalize();
+        const up = new THREE.Vector3(0, 1, 0);
+        const binormal = new THREE.Vector3().crossVectors(tangent, up).normalize();
+
+        const leftPt = pt.clone().addScaledVector(binormal, beltWidth / 2);
+        const rightPt = pt.clone().addScaledVector(binormal, -beltWidth / 2);
+
+        vertices.push(leftPt.x, leftPt.y, leftPt.z);
+        vertices.push(rightPt.x, rightPt.y, rightPt.z);
+
+        uvs.push(0, t);
+        uvs.push(1, t);
+
+        if (i < numSegments) {
+          const row1 = i * 2;
+          const row2 = (i + 1) * 2;
+          indices.push(row1, row1 + 1, row2);
+          indices.push(row1 + 1, row2 + 1, row2);
+        }
+      }
+
+      const beltGeo = new THREE.BufferGeometry();
+      beltGeo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+      beltGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      beltGeo.setIndex(indices);
+      beltGeo.computeVertexNormals();
+
+      const beltMesh = new THREE.Mesh(beltGeo, matConveyorBelt);
+      beltMesh.receiveShadow = true;
+      conveyorGroup.add(beltMesh);
+
+      // Rails and Support Architecture
+      if (params.conveyorRails) {
+        const leftRailPoints = [];
+        const rightRailPoints = [];
+        for (let i = 0; i <= 100; i++) {
+          const t = i / 100;
+          const pt = curve.getPointAt(t);
+          const tangent = curve.getTangentAt(t).normalize();
+          const up = new THREE.Vector3(0, 1, 0);
+          const binormal = new THREE.Vector3().crossVectors(tangent, up).normalize();
+
+          leftRailPoints.push(pt.clone().addScaledVector(binormal, beltWidth / 2 + 0.18).add(new THREE.Vector3(0, 0.35, 0)));
+          rightRailPoints.push(pt.clone().addScaledVector(binormal, -beltWidth / 2 - 0.18).add(new THREE.Vector3(0, 0.35, 0)));
+        }
+
+        const leftRailCurve = new THREE.CatmullRomCurve3(leftRailPoints);
+        const rightRailCurve = new THREE.CatmullRomCurve3(rightRailPoints);
+
+        const leftRailGeo = new THREE.TubeGeometry(leftRailCurve, 100, 0.09, 8, false);
+        const rightRailGeo = new THREE.TubeGeometry(rightRailCurve, 100, 0.09, 8, false);
+
+        const leftRailMesh = new THREE.Mesh(leftRailGeo, matConveyorRail);
+        const rightRailMesh = new THREE.Mesh(rightRailGeo, matConveyorRail);
+        leftRailMesh.castShadow = true;
+        rightRailMesh.castShadow = true;
+        conveyorGroup.add(leftRailMesh);
+        conveyorGroup.add(rightRailMesh);
+
+        // Support pylons with sturdy base plates
+        const pylonT = [0.10, 0.30, 0.50, 0.70, 0.90];
+        pylonT.forEach(t => {
+          const pt = curve.getPointAt(t);
+          const pylonHeight = pt.y - (-9.0);
+          if (pylonHeight > 0.5) {
+            const pylonGeo = new THREE.CylinderGeometry(0.24, 0.36, pylonHeight, 16);
+            const pylon = new THREE.Mesh(pylonGeo, matConveyorRail);
+            pylon.position.set(pt.x, pt.y - pylonHeight / 2 - 0.08, pt.z);
+            pylon.castShadow = true;
+            pylon.receiveShadow = true;
+            conveyorGroup.add(pylon);
+
+            // Circular footplate
+            const footGeo = new THREE.CylinderGeometry(0.7, 0.8, 0.12, 16);
+            const foot = new THREE.Mesh(footGeo, matConveyorRail);
+            foot.position.set(pt.x, -8.94, pt.z);
+            foot.castShadow = true;
+            foot.receiveShadow = true;
+            conveyorGroup.add(foot);
+
+            // Heavy cross-beam cradle under belt
+            const braceGeo = new THREE.BoxGeometry(beltWidth + 0.5, 0.2, 0.45);
+            const brace = new THREE.Mesh(braceGeo, matConveyorRail);
+            brace.position.set(pt.x, pt.y - 0.12, pt.z);
+            brace.castShadow = true;
+            conveyorGroup.add(brace);
+          }
+        });
+      }
+    }
+
+    buildConveyorGeometry();
+
+    // =========================================================================
+    // 3D REALISTIC SHOPPING CART (ZERO-GAP CONTINUOUS STRUCTURAL FRAME)
+    // =========================================================================
+    function createShoppingCartModel() {
+      const cartGroup = new THREE.Group();
+      const wheels = [];
+
+      // Geometric key heights (wheel contact sits exactly on belt surface y = 0.0)
+      const wheelY = 0.18;
+      const chassisY = 0.32;
+      const basketFloorY = 0.58;
+      const basketHeightFront = 0.75;
+      const basketHeightRear = 1.02;
+
+      // Chassis bounds
+      const cRearW = 1.22;
+      const cFrontW = 0.98;
+      const cLen = 1.85;
+
+      // 1. Lower Undercarriage Frame
+      const chassisGroup = new THREE.Group();
+
+      // Rear Axle Transverse Bar
+      const rearAxleGeo = new THREE.CylinderGeometry(0.045, 0.045, cRearW, 8);
+      const rearAxle = new THREE.Mesh(rearAxleGeo, matCartFrame);
+      rearAxle.rotation.z = Math.PI / 2;
+      rearAxle.position.set(0, chassisY, -cLen / 2 + 0.15);
+      rearAxle.castShadow = true;
+      chassisGroup.add(rearAxle);
+
+      // Front Axle Transverse Bar
+      const frontAxleGeo = new THREE.CylinderGeometry(0.045, 0.045, cFrontW, 8);
+      const frontAxle = new THREE.Mesh(frontAxleGeo, matCartFrame);
+      frontAxle.rotation.z = Math.PI / 2;
+      frontAxle.position.set(0, chassisY, cLen / 2 - 0.15);
+      frontAxle.castShadow = true;
+      chassisGroup.add(frontAxle);
+
+      // Left & Right Longitudinal Lower Frame Tubes
+      const sideFrameLen = Math.hypot(cLen - 0.3, (cRearW - cFrontW) / 2);
+      const sideFrameGeo = new THREE.CylinderGeometry(0.045, 0.045, sideFrameLen, 8);
+
+      const sideFrameL = new THREE.Mesh(sideFrameGeo, matCartFrame);
+      sideFrameL.rotation.x = Math.PI / 2;
+      sideFrameL.rotation.z = Math.atan2((cRearW - cFrontW) / 2, cLen - 0.3);
+      sideFrameL.position.set(-(cRearW + cFrontW) / 4, chassisY, 0);
+      sideFrameL.castShadow = true;
+      chassisGroup.add(sideFrameL);
+
+      const sideFrameR = sideFrameL.clone();
+      sideFrameR.rotation.z = -sideFrameL.rotation.z;
+      sideFrameR.position.x = (cRearW + cFrontW) / 4;
+      chassisGroup.add(sideFrameR);
+
+      // Lower Wire Shelf (Undershelf Rack)
+      const shelfSlatGeo = new THREE.CylinderGeometry(0.015, 0.015, cLen - 0.45, 6);
+      for (let s = -3; s <= 3; s++) {
+        const slat = new THREE.Mesh(shelfSlatGeo, matCartWire);
+        slat.rotation.x = Math.PI / 2;
+        slat.position.set(s * 0.12, chassisY + 0.02, 0);
+        slat.castShadow = true;
+        chassisGroup.add(slat);
+      }
+
+      // 2. Wheels and Caster Mounts
+      const wheelPositions = [
+        [-cFrontW / 2 + 0.02, wheelY, cLen / 2 - 0.15],
+        [ cFrontW / 2 - 0.02, wheelY, cLen / 2 - 0.15],
+        [-cRearW / 2 + 0.02,  wheelY, -cLen / 2 + 0.15],
+        [ cRearW / 2 - 0.02,  wheelY, -cLen / 2 + 0.15]
+      ];
+
+      const wheelGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.08, 16);
+      const forkGeo = new THREE.CylinderGeometry(0.035, 0.035, 0.18, 8);
+
+      wheelPositions.forEach(pos => {
+        // Caster fork linking chassis directly to wheel axle
+        const fork = new THREE.Mesh(forkGeo, matCartFrame);
+        fork.position.set(pos[0], pos[1] + 0.07, pos[2]);
+        fork.castShadow = true;
+        chassisGroup.add(fork);
+
+        // Wheel body with dark rubber tire
+        const wheel = new THREE.Mesh(wheelGeo, matCartWheels);
+        wheel.rotation.z = Math.PI / 2;
+        wheel.position.set(pos[0], pos[1], pos[2]);
+        wheel.castShadow = true;
+        chassisGroup.add(wheel);
+        wheels.push(wheel);
+
+        // Accent colored hubcap
+        const hubGeo = new THREE.CylinderGeometry(0.07, 0.07, 0.09, 12);
+        const hub = new THREE.Mesh(hubGeo, matCartAccent);
+        hub.rotation.z = Math.PI / 2;
+        hub.position.set(pos[0], pos[1], pos[2]);
+        chassisGroup.add(hub);
+      });
+
+      cartGroup.add(chassisGroup);
+
+      // 3. VERTICAL CONNECTING FRAMEWORK (BRIDGING THE GAP COMPLETELY)
+      const frameRiserGroup = new THREE.Group();
+
+      // Front Upright Struts (connecting lower frame front to basket bottom front)
+      const frontRiserH = basketFloorY - chassisY;
+      const frontRiserGeo = new THREE.CylinderGeometry(0.04, 0.04, frontRiserH, 8);
+
+      const frontRiserL = new THREE.Mesh(frontRiserGeo, matCartFrame);
+      frontRiserL.position.set(-cFrontW / 2 + 0.04, chassisY + frontRiserH / 2, cLen / 2 - 0.15);
+      frontRiserL.castShadow = true;
+      frameRiserGroup.add(frontRiserL);
+
+      const frontRiserR = frontRiserL.clone();
+      frontRiserR.position.x = cFrontW / 2 - 0.04;
+      frameRiserGroup.add(frontRiserR);
+
+      // Diagonal Center Braces (connecting lower chassis to basket underside)
+      const diagStrutLen = Math.hypot(0.35, basketFloorY - chassisY);
+      const diagStrutGeo = new THREE.CylinderGeometry(0.038, 0.038, diagStrutLen, 8);
+
+      const diagStrutL = new THREE.Mesh(diagStrutGeo, matCartFrame);
+      diagStrutL.rotation.x = Math.atan2(0.35, basketFloorY - chassisY);
+      diagStrutL.position.set(-cRearW / 2 + 0.12, chassisY + frontRiserH / 2, -0.05);
+      diagStrutL.castShadow = true;
+      frameRiserGroup.add(diagStrutL);
+
+      const diagStrutR = diagStrutL.clone();
+      diagStrutR.position.x = cRearW / 2 - 0.12;
+      frameRiserGroup.add(diagStrutR);
+
+      // Rear Main Spine Columns: continuous from rear axle ALL THE WAY through basket rear to the handlebar!
+      const spineLen = (basketFloorY + basketHeightRear + 0.45) - chassisY;
+      const spineGeo = new THREE.CylinderGeometry(0.045, 0.045, spineLen, 10);
+
+      const spineL = new THREE.Mesh(spineGeo, matCartFrame);
+      spineL.rotation.x = -Math.PI / 16;
+      spineL.position.set(-cRearW / 2 - 0.02, chassisY + spineLen / 2, -cLen / 2 + 0.08);
+      spineL.castShadow = true;
+      frameRiserGroup.add(spineL);
+
+      const spineR = spineL.clone();
+      spineR.position.x = cRearW / 2 + 0.02;
+      frameRiserGroup.add(spineR);
+
+      // Transverse handlebar tube connecting both spines at the top
+      const handleBarW = cRearW + 0.18;
+      const handleBarGeo = new THREE.CylinderGeometry(0.045, 0.045, handleBarW, 12);
+      const handleBar = new THREE.Mesh(handleBarGeo, matCartFrame);
+      handleBar.rotation.z = Math.PI / 2;
+      handleBar.position.set(0, chassisY + spineLen - 0.05, -cLen / 2 - 0.16);
+      handleBar.castShadow = true;
+      frameRiserGroup.add(handleBar);
+
+      // Ergonomic ribbed sleeve in accent color
+      const gripGeo = new THREE.CylinderGeometry(0.068, 0.068, handleBarW * 0.72, 12);
+      const grip = new THREE.Mesh(gripGeo, matCartAccent);
+      grip.rotation.z = Math.PI / 2;
+      grip.position.copy(handleBar.position);
+      grip.castShadow = true;
+      frameRiserGroup.add(grip);
+
+      cartGroup.add(frameRiserGroup);
+
+      // 4. Basket Wire Cage (sitting firmly anchored on the support framework at basketFloorY)
+      const basketGroup = new THREE.Group();
+      const bFrontW = 1.0;
+      const bRearW = 1.3;
+      const bLen = 1.8;
+
+      // Basket Bottom Perimeter Frame & Slotted Floor Mesh
+      const bottomFloorGeo = new THREE.BoxGeometry(bFrontW * 0.94, 0.025, bLen * 0.94);
+      const bottomFloor = new THREE.Mesh(bottomFloorGeo, matCartWire);
+      bottomFloor.position.set(0, basketFloorY, 0);
+      bottomFloor.castShadow = true;
+      basketGroup.add(bottomFloor);
+
+      // Top Rim Tubular Bar
+      const topRimRadius = 0.036;
+
+      // Front top bar
+      const topFrontGeo = new THREE.CylinderGeometry(topRimRadius, topRimRadius, bFrontW, 8);
+      const topFront = new THREE.Mesh(topFrontGeo, matCartWire);
+      topFront.rotation.z = Math.PI / 2;
+      topFront.position.set(0, basketFloorY + basketHeightFront, bLen / 2);
+      topFront.castShadow = true;
+      basketGroup.add(topFront);
+
+      // Rear top bar
+      const topRearGeo = new THREE.CylinderGeometry(topRimRadius, topRimRadius, bRearW, 8);
+      const topRear = new THREE.Mesh(topRearGeo, matCartWire);
+      topRear.rotation.z = Math.PI / 2;
+      topRear.position.set(0, basketFloorY + basketHeightRear, -bLen / 2 + 0.05);
+      topRear.castShadow = true;
+      basketGroup.add(topRear);
+
+      // Side top sloped bars
+      const topSideLen = Math.hypot(bLen - 0.05, basketHeightRear - basketHeightFront);
+      const topSideGeo = new THREE.CylinderGeometry(topRimRadius, topRimRadius, topSideLen, 8);
+
+      const topSideL = new THREE.Mesh(topSideGeo, matCartWire);
+      topSideL.rotation.x = Math.atan2(basketHeightRear - basketHeightFront, bLen) - Math.PI / 2;
+      topSideL.position.set(-(bFrontW + bRearW) / 4, basketFloorY + (basketHeightFront + basketHeightRear) / 2, 0.02);
+      topSideL.castShadow = true;
+      basketGroup.add(topSideL);
+
+      const topSideR = topSideL.clone();
+      topSideR.position.x = (bFrontW + bRearW) / 4;
+      basketGroup.add(topSideR);
+
+      // Vertical wire ribs on basket sides
+      const numRibs = 10;
+      const wireR = 0.016;
+      for (let i = 0; i <= numRibs; i++) {
+        const u = i / numRibs;
+        const z = -bLen / 2 + 0.05 + u * (bLen - 0.05);
+        const w = THREE.MathUtils.lerp(bRearW, bFrontW, u) / 2;
+        const h = THREE.MathUtils.lerp(basketHeightRear, basketHeightFront, u);
+
+        const ribGeo = new THREE.CylinderGeometry(wireR, wireR, h, 6);
+
+        const ribL = new THREE.Mesh(ribGeo, matCartWire);
+        ribL.position.set(-w, basketFloorY + h / 2, z);
+        ribL.castShadow = true;
+        basketGroup.add(ribL);
+
+        const ribR = ribL.clone();
+        ribR.position.x = w;
+        basketGroup.add(ribR);
+      }
+
+      // Front vertical wires
+      for (let f = -3; f <= 3; f++) {
+        const fRibGeo = new THREE.CylinderGeometry(wireR, wireR, basketHeightFront, 6);
+        const fRib = new THREE.Mesh(fRibGeo, matCartWire);
+        fRib.position.set(f * (bFrontW / 8), basketFloorY + basketHeightFront / 2, bLen / 2);
+        fRib.castShadow = true;
+        basketGroup.add(fRib);
+      }
+
+      // Horizontal wrapping wire hoops
+      for (let j = 1; j <= 3; j++) {
+        const v = j / 4;
+        const loopSideL = topSideL.clone();
+        loopSideL.position.y = basketFloorY + THREE.MathUtils.lerp(basketHeightFront, basketHeightRear, 0.5) * v;
+        loopSideL.scale.set(0.7, 1, 0.7);
+        basketGroup.add(loopSideL);
+
+        const loopSideR = topSideR.clone();
+        loopSideR.position.y = loopSideL.position.y;
+        loopSideR.scale.set(0.7, 1, 0.7);
+        basketGroup.add(loopSideR);
+      }
+
+      // Protective front corner bumpers in accent color
+      const bumperGeo = new THREE.SphereGeometry(0.085, 8, 8);
+      const bumperL = new THREE.Mesh(bumperGeo, matCartAccent);
+      bumperL.position.set(-bFrontW / 2, basketFloorY + basketHeightFront, bLen / 2);
+      basketGroup.add(bumperL);
+
+      const bumperR = bumperL.clone();
+      bumperR.position.x = bFrontW / 2;
+      basketGroup.add(bumperR);
+
+      // Child seat flap inside rear
+      const seatPlateGeo = new THREE.BoxGeometry(bRearW * 0.62, 0.38, 0.025);
+      const seatPlate = new THREE.Mesh(seatPlateGeo, matCartAccent);
+      seatPlate.position.set(0, basketFloorY + basketHeightRear * 0.52, -bLen / 2 + 0.22);
+      seatPlate.rotation.x = Math.PI / 12;
+      seatPlate.castShadow = true;
+      basketGroup.add(seatPlate);
+
+      cartGroup.add(basketGroup);
+
+      // 5. Stylized Minimalist Groceries Inside Basket
+      const goodsGroup = new THREE.Group();
+      goodsGroup.name = 'goods';
+
+      // Item 1: Milk / Juice Carton
+      const cartonGeo = new THREE.BoxGeometry(0.35, 0.55, 0.35);
+      const carton = new THREE.Mesh(cartonGeo, matGoodsA);
+      carton.position.set(-0.24, basketFloorY + 0.3, 0.15);
+      carton.rotation.y = 0.35;
+      carton.castShadow = true;
+      goodsGroup.add(carton);
+
+      // Item 2: Modern Beverage Can
+      const canGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.42, 16);
+      const can = new THREE.Mesh(canGeo, matGoodsB);
+      can.position.set(0.28, basketFloorY + 0.22, -0.2);
+      can.castShadow = true;
+      goodsGroup.add(can);
+
+      // Item 3: Geometric Fruit Sphere / Box
+      const fruitGeo = new THREE.SphereGeometry(0.22, 16, 16);
+      const fruit = new THREE.Mesh(fruitGeo, matCartAccent);
+      fruit.position.set(0.06, basketFloorY + 0.22, 0.36);
+      fruit.castShadow = true;
+      goodsGroup.add(fruit);
+
+      goodsGroup.visible = params.showGroceries;
+      cartGroup.add(goodsGroup);
+
+      cartGroup.userData.wheels = wheels;
+      return cartGroup;
+    }
+
+    // --- INSTANTIATE FLOW STREAM CARTS ---
+    const streamContainer = new THREE.Group();
+    scene.add(streamContainer);
+
+    let streamItems = [];
+
+    function rebuildStream() {
+      while (streamContainer.children.length > 0) {
+        streamContainer.remove(streamContainer.children[0]);
+      }
+      streamItems = [];
+
+      const count = params.itemCount;
+      for (let i = 0; i < count; i++) {
+        const itemMesh = createShoppingCartModel();
+
+        // Stagger groceries for organic variety
+        const goods = itemMesh.getObjectByName('goods');
+        if (goods) {
+          if (i % 3 === 0) {
+            goods.scale.set(0.9, 0.9, 0.9);
+          } else if (i % 3 === 1) {
+            goods.children[0].visible = true;
+            goods.children[1].visible = false;
+            goods.children[2].visible = true;
+          } else {
+            goods.children[0].visible = false;
+            goods.children[1].visible = true;
+            goods.children[2].visible = false;
+          }
+        }
+
+        const offset = i / count;
+        itemMesh.userData.offset = offset;
+        itemMesh.userData.index = i;
+        itemMesh.userData.wobblePhase = Math.random() * Math.PI * 2;
+
+        streamContainer.add(itemMesh);
+        streamItems.push(itemMesh);
+      }
+    }
+
+    rebuildStream();
+
+    // --- INITIALIZE POST PROCESSOR PIPELINE ---
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomEnabled: true,
+      bloomStrength: 0.85,
+      bloomRadius: 0.55,
+      bloomThreshold: 0.18,
+      chromaticAberration: 0.012,
+      vignetteBoost: 1.1,
+      vignetteReduction: 0.6,
+      noiseIntensity: 0.012,
+      gamma: 1.05
+    });
+
+    // --- APPLY COLOR SCHEME ---
+    function applyColorScheme(schemeKey) {
+      const s = COLOR_SCHEMES[schemeKey];
+      if (!s) return;
+
+      params.colorScheme = schemeKey;
+      params.cartColor = s.cartColor;
+      params.wireColor = s.wireColor;
+      params.accentColor = s.accentColor;
+      params.frameColor = s.frameColor;
+      params.conveyorColor = s.conveyorColor;
+      params.bgColor = s.bgColor;
+      params.lightColor = s.lightColor;
+
+      matCartMain.color.set(params.cartColor);
+      matCartWire.color.set(params.wireColor);
+      matCartAccent.color.set(params.accentColor);
+      matCartFrame.color.set(params.frameColor);
+      matConveyorBelt.color.set(params.conveyorColor);
+      matConveyorRail.color.set(params.frameColor);
+
+      matGoodsA.color.set(params.accentColor);
+      matGoodsB.color.set(params.cartColor);
+
+      dirLightKey.color.set(params.lightColor);
+      dirLightRim.color.set(params.lightColor);
+
+      updateGreenscreen(params.greenscreen);
+    }
+
+    // --- GREENSCREEN SUPPORT (#00ff00) ---
+    function updateGreenscreen(enabled) {
+      params.greenscreen = enabled;
+      if (enabled) {
+        scene.background = new THREE.Color('#00ff00');
+        scene.fog = null;
+        floorMesh.visible = false;
+      } else {
+        scene.background = new THREE.Color(params.bgColor);
+        scene.fog = new THREE.FogExp2(params.bgColor, 0.015);
+        floorMesh.visible = params.floorShadow;
+      }
+    }
+
+    // --- APPLY MATERIAL STYLE ---
+    function applyMaterialStyle(styleKey) {
+      const st = MATERIAL_STYLES[styleKey];
+      if (!st) return;
+
+      params.materialStyle = styleKey;
+      params.metalness = st.metalness;
+      params.roughness = st.roughness;
+      params.clearcoat = st.clearcoat;
+
+      matCartMain.metalness = params.metalness;
+      matCartMain.roughness = params.roughness;
+
+      matCartWire.metalness = params.metalness;
+      matCartWire.roughness = params.roughness;
+
+      matCartFrame.metalness = Math.max(params.metalness, 0.75);
+      matCartFrame.roughness = Math.min(params.roughness, 0.35);
+    }
+
+    // --- PROCEDURAL SCENE RANDOMIZER ---
+    // NOTE: Strictly does NOT shuffle or change Postprocessing settings!
+    function randomizeScene() {
+      // 1. Random Scheme
+      const schemeKeys = Object.keys(COLOR_SCHEMES);
+      const chosenScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+      applyColorScheme(chosenScheme);
+
+      // 2. Random Material Finish
+      const styleKeys = Object.keys(MATERIAL_STYLES);
+      const chosenStyle = styleKeys[Math.floor(Math.random() * styleKeys.length)];
+      applyMaterialStyle(chosenStyle);
+
+      // 3. Motion & Dynamics
+      params.speed = THREE.MathUtils.randFloat(0.65, 1.85);
+      params.wobble = THREE.MathUtils.randFloat(0.1, 0.45);
+
+      // 4. Animation Preset
+      const animIndex = Math.floor(Math.random() * ANIM_PRESETS.length);
+      params.animPreset = ANIM_PRESETS[animIndex];
+
+      // 5. Stream Density
+      params.itemCount = Math.floor(THREE.MathUtils.randInt(20, 32));
+      rebuildStream();
+
+      // Refresh ONLY the scene controllers (PostProcessing folder untouched!)
+      sceneControllers.forEach(ctrl => ctrl.updateDisplay());
+    }
+
+    // --- CLICK TO RANDOMIZE LISTENER ---
+    let pointerDownX = 0;
+    let pointerDownY = 0;
+    let pointerDownTime = 0;
+
+    window.addEventListener('pointerdown', (e) => {
+      pointerDownX = e.clientX;
+      pointerDownY = e.clientY;
+      pointerDownTime = performance.now();
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (gui && gui.domElement && gui.domElement.contains(e.target)) return;
+
+      const dist = Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY);
+      const elapsed = performance.now() - pointerDownTime;
+
+      // Distinguish click from drag/orbit
+      if (dist < 6 && elapsed < 320) {
+        if (params.clickRandomize) {
+          randomizeScene();
+        }
+      }
+    });
+
+    // --- HIDE/SHOW UI WITH "H" KEY ---
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        if (gui) {
+          gui._hidden ? gui.show() : gui.hide();
+        }
+      }
+    });
+
+    // --- LIL-GUI SETUP (STANDARD NATIVE STYLING ONLY) ---
+    const gui = new GUI({ title: 'Shopping Cart Flow' });
+    const sceneControllers = [];
+
+    function track(ctrl) {
+      sceneControllers.push(ctrl);
+      return ctrl;
+    }
+
+    // 1. Theme & Colors Folder
+    const fTheme = gui.addFolder('Color Schemes (18 Options)');
+    track(fTheme.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Preset').onChange(v => {
+      applyColorScheme(v);
+      sceneControllers.forEach(c => c.updateDisplay());
+    }));
+    track(fTheme.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(v => updateGreenscreen(v)));
+    track(fTheme.addColor(params, 'cartColor').name('Cart Body').onChange(v => matCartMain.color.set(v)));
+    track(fTheme.addColor(params, 'wireColor').name('Wire Cage').onChange(v => matCartWire.color.set(v)));
+    track(fTheme.addColor(params, 'accentColor').name('Grip / Accents').onChange(v => {
+      matCartAccent.color.set(v);
+      matGoodsA.color.set(v);
+    }));
+    track(fTheme.addColor(params, 'frameColor').name('Chassis / Rails').onChange(v => {
+      matCartFrame.color.set(v);
+      matConveyorRail.color.set(v);
+    }));
+    track(fTheme.addColor(params, 'conveyorColor').name('Conveyor Belt').onChange(v => matConveyorBelt.color.set(v)));
+    track(fTheme.addColor(params, 'bgColor').name('Background').onChange(v => {
+      if (!params.greenscreen) {
+        scene.background.set(v);
+        if (scene.fog) scene.fog.color.set(v);
+      }
+    }));
+    track(fTheme.addColor(params, 'lightColor').name('Lighting Hue').onChange(v => {
+      dirLightKey.color.set(v);
+      dirLightRim.color.set(v);
+    }));
+
+    // 2. Material Finish Folder
+    const fMat = gui.addFolder('Materials & Style');
+    track(fMat.add(params, 'materialStyle', Object.keys(MATERIAL_STYLES)).name('Style').onChange(v => {
+      applyMaterialStyle(v);
+      sceneControllers.forEach(c => c.updateDisplay());
+    }));
+    track(fMat.add(params, 'metalness', 0.0, 1.0, 0.02).name('Metalness').onChange(v => {
+      matCartMain.metalness = v;
+      matCartWire.metalness = v;
+    }));
+    track(fMat.add(params, 'roughness', 0.0, 1.0, 0.02).name('Roughness').onChange(v => {
+      matCartMain.roughness = v;
+      matCartWire.roughness = v;
+    }));
+
+    // 3. Animation & Motion (8 Smooth Presets)
+    const fAnim = gui.addFolder('Animations (8 Presets)');
+    track(fAnim.add(params, 'animPreset', ANIM_PRESETS).name('Camera Mode'));
+    track(fAnim.add(params, 'speed', 0.0, 3.0, 0.05).name('Flow Speed'));
+    track(fAnim.add(params, 'wobble', 0.0, 1.0, 0.05).name('Physics Wobble'));
+
+    // 4. Stream & Scene Setup
+    const fScene = gui.addFolder('Stream Setup');
+    track(fScene.add(params, 'itemCount', 12, 38, 1).name('Cart Density').onChange(() => rebuildStream()));
+    track(fScene.add(params, 'showGroceries').name('Show Groceries').onChange(v => {
+      streamItems.forEach(item => {
+        const goods = item.getObjectByName('goods');
+        if (goods) goods.visible = v;
+      });
+    }));
+    track(fScene.add(params, 'conveyorRails').name('Side Rails').onChange(() => buildConveyorGeometry()));
+    track(fScene.add(params, 'floorShadow').name('Floor Shadow').onChange(v => {
+      if (!params.greenscreen) floorMesh.visible = v;
+    }));
+
+    // 5. Controls, Randomizer & DPR
+    const fControls = gui.addFolder('Controls & System');
+    track(fControls.add(params, 'clickRandomize').name('Click Scene to Reroll'));
+    track(fControls.add(params, 'dpr', 0.5, 3.0, 0.25).name('Pixel Ratio (DPR)').onChange(v => {
+      renderer.setPixelRatio(v);
+      postProcessor.setSize(window.innerWidth * v, window.innerHeight * v);
+    }));
+    track(fControls.add({ randomize: () => randomizeScene() }, 'randomize').name('🎲 Randomize Scene Now'));
+    track(fControls.add({ resetCam: () => {
+      camera.position.set(19, 13, 23);
+      controls.target.set(0, 1.2, 0);
+      controls.update();
+    }}, 'resetCam').name('Reset Camera'));
+
+    // 6. Integrated Post-Processing Suite (Preserved during random clicks)
+    postProcessor.attachGUI(gui, 'Post-Processing Suite');
+
+    // Apply initial colors
+    applyColorScheme(params.colorScheme);
+
+    // --- RESIZE HANDLER ---
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      postProcessor.setSize(w * params.dpr, h * params.dpr);
+    });
+
+    // Trigger initial postprocessor sizing
+    postProcessor.setSize(window.innerWidth * params.dpr, window.innerHeight * params.dpr);
+
+    // --- ANIMATION LOOP ---
+    const clock = new THREE.Clock();
+    let globalTime = 0;
+
+    const forwardVector = new THREE.Vector3(0, 0, 1);
+    const itemPosition = new THREE.Vector3();
+    const itemTangent = new THREE.Vector3();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.1);
+      const effectiveSpeed = params.speed;
+      globalTime += delta * effectiveSpeed;
+
+      // 1. Scroll conveyor belt texture in sync with flow
+      conveyorTexture.offset.y = -(globalTime * 0.075) % 1.0;
+
+      // 2. Animate shopping carts along spline stream
+      const count = streamItems.length;
+      for (let i = 0; i < count; i++) {
+        const item = streamItems[i];
+        const progress = (item.userData.offset + globalTime * 0.028) % 1.0;
+
+        // Calculate smooth position & orientation along curve
+        curve.getPointAt(progress, itemPosition);
+        curve.getTangentAt(progress, itemTangent).normalize();
+
+        item.position.copy(itemPosition);
+        item.quaternion.setFromUnitVectors(forwardVector, itemTangent);
+
+        // Gentle organic wobble & banking
+        const wobbleTime = globalTime * 2.8 + item.userData.wobblePhase;
+        const wobbleY = Math.sin(wobbleTime) * (0.07 * params.wobble);
+        const wobbleRoll = Math.cos(wobbleTime * 0.8) * (0.04 * params.wobble);
+        item.position.y += wobbleY;
+        item.rotation.z += wobbleRoll;
+
+        // Smooth scale-in at start and scale-out at end (seamless infinite stream)
+        let scale = 1.0;
+        if (progress < 0.08) {
+          scale = progress / 0.08;
+        } else if (progress > 0.92) {
+          scale = (1.0 - progress) / 0.08;
+        }
+        scale = THREE.MathUtils.clamp(scale, 0.0001, 1.0);
+        item.scale.set(scale, scale, scale);
+
+        // Wheel spinning in sync with movement
+        if (item.userData.wheels) {
+          const spinDelta = delta * effectiveSpeed * 9;
+          for (let w = 0; w < item.userData.wheels.length; w++) {
+            item.userData.wheels[w].rotation.x += spinDelta;
+          }
+        }
+      }
+
+      // 3. Camera Animation Presets (8 smooth cinematic presets)
+      const isInteracting = controls.state !== -1;
+      const animT = globalTime * 0.25;
+
+      if (!isInteracting) {
+        switch (params.animPreset) {
+          case '1. Diagonal Conveyor Glide': {
+            const camX = 18 + Math.sin(animT * 0.5) * 3.5;
+            const camY = 12 + Math.cos(animT * 0.4) * 2.0;
+            const camZ = 22 + Math.cos(animT * 0.5) * 3.5;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.04);
+            controls.target.lerp(new THREE.Vector3(0, 1.0, 0), 0.04);
+            break;
+          }
+          case '2. Smooth Orbit Turntable': {
+            const radius = 26.0;
+            const camX = Math.cos(animT * 0.3) * radius;
+            const camY = 11 + Math.sin(animT * 0.22) * 2.5;
+            const camZ = Math.sin(animT * 0.3) * radius;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.04);
+            controls.target.lerp(new THREE.Vector3(0, 1.0, 0), 0.04);
+            break;
+          }
+          case '3. Conveyor Tracking Follow': {
+            const trackProgress = (animT * 0.09) % 1.0;
+            const trackPt = curve.getPointAt(trackProgress);
+            const camPos = trackPt.clone().add(new THREE.Vector3(11, 6.5, 13));
+            camera.position.lerp(camPos, 0.035);
+            controls.target.lerp(trackPt, 0.04);
+            break;
+          }
+          case '4. Ascending Wave Drift': {
+            const camX = 18 + Math.sin(animT * 0.3) * 2.5;
+            const camY = 10 + Math.sin(animT * 0.75) * 4.5;
+            const camZ = 20 + Math.cos(animT * 0.3) * 2.5;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.04);
+            controls.target.lerp(new THREE.Vector3(0, Math.sin(animT * 0.75) * 1.5 + 1.0, 0), 0.04);
+            break;
+          }
+          case '5. Isometric Architectural Stream': {
+            const camX = 24 + Math.sin(animT * 0.2) * 2.0;
+            const camY = 24 + Math.cos(animT * 0.2) * 1.5;
+            const camZ = 24 + Math.sin(animT * 0.2) * 2.0;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.035);
+            controls.target.lerp(new THREE.Vector3(0, 0.5, 0), 0.035);
+            break;
+          }
+          case '6. Cinematic Low-Angle Float': {
+            const camX = 14 + Math.cos(animT * 0.32) * 3.5;
+            const camY = -1.0 + Math.sin(animT * 0.38) * 1.2;
+            const camZ = 16 + Math.sin(animT * 0.32) * 3.5;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.04);
+            controls.target.lerp(new THREE.Vector3(0, 3.0, 0), 0.04);
+            break;
+          }
+          case '7. Spiral Vortex Rise': {
+            const radius = 23.0;
+            const camX = Math.cos(animT * 0.28) * radius;
+            const camY = 9 + Math.sin(animT * 0.45) * 5.5;
+            const camZ = Math.sin(animT * 0.28) * radius;
+            camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.035);
+            controls.target.lerp(new THREE.Vector3(0, 1.0, 0), 0.035);
+            break;
+          }
+          case '8. Static Camera (Zero Move)': {
+            // Pure stationary camera - zero automatic camera motion
+            break;
+          }
+        }
+      }
+
+      controls.update();
+
+      // 4. Render through Post-Processing Pipeline (or raw render on greenscreen)
+      if (params.greenscreen) {
+        renderer.render(scene, camera);
+      } else {
+        postProcessor.renderScene(scene, camera);
+      }
+    }
+
+    animate();
+  </script>
+</body>
+</html>

@@ -1,0 +1,2622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Global Data Network Globe - Holographic 3D Earth</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #02040a;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================================
+    // POST PROCESSOR SUITE (Inlined from postprocessing/PostProcessor.js for standalone usage)
+    // =========================================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = max(vec2(textureSize(image, 0)), vec2(1.0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const godRaysDepthMaskShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float factor = smoothstep(threshold, threshold + 0.15, lum);
+      fragColor = vec4(vec3(factor), 1.0);
+    }
+    `;
+
+    const godRaysGenerateShader = `
+    precision highp float;
+    #define TAPS_PER_PASS 6.0
+
+    uniform sampler2D inputTexture;
+    uniform vec3 vSunPositionScreenSpace;
+    uniform float fStepSize;
+    uniform float distanceAttenuation;
+    uniform float maxDensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec2 delta = vSunPositionScreenSpace.xy - vUv;
+      float dist = length(delta);
+      vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+      float iters = dist / max(fStepSize, 0.00001);
+
+      vec2 uv = vUv;
+      float col = 0.0;
+      float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+      float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+
+      if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+
+      float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+      fragColor = vec4(vec3(finalVal), 1.0);
+    }
+    `;
+
+    const anamorphicBrightShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    uniform float smoothWidth;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+      fragColor = mix(vec4(0.0), color, alpha);
+    }
+    `;
+
+    const anamorphicBlurShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    uniform float samples;
+    uniform float intensity;
+    uniform vec3 tintColor;
+    uniform float bloomRadius;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      int halfSamples = max(1, int(samples) / 2);
+      float fHalfSamples = float(halfSamples);
+      vec2 invSize = 1.0 / resolution;
+      vec4 total = vec4(0.0);
+
+      for (int i = -64; i <= 64; i++) {
+        if (i < -halfSamples || i > halfSamples) continue;
+        float softness = 1.0 - abs(float(i)) / fHalfSamples;
+        softness = pow(softness, 2.0);
+        vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+        shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+        total += texture(inputTexture, shiftedUV) * softness;
+      }
+
+      fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform sampler2D raysTexture;
+    uniform sampler2D anamorphicTexture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform bool raysEnabled;
+    uniform float raysStrength;
+    uniform vec3 raysColor;
+    uniform bool anamorphicEnabled;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    // Stable float PRNG without 32-bit uint overflow
+    float filmNoise(vec2 coord, float t) {
+      vec2 p = coord * 0.75 + vec2(sin(t * 0.1), cos(t * 0.1)) * 10.0;
+      return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      if (raysEnabled && raysStrength > 0.001) {
+        vec4 r = texture(raysTexture, vUv);
+        color.rgb += r.rgb * raysColor * raysStrength;
+      }
+
+      if (anamorphicEnabled) {
+        vec4 a = texture(anamorphicTexture, vUv);
+        color.rgb += a.rgb;
+      }
+
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * (filmNoise(gl_FragCoord.xy, time) - 0.5);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    uniform int visionMode;
+    uniform float thermalSensitivity;
+    uniform float nightVisionNoise;
+    uniform float nightVisionGain;
+    uniform float crtIntensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d < 0.00001 || d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      color = max(color, vec3(0.0));
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+
+    vec3 applyNightVision(vec3 color, vec2 uv, float timeVal, float noiseAmt, float gain, float crt) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float amplified = pow(lum * gain, 0.72);
+      vec3 phosphorColor = mix(vec3(0.02, 0.12, 0.03), vec3(0.18, 1.0, 0.32), clamp(amplified, 0.0, 1.0));
+      phosphorColor += vec3(0.7, 1.0, 0.8) * max(0.0, amplified - 0.75) * 1.8;
+      vec2 p = uv - 0.5;
+      float tubeDist = length(p);
+      float tubeMask = smoothstep(0.72, 0.44, tubeDist);
+      float n = fract(sin(dot(uv * 280.0 + timeVal * 0.05, vec2(12.9898, 78.233))) * 43758.5453);
+      float scanline = sin(uv.y * 650.0) * crt;
+      phosphorColor += (n - 0.5) * noiseAmt * 2.0 + scanline;
+      return clamp(phosphorColor * tubeMask, 0.0, 1.0);
+    }
+
+    vec3 ironbow(float t) {
+      t = clamp(t, 0.0, 1.0);
+      vec3 c0 = vec3(0.02, 0.01, 0.18);
+      vec3 c1 = vec3(0.22, 0.02, 0.48);
+      vec3 c2 = vec3(0.82, 0.05, 0.25);
+      vec3 c3 = vec3(1.0, 0.62, 0.02);
+      vec3 c4 = vec3(1.0, 1.0, 0.92);
+      if (t < 0.25) return mix(c0, c1, t * 4.0);
+      if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+      if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+      return mix(c3, c4, (t - 0.75) * 4.0);
+    }
+
+    vec3 applyThermal(vec3 color, vec2 uv, float sensitivity, float crt, bool whiteHot) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float heat = clamp(lum * sensitivity, 0.0, 1.0);
+      float sensorRaster = sin(uv.y * 900.0) * (crt * 0.3);
+      heat = clamp(heat + sensorRaster, 0.0, 1.0);
+      if (whiteHot) {
+        return vec3(pow(heat, 0.85));
+      } else {
+        return ironbow(heat);
+      }
+    }
+
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      vec3 finalCol = col.rgb;
+
+      if (visionMode == 1) {
+        finalCol = applyNightVision(finalCol, uv, time, nightVisionNoise, nightVisionGain, crtIntensity);
+      } else if (visionMode == 2) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, false);
+      } else if (visionMode == 3) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, true);
+      } else {
+        vec3 exposedColor = finalCol * exposure;
+        vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+        finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+        if (crtIntensity > 0.0001) {
+          float scanline = sin(uv.y * 900.0 + time * 2.0) * crtIntensity;
+          finalCol -= scanline;
+        }
+      }
+
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    // 1x1 Black dummy texture to guarantee all sampler uniforms are always bound
+    const blackDummyTexture = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1, THREE.RGBAFormat);
+    blackDummyTexture.needsUpdate = true;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: 0, // Samples must be 0 to prevent D3D11 ANGLE multisample blit resolve black quadrant bugs
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoQuad.frustumCulled = false;
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoQuad.frustumCulled = false;
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture || blackDummyTexture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    const VISION_MODE_MAP = {
+      'Normal (Cinematic)': 0,
+      'Night Vision (Phosphor)': 1,
+      'Thermal (Ironbow)': 2,
+      'Thermal (White-Hot)': 3,
+    };
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          antialias: false,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.95,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.2,
+          raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : false,
+          raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.6,
+          raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+          raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+          raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+          raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.12,
+          raysColor: params.raysColor ? (params.raysColor.isColor ? params.raysColor.clone() : new THREE.Color(params.raysColor)) : new THREE.Color(0x00f0ff),
+          raysColorHex: params.raysColorHex || '#00f0ff',
+          // Anamorphic is OFF by default as required
+          anamorphicEnabled: false,
+          anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+          anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.35,
+          anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 64,
+          anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+          anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+          anamorphicColor: params.anamorphicColor ? (params.anamorphicColor.isColor ? params.anamorphicColor.clone() : new THREE.Color(params.anamorphicColor)) : new THREE.Color(0x00d4ff),
+          anamorphicColorHex: params.anamorphicColorHex || '#00d4ff',
+          visionMode: params.visionMode !== undefined ? params.visionMode : 'Normal (Cinematic)',
+          thermalSensitivity: params.thermalSensitivity !== undefined ? params.thermalSensitivity : 1.4,
+          nightVisionGain: params.nightVisionGain !== undefined ? params.nightVisionGain : 2.1,
+          nightVisionNoise: params.nightVisionNoise !== undefined ? params.nightVisionNoise : 0.05,
+          crtIntensity: params.crtIntensity !== undefined ? params.crtIntensity : 0.0,
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.005,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.15,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 1.25,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+          exposure: params.exposure !== undefined ? params.exposure : 1.05,
+        };
+
+        // Solid single-sampled target: zero samples eliminates the blinking black square bug
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: 0 });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.moonScreenPos = new THREE.Vector3(0.5, 0.7, 1.0);
+        this.moonInFront = true;
+
+        this.godRaysMaskShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            threshold: { value: this.settings.raysThreshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysDepthMaskShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysMaskPass = new ShaderPass(this.godRaysMaskShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.godRaysGenShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            vSunPositionScreenSpace: { value: this.moonScreenPos },
+            fStepSize: { value: 1.0 },
+            distanceAttenuation: { value: this.settings.raysDistanceAttenuation },
+            maxDensity: { value: this.settings.raysMaxDensity },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysGenerateShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysPingPong = new ShaderPingPongPass(this.godRaysGenShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            threshold: { value: this.settings.anamorphicThreshold },
+            smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBrightShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+            resolution: { value: new THREE.Vector2(1, 1) },
+            samples: { value: this.settings.anamorphicSamples },
+            intensity: { value: this.settings.anamorphicIntensity },
+            tintColor: { value: this.settings.anamorphicColor },
+            bloomRadius: { value: this.settings.anamorphicRadius },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBlurShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            raysEnabled: { value: this.settings.raysEnabled },
+            raysStrength: { value: this.settings.raysStrength },
+            raysColor: { value: this.settings.raysColor },
+            anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: blackDummyTexture },
+            blur0Texture: { value: blackDummyTexture },
+            blur1Texture: { value: blackDummyTexture },
+            blur2Texture: { value: blackDummyTexture },
+            blur3Texture: { value: blackDummyTexture },
+            blur4Texture: { value: blackDummyTexture },
+            raysTexture: { value: blackDummyTexture },
+            anamorphicTexture: { value: blackDummyTexture },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+            visionMode: { value: VISION_MODE_MAP[this.settings.visionMode] ?? 0 },
+            thermalSensitivity: { value: this.settings.thermalSensitivity },
+            nightVisionGain: { value: this.settings.nightVisionGain },
+            nightVisionNoise: { value: this.settings.nightVisionNoise },
+            crtIntensity: { value: this.settings.crtIntensity },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: blackDummyTexture },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+        this.godRaysGenShader.uniforms.distanceAttenuation.value = this.settings.raysDistanceAttenuation;
+        this.godRaysGenShader.uniforms.maxDensity.value = this.settings.raysMaxDensity;
+
+        this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+        this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+        this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+        this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+        this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+        this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.raysEnabled.value = this.settings.raysEnabled && this.moonInFront;
+        this.finalShader.uniforms.raysStrength.value = this.settings.raysStrength;
+        this.finalShader.uniforms.raysColor.value.copy(this.settings.raysColor);
+        this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+        this.rgbShader.uniforms.visionMode.value = VISION_MODE_MAP[this.settings.visionMode] ?? 0;
+        this.rgbShader.uniforms.thermalSensitivity.value = this.settings.thermalSensitivity;
+        this.rgbShader.uniforms.nightVisionGain.value = this.settings.nightVisionGain;
+        this.rgbShader.uniforms.nightVisionNoise.value = this.settings.nightVisionNoise;
+        this.rgbShader.uniforms.crtIntensity.value = this.settings.crtIntensity;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+
+        const grW = Math.max(1, Math.round(w / 2));
+        const grH = Math.max(1, Math.round(h / 2));
+        this.godRaysMaskPass.setSize(grW, grH);
+        this.godRaysPingPong.setSize(grW, grH);
+
+        const anW = Math.max(1, Math.round(w / 4));
+        const anH = Math.max(1, Math.round(h / 4));
+        this.anamorphicBrightPass.setSize(anW, anH);
+        this.anamorphicBlurPass.setSize(anW, anH);
+        this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      setAntialias(enabled) {
+        this.settings.antialias = !!enabled;
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture || blackDummyTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        // 1. Bloom
+        this.bloomPass.source = sourceTexture || blackDummyTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture || blackDummyTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        // 2. Godrays
+        if (this.settings.raysEnabled && this.settings.raysStrength > 0.001 && this.moonInFront) {
+          this.godRaysMaskShader.uniforms.inputTexture.value = sourceTexture || blackDummyTexture;
+          this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+          this.godRaysMaskPass.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = this.settings.raysDensity;
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysMaskPass.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.finalPass.shader.uniforms.raysTexture.value = this.godRaysPingPong.texture;
+          this.finalShader.uniforms.raysEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.raysTexture.value = blackDummyTexture;
+          this.finalShader.uniforms.raysEnabled.value = false;
+        }
+
+        // 3. Anamorphic Flare
+        if (this.settings.anamorphicEnabled) {
+          this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture || blackDummyTexture;
+          this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+          this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+          this.anamorphicBrightPass.render(this.renderer);
+
+          this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+          this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+          this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+          this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+          this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+          this.anamorphicBlurPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.anamorphicTexture.value = blackDummyTexture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+        }
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing (PostProcessor.js)") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Post-Process");
+
+        const bloom = root.addFolder("Atmospheric Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Bloom Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Bloom Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Bloom Threshold").onChange(() => this.updateSettings());
+
+        const anamorphic = root.addFolder("Three.js Anamorphic Flare");
+        anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Anamorphic").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicSamples", 2, 128, 1).name("Samples").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicRadius", 0.0, 1.0, 0.01).name("Bloom Radius").onChange(() => this.updateSettings());
+        anamorphic.addColor(this.settings, "anamorphicColorHex").name("Tint Color").onChange((v) => {
+          this.settings.anamorphicColor.set(v);
+          this.updateSettings();
+        });
+
+        const rays = root.addFolder("Three.js Godrays");
+        rays.add(this.settings, "raysEnabled").name("Enable Godrays").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysStrength", 0, 3.0, 0.05).name("Intensity").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysThreshold", 0.0, 0.8, 0.01).name("Threshold").onChange(() => this.updateSettings());
+        rays.addColor(this.settings, "raysColorHex").name("Ray Tint").onChange((v) => {
+          this.settings.raysColor.set(v);
+          this.updateSettings();
+        });
+
+        const lens = root.addFolder("Lens, Optics & Film Grain");
+        lens.add(this.settings, "chromaticAberration", 0, 0.05, 0.001).name("Chromatic Aberr").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.05, 0.002).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+
+        const vision = root.addFolder("Thermal & Night Vision");
+        vision.add(this.settings, "visionMode", Object.keys(VISION_MODE_MAP)).name("Vision Mode").onChange(() => this.updateSettings());
+        vision.add(this.settings, "nightVisionGain", 0.5, 5.0, 0.1).name("NVG Amplification").onChange(() => this.updateSettings());
+        vision.add(this.settings, "thermalSensitivity", 0.5, 3.5, 0.05).name("Thermal Sens").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // -------------------------------------------------------------
+    // 19+ Preconfigured Color Schemes
+    // -------------------------------------------------------------
+    const COLOR_SCHEMES = {
+      "Original": {
+        bg: "#02050e",
+        land: "#00f0ff",
+        ocean: "#041933",
+        arcs: "#00b4d8",
+        packets: "#ffffff",
+        hubs: "#00ffa3",
+        bokeh: "#0077ee",
+        halo: "#00f0ff",
+        core: "#010814",
+        ambient: "#021226",
+        keyLight: "#00f0ff",
+        rimLight: "#0077ff",
+        coreLight: "#00ffcc"
+      },
+      "Monochromatic": {
+        bg: "#020b14",
+        land: "#38bdf8",
+        ocean: "#082f49",
+        arcs: "#0284c7",
+        packets: "#e0f2fe",
+        hubs: "#7dd3fc",
+        bokeh: "#0369a1",
+        halo: "#0ea5e9",
+        core: "#041724",
+        ambient: "#082f49",
+        keyLight: "#38bdf8",
+        rimLight: "#0284c7",
+        coreLight: "#7dd3fc"
+      },
+      "Analogous": {
+        bg: "#040516",
+        land: "#06b6d4",
+        ocean: "#141138",
+        arcs: "#6366f1",
+        packets: "#a5f3fc",
+        hubs: "#818cf8",
+        bokeh: "#4f46e5",
+        halo: "#3b82f6",
+        core: "#070a1a",
+        ambient: "#131036",
+        keyLight: "#06b6d4",
+        rimLight: "#818cf8",
+        coreLight: "#6366f1"
+      },
+      "Complementary": {
+        bg: "#040913",
+        land: "#00d2ff",
+        ocean: "#031d2b",
+        arcs: "#ff9500",
+        packets: "#ffea00",
+        hubs: "#ff5500",
+        bokeh: "#0088cc",
+        halo: "#ff8800",
+        core: "#030e17",
+        ambient: "#031520",
+        keyLight: "#00d2ff",
+        rimLight: "#ff9500",
+        coreLight: "#ff7700"
+      },
+      "Split-complementary": {
+        bg: "#040712",
+        land: "#00c8ff",
+        ocean: "#091422",
+        arcs: "#ff7b00",
+        packets: "#ff0055",
+        hubs: "#ff3366",
+        bokeh: "#0077b6",
+        halo: "#ff5500",
+        core: "#050e18",
+        ambient: "#091422",
+        keyLight: "#00c8ff",
+        rimLight: "#ff7b00",
+        coreLight: "#ff0055"
+      },
+      "Triadic": {
+        bg: "#080312",
+        land: "#00f5d4",
+        ocean: "#20062a",
+        arcs: "#f72585",
+        packets: "#fee440",
+        hubs: "#7209b7",
+        bokeh: "#f72585",
+        halo: "#00f5d4",
+        core: "#100318",
+        ambient: "#1c0424",
+        keyLight: "#00f5d4",
+        rimLight: "#f72585",
+        coreLight: "#fee440"
+      },
+      "Tetradic": {
+        bg: "#060512",
+        land: "#00f0ff",
+        ocean: "#110b24",
+        arcs: "#ff6b35",
+        packets: "#57cc99",
+        hubs: "#c77dff",
+        bokeh: "#9d4edd",
+        halo: "#00f0ff",
+        core: "#0a0718",
+        ambient: "#120b26",
+        keyLight: "#00f0ff",
+        rimLight: "#ff6b35",
+        coreLight: "#c77dff"
+      },
+      "Double split-complementary": {
+        bg: "#040813",
+        land: "#2ec4b6",
+        ocean: "#02111e",
+        arcs: "#e71d36",
+        packets: "#ff9f1c",
+        hubs: "#ff006e",
+        bokeh: "#3a86ff",
+        halo: "#2ec4b6",
+        core: "#040f1c",
+        ambient: "#051628",
+        keyLight: "#2ec4b6",
+        rimLight: "#e71d36",
+        coreLight: "#ff9f1c"
+      },
+      "Achromatic (Black & White)": {
+        bg: "#000000",
+        land: "#ffffff",
+        ocean: "#181818",
+        arcs: "#aaaaaa",
+        packets: "#ffffff",
+        hubs: "#e5e5e5",
+        bokeh: "#555555",
+        halo: "#ffffff",
+        core: "#050505",
+        ambient: "#151515",
+        keyLight: "#ffffff",
+        rimLight: "#888888",
+        coreLight: "#ffffff"
+      },
+      "Achromatic (White & Black)": {
+        bg: "#f4f6f8",
+        land: "#0f172a",
+        ocean: "#cbd5e1",
+        arcs: "#334155",
+        packets: "#020617",
+        hubs: "#1e293b",
+        bokeh: "#94a3b8",
+        halo: "#64748b",
+        core: "#e2e8f0",
+        ambient: "#cbd5e1",
+        keyLight: "#1e293b",
+        rimLight: "#475569",
+        coreLight: "#0f172a"
+      },
+      "Achromatic + Accent (B&W + Red)": {
+        bg: "#020202",
+        land: "#e5e7eb",
+        ocean: "#171a20",
+        arcs: "#ff1744",
+        packets: "#ffffff",
+        hubs: "#ff1744",
+        bokeh: "#262b33",
+        halo: "#ff1744",
+        core: "#0a0a0b",
+        ambient: "#171a20",
+        keyLight: "#ffffff",
+        rimLight: "#ff1744",
+        coreLight: "#ff1744"
+      },
+      "Achromatic + Accent (W&B + Red)": {
+        bg: "#fafafa",
+        land: "#18181b",
+        ocean: "#e4e4e7",
+        arcs: "#dc2626",
+        packets: "#991b1b",
+        hubs: "#dc2626",
+        bokeh: "#a1a1aa",
+        halo: "#ef4444",
+        core: "#f4f4f5",
+        ambient: "#e4e4e7",
+        keyLight: "#18181b",
+        rimLight: "#dc2626",
+        coreLight: "#ef4444"
+      },
+      "Neutral + Accent": {
+        bg: "#100f0e",
+        land: "#c4b5a5",
+        ocean: "#201d1b",
+        arcs: "#ffb703",
+        packets: "#fb8500",
+        hubs: "#ffd166",
+        bokeh: "#3a342e",
+        halo: "#ffb703",
+        core: "#151312",
+        ambient: "#201d1b",
+        keyLight: "#ffd166",
+        rimLight: "#ffb703",
+        coreLight: "#fb8500"
+      },
+      "Palette (F6AA1C, BC3908, 941B0C...)": {
+        bg: "#160501",
+        land: "#F6AA1C",
+        ocean: "#2a0c03",
+        arcs: "#BC3908",
+        packets: "#F6AA1C",
+        hubs: "#941B0C",
+        bokeh: "#BC3908",
+        halo: "#F6AA1C",
+        core: "#1f0702",
+        ambient: "#2a0c03",
+        keyLight: "#F6AA1C",
+        rimLight: "#BC3908",
+        coreLight: "#941B0C"
+      },
+      "Palette (63D1CF, 5BC0BE, 4BAD9E...)": {
+        bg: "#000000",
+        land: "#63D1CF",
+        ocean: "#070c1b",
+        arcs: "#5BC0BE",
+        packets: "#63D1CF",
+        hubs: "#4BAD9E",
+        bokeh: "#4BAD9E",
+        halo: "#5BC0BE",
+        core: "#050914",
+        ambient: "#070c1b",
+        keyLight: "#63D1CF",
+        rimLight: "#5BC0BE",
+        coreLight: "#4BAD9E"
+      },
+      "Palette (AA60C8, D69ADE, C9A3C6...)": {
+        bg: "#080012",
+        land: "#D69ADE",
+        ocean: "#0f0817",
+        arcs: "#AA60C8",
+        packets: "#CFB5C2",
+        hubs: "#C9A3C6",
+        bokeh: "#AA60C8",
+        halo: "#D69ADE",
+        core: "#140522",
+        ambient: "#0f0817",
+        keyLight: "#D69ADE",
+        rimLight: "#AA60C8",
+        coreLight: "#C9A3C6"
+      },
+      "Palette (FEF1BE, FFBA00, 008189...)": {
+        bg: "#030a08",
+        land: "#FFBA00",
+        ocean: "#02272a",
+        arcs: "#008189",
+        packets: "#FEF1BE",
+        hubs: "#FFBA00",
+        bokeh: "#008189",
+        halo: "#FEF1BE",
+        core: "#021719",
+        ambient: "#02272a",
+        keyLight: "#FFBA00",
+        rimLight: "#008189",
+        coreLight: "#FEF1BE"
+      },
+      "Palette (D4FFB0, 7FFF00, 00B894...)": {
+        bg: "#030c06",
+        land: "#7FFF00",
+        ocean: "#052216",
+        arcs: "#00B894",
+        packets: "#D4FFB0",
+        hubs: "#7FFF00",
+        bokeh: "#00B894",
+        halo: "#7FFF00",
+        core: "#04160d",
+        ambient: "#052216",
+        keyLight: "#7FFF00",
+        rimLight: "#00B894",
+        coreLight: "#D4FFB0"
+      },
+      "Palette (FFE8CC, FF8C00, C7501A...)": {
+        bg: "#08030f",
+        land: "#FF8C00",
+        ocean: "#260a33",
+        arcs: "#C7501A",
+        packets: "#FFE8CC",
+        hubs: "#FF8C00",
+        bokeh: "#3D1050",
+        halo: "#FF8C00",
+        core: "#160520",
+        ambient: "#260a33",
+        keyLight: "#FF8C00",
+        rimLight: "#C7501A",
+        coreLight: "#FFE8CC"
+      },
+      "Palette (E8E0FF, B38FFF, 6A3DE8...)": {
+        bg: "#05030b",
+        land: "#B38FFF",
+        ocean: "#100b33",
+        arcs: "#6A3DE8",
+        packets: "#E8E0FF",
+        hubs: "#B38FFF",
+        bokeh: "#6A3DE8",
+        halo: "#B38FFF",
+        core: "#0d0822",
+        ambient: "#100b33",
+        keyLight: "#B38FFF",
+        rimLight: "#6A3DE8",
+        coreLight: "#E8E0FF"
+      },
+      "Palette (E0FBFF, 00F0FF, D40078...)": {
+        bg: "#03010a",
+        land: "#00F0FF",
+        ocean: "#130626",
+        arcs: "#D40078",
+        packets: "#E0FBFF",
+        hubs: "#00F0FF",
+        bokeh: "#D40078",
+        halo: "#00F0FF",
+        core: "#0b0318",
+        ambient: "#130626",
+        keyLight: "#00F0FF",
+        rimLight: "#D40078",
+        coreLight: "#E0FBFF"
+      }
+    };
+
+    // -------------------------------------------------------------
+    // 8 Preconfigured Camera Animations
+    // -------------------------------------------------------------
+    const ANIMATIONS = [
+      "Static (No Cam Move)",
+      "Orbital Glide",
+      "Polar Drift",
+      "Breathing Zoom",
+      "Figure Eight",
+      "Data Flyby",
+      "Satellite Pan",
+      "Zen Horizon"
+    ];
+
+    // -------------------------------------------------------------
+    // Master Parameters
+    // -------------------------------------------------------------
+    const params = {
+      // Color & Palette
+      colorScheme: "Original",
+      greenScreen: false,
+      landColor: COLOR_SCHEMES["Original"].land,
+      oceanColor: COLOR_SCHEMES["Original"].ocean,
+      arcsColor: COLOR_SCHEMES["Original"].arcs,
+      packetsColor: COLOR_SCHEMES["Original"].packets,
+      hubsColor: COLOR_SCHEMES["Original"].hubs,
+      bokehColor: COLOR_SCHEMES["Original"].bokeh,
+      haloColor: COLOR_SCHEMES["Original"].halo,
+      innerCoreColor: COLOR_SCHEMES["Original"].core,
+
+      // Animation & Movement
+      animation: "Orbital Glide",
+      animationSpeed: 1.0,
+      globeRotation: true,
+      packetSpeed: 1.0,
+
+      // Geometry & Precision Tuning
+      globeRadius: 12.0,
+      arcHeight: 1.1,
+      pointSize: 1.05,
+      bokehIntensity: 0.6,
+
+      // Lights & Scene Exposure
+      exposure: 1.05,
+      ambientIntensity: 0.7,
+      ambientColor: COLOR_SCHEMES["Original"].ambient,
+      keyIntensity: 1.8,
+      keyColor: COLOR_SCHEMES["Original"].keyLight,
+      rimIntensity: 2.2,
+      rimColor: COLOR_SCHEMES["Original"].rimLight,
+      coreIntensity: 1.5,
+      coreLightColor: COLOR_SCHEMES["Original"].coreLight,
+
+      // System & Control Options
+      dragMode: "Rotate (Right-click to Pan)",
+      globePosX: 0.0,
+      globePosY: 0.0,
+      globePosZ: 0.0,
+      orbitDistance: 32.0,
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+      antialias: true,
+      clickToRandomize: true
+    };
+
+    // -------------------------------------------------------------
+    // Three.js Core Globals
+    // -------------------------------------------------------------
+    const container = document.getElementById('canvas-container');
+    let scene, camera, renderer, controls, gui, postProcessor;
+    let ambientLight, keyLight, rimLight, coreLight;
+    let globeGroup, landPoints, oceanPoints, arcsGroup, packetsMesh, hubsGroup, bokehPoints, atmosphereMesh, coreSphere, coastlinesMesh;
+    let clock = new THREE.Clock();
+    let isUserInteracting = false;
+    let userInteractionTimeout = null;
+    let animAngleOffset = 0;
+    let guiOrbitDistCtrl, guiPosXCtrl, guiPosYCtrl, guiPosZCtrl;
+
+    // -------------------------------------------------------------
+    // High-Precision Natural Earth Continental Map & Landmask
+    // -------------------------------------------------------------
+    const LAND_TOPO = {"type":"Topology","objects":{"land":{"type":"GeometryCollection","geometries":[{"type":"MultiPolygon","arcs":[[[0]],[[1]],[[2]],[[3]],[[4]],[[5]],[[6]],[[7]],[[8]],[[9]],[[10]],[[11]],[[12]],[[13]],[[14]],[[15]],[[16,18]],[[19]],[[20]],[[21]],[[22]],[[23]],[[24]],[[25]],[[26]],[[27]],[[28]],[[29]],[[30]],[[31]],[[32]],[[33]],[[34]],[[35]],[[36]],[[37]],[[38]],[[39]],[[40]],[[41]],[[42]],[[43]],[[44]],[[45]],[[46]],[[47]],[[48]],[[49]],[[50]],[[51]],[[52]],[[53]],[[54]],[[55]],[[56]],[[57]],[[58]],[[59]],[[60]],[[61]],[[62]],[[63]],[[64]],[[65]],[[66]],[[67]],[[68]],[[69]],[[70]],[[71]],[[72]],[[73]],[[74]],[[75]],[[76]],[[77]],[[78]],[[79]],[[80]],[[81]],[[82]],[[83]],[[84]],[[85]],[[86]],[[87]],[[88]],[[89]],[[90]],[[91]],[[92,115],[114]],[[94]],[[95]],[[96]],[[97]],[[98]],[[99]],[[100]],[[101]],[[102]],[[103]],[[104]],[[105]],[[106]],[[107]],[[108]],[[109]],[[110]],[[111]],[[112]],[[113]],[[116]],[[117]],[[118]],[[119]],[[120]],[[121]],[[122]],[[123]],[[124]],[[125]],[[126]],[[127]],[[128]],[[129]]]}]}},"arcs":[[[33452,3290],[-82,-301],[-81,-266],[-582,81],[-621,-35],[-348,197],[0,23],[-152,174],[625,-23],[599,-58],[207,243],[147,208],[288,-243]],[[5775,3611],[-533,-81],[-364,208],[-163,209],[-11,35],[-180,162],[169,220],[517,-93],[277,-185],[212,-209],[76,-266]],[[37457,4468],[342,-255],[120,-359],[33,-254],[11,-301],[-430,-186],[-452,-150],[-522,-139],[-582,-116],[-658,35],[-365,197],[49,243],[593,162],[239,197],[174,254],[126,220],[168,209],[180,243],[141,0],[414,127],[419,-127]],[[16330,7154],[359,-93],[332,104],[-158,-208],[-261,-151],[-386,47],[-278,208],[60,197],[332,-104]],[[15122,7165],[425,-231],[-164,23],[-359,58],[-381,162],[202,127],[277,-139]],[[22505,8080],[305,-81],[304,69],[163,-335],[-217,46],[-337,-23],[-343,23],[-376,-35],[-283,116],[-146,243],[174,104],[353,-81],[403,-46]],[[30985,8657],[33,-266],[-49,-231],[-76,-220],[-326,-81],[-311,-116],[-364,11],[136,232],[-327,-81],[-310,-81],[-212,174],[-16,243],[305,231],[190,70],[321,-23],[82,301],[16,219],[-6,475],[158,278],[256,93],[147,-220],[65,-220],[120,-267],[92,-254],[76,-267]],[[0,529],[16,-5],[245,344],[501,-185],[32,21],[78,49],[94,61],[81,52],[41,26],[41,-1],[29,-10],[402,-246],[352,246],[63,34],[816,104],[265,-138],[130,-71],[419,-196],[789,-151],[625,-185],[1072,-139],[800,162],[1181,-116],[669,-185],[734,174],[773,162],[60,278],[-1094,23],[-898,139],[-234,231],[-745,128],[49,266],[103,243],[104,220],[-55,243],[-462,162],[-212,209],[-430,185],[675,-35],[642,93],[402,-197],[495,173],[457,220],[223,197],[-98,243],[-359,162],[-408,174],[-571,35],[-500,81],[-539,58],[-180,220],[-359,185],[-217,208],[-87,672],[136,-58],[250,-185],[457,58],[441,81],[228,-255],[441,58],[370,127],[348,162],[315,197],[419,58],[-11,220],[-97,220],[81,208],[359,104],[163,-196],[425,115],[321,151],[397,12],[375,57],[376,139],[299,128],[337,127],[218,-35],[190,-46],[414,81],[370,-104],[381,11],[364,81],[375,-57],[414,-58],[386,23],[403,-12],[413,-11],[381,23],[283,174],[337,92],[349,-127],[331,104],[300,208],[179,-185],[98,-208],[180,-197],[288,174],[332,-220],[375,-70],[321,-162],[392,35],[354,104],[418,-23],[376,-81],[381,-104],[147,254],[-180,197],[-136,209],[-359,46],[-158,220],[-60,220],[-98,440],[213,-81],[364,-35],[359,35],[327,-93],[283,-174],[119,-208],[376,-35],[359,81],[381,116],[342,70],[283,-139],[370,46],[239,451],[224,-266],[321,-104],[348,58],[228,-232],[365,-23],[337,-69],[332,-128],[218,220],[108,209],[278,-232],[381,58],[283,-127],[190,-197],[370,58],[288,127],[283,151],[337,81],[392,69],[354,81],[272,127],[163,186],[65,254],[-32,244],[-87,231],[-98,232],[-87,231],[-71,209],[-16,231],[27,232],[130,220],[109,243],[44,231],[-55,255],[-32,232],[136,266],[152,173],[180,220],[190,186],[223,173],[109,255],[152,162],[174,151],[267,34],[174,186],[196,115],[228,70],[202,150],[157,186],[218,69],[163,-151],[-103,-196],[-283,-174],[-120,-127],[-206,92],[-229,-58],[-190,-139],[-202,-150],[-136,-174],[-38,-231],[17,-220],[130,-197],[-190,-139],[-261,-46],[-153,-197],[-163,-185],[-174,-255],[-44,-220],[98,-243],[147,-185],[229,-139],[212,-185],[114,-232],[60,-220],[82,-232],[130,-196],[82,-220],[38,-544],[81,-220],[22,-232],[87,-231],[-38,-313],[-152,-243],[-163,-197],[-370,-81],[-125,-208],[-169,-197],[-419,-220],[-370,-93],[-348,-127],[-376,-128],[-223,-243],[-446,-23],[-489,23],[-441,-46],[-468,0],[87,-232],[424,-104],[311,-162],[174,-208],[-310,-185],[-479,58],[-397,-151],[-17,-243],[-11,-232],[327,-196],[60,-220],[353,-220],[588,-93],[500,-162],[398,-185],[506,-186],[690,-92],[681,-162],[473,-174],[517,-197],[272,-278],[136,-220],[337,209],[457,173],[484,186],[577,150],[495,162],[691,12],[680,-81],[560,-139],[180,255],[386,173],[702,12],[550,127],[522,128],[577,81],[614,104],[430,150],[-196,209],[-119,208],[0,220],[-539,-23],[-571,-93],[-544,0],[-77,220],[39,440],[125,128],[397,138],[468,139],[337,174],[337,174],[251,231],[380,104],[376,81],[190,47],[430,23],[408,81],[343,116],[337,139],[305,139],[386,185],[245,197],[261,173],[82,232],[-294,139],[98,243],[185,185],[288,116],[305,139],[283,185],[217,232],[136,277],[202,163],[331,-35],[136,-197],[332,-23],[11,220],[142,231],[299,-58],[71,-220],[331,-34],[360,104],[348,69],[315,-34],[120,-243],[305,196],[283,105],[315,81],[310,81],[283,139],[310,92],[240,128],[168,208],[207,-151],[288,81],[202,-277],[157,-209],[316,116],[125,232],[283,162],[365,-35],[108,-220],[229,220],[299,69],[326,23],[294,-11],[310,-70],[300,-34],[130,-197],[180,-174],[304,104],[327,24],[315,0],[310,11],[278,81],[294,70],[245,162],[261,104],[283,58],[212,162],[152,324],[158,197],[288,-93],[109,-208],[239,-139],[289,46],[196,-208],[206,-151],[283,139],[98,255],[250,104],[289,197],[272,81],[326,116],[218,127],[228,139],[218,127],[261,-69],[250,208],[180,162],[261,-11],[229,139],[54,208],[234,162],[228,116],[278,93],[256,46],[244,-35],[262,-58],[223,-162],[27,-254],[245,-197],[168,-162],[332,-70],[185,-162],[229,-162],[266,-35],[223,116],[240,243],[261,-127],[272,-70],[261,-69],[272,-46],[277,0],[229,-614],[-11,-150],[-33,-267],[-266,-150],[-218,-220],[38,-232],[310,12],[-38,-232],[-141,-220],[-131,-243],[212,-185],[321,-58],[321,104],[153,232],[92,220],[153,185],[174,174],[70,208],[147,289],[174,58],[316,24],[277,69],[283,93],[136,231],[82,220],[190,220],[272,151],[234,115],[153,197],[157,104],[202,93],[277,-58],[250,58],[272,69],[305,-34],[201,162],[142,393],[103,-162],[131,-278],[234,-115],[266,-47],[267,70],[283,-46],[261,-12],[174,58],[234,-35],[212,-127],[250,81],[300,0],[255,81],[289,-81],[185,197],[141,196],[191,163],[348,439],[179,-81],[212,-162],[185,-208],[354,-359],[272,-12],[256,0],[299,70],[299,81],[229,162],[190,174],[310,23],[207,127],[218,-116],[141,-185],[196,-185],[305,23],[190,-150],[332,-151],[348,-58],[288,47],[218,185],[185,185],[250,46],[251,-81],[288,-58],[261,93],[250,0],[245,-58],[256,-58],[250,104],[299,93],[283,23],[316,0],[255,58],[251,46],[76,290],[11,243],[174,-162],[49,-266],[92,-244],[115,-196],[234,-105],[315,35],[365,12],[250,35],[364,0],[262,11],[364,-23],[310,-46],[196,-186],[-54,-220],[179,-173],[299,-139],[310,-151],[360,-104],[375,-92],[283,-93],[315,-12],[180,197],[245,-162],[212,-185],[245,-139],[337,-58],[321,-69],[136,-232],[316,-139],[212,-208],[310,-93],[321,12],[299,-35],[332,12],[332,-47],[310,-81],[288,-139],[289,-116],[195,-173],[-32,-232],[-147,-208],[-125,-266],[-98,-209],[-131,-243],[-364,-93],[-163,-208],[-360,-127],[-125,-232],[-190,-220],[-201,-185],[-115,-243],[-70,-220],[-28,-266],[6,-220],[158,-232],[60,-220],[130,-208],[517,-81],[109,-255],[-501,-93],[-424,-127],[-528,-23],[-234,-336],[-49,-278],[-119,-220],[-147,-220],[370,-196],[141,-244],[239,-219],[338,-197],[386,-186],[419,-185],[636,-185],[142,-289],[800,-128],[53,-45],[208,-175],[767,151],[636,-186],[-99520,-142]],[[31180,18764],[361,-355],[389,-147],[-125,-296],[-264,-29],[-141,208],[-92,-239],[-238,-183],[-301,67],[-202,177],[-291,86],[-350,330],[-283,317],[-383,662],[229,-124],[390,-395],[369,-212],[143,271],[90,405],[256,244],[198,-70],[106,-274],[139,-443]],[[33736,20389],[222,-266],[-83,-207],[-375,-177],[-125,207],[-236,-266],[-139,266],[333,354],[236,-148],[167,237]],[[69522,21210],[-427,-38],[-7,314],[41,244],[19,121],[179,-186],[263,-74],[9,-112],[-77,-269]],[[90387,26479],[269,-204],[151,81],[217,113],[166,-39],[20,-702],[-95,-203],[-29,-476],[-97,162],[-193,-412],[-57,32],[-171,19],[-171,505],[-38,390],[-160,515],[7,271],[181,-52]],[[98060,26404],[63,-244],[198,239],[80,-249],[0,-249],[-103,-274],[-182,-435],[-142,-238],[103,-284],[-214,-7],[-238,-223],[-75,-387],[-157,-597],[-219,-264],[-138,-169],[-256,13],[-180,194],[-302,42],[-46,217],[149,438],[349,583],[179,111],[200,225],[238,310],[167,306],[123,441],[106,149],[41,330],[195,273],[61,-251]],[[98502,29218],[202,-622],[5,403],[126,-161],[41,-447],[224,-192],[188,-48],[158,226],[141,-69],[-67,-524],[-85,-345],[-212,12],[-74,-179],[26,-254],[-41,-110],[-105,-319],[-138,-404],[-214,-236],[-48,155],[-116,85],[160,486],[-91,326],[-299,236],[8,214],[201,206],[47,455],[-13,382],[-113,396],[8,104],[-133,244],[-218,523],[-117,418],[104,46],[151,-328],[216,-153],[78,-526]],[[96421,37487],[-105,-142],[-153,160],[-199,266],[-179,313],[-184,416],[-38,201],[119,-9],[156,-201],[122,-200],[89,-166],[228,-366],[144,-272]],[[99547,40335],[96,-171],[-46,-308],[-172,-81],[-153,73],[-27,260],[107,203],[126,-74],[69,98]],[[0,40798],[99822,-145],[-177,-124],[-36,220],[139,121],[88,33],[-99836,184]],[[0,41087],[0,-289]],[[0,41087],[57,27],[-34,-284],[-23,-32]],[[96623,40851],[-92,-78],[-93,259],[10,158],[175,-339]],[[96418,41756],[45,-476],[-75,74],[-58,-32],[-39,163],[-6,453],[133,-182]],[[63904,42571],[45,-711],[72,-276],[-28,-284],[-49,-174],[-94,347],[-53,-175],[53,-438],[-24,-250],[-77,-137],[-18,-500],[-109,-689],[-137,-814],[-172,-1120],[-106,-821],[-125,-685],[-226,-140],[-243,-250],[-160,151],[-220,211],[-77,312],[-18,524],[-98,471],[-26,425],[50,426],[128,102],[1,197],[133,447],[25,377],[-65,280],[-52,372],[-23,544],[97,331],[38,375],[138,22],[155,121],[103,107],[122,7],[158,337],[229,364],[83,297],[-38,253],[118,-71],[153,410],[6,356],[92,264],[96,-254],[74,-251],[69,-390]],[[89877,42448],[100,-464],[179,223],[92,-250],[133,-231],[-29,-262],[60,-506],[42,-295],[70,-72],[75,-505],[-27,-307],[90,-400],[301,-309],[197,-281],[186,-257],[-37,-143],[159,-371],[108,-639],[111,130],[113,-256],[68,91],[48,-626],[197,-363],[129,-226],[217,-478],[78,-475],[7,-337],[-19,-365],[132,-502],[-16,-523],[-48,-274],[-75,-527],[6,-339],[-55,-423],[-123,-538],[-205,-290],[-102,-458],[-93,-292],[-82,-510],[-107,-294],[-70,-442],[-36,-407],[14,-187],[-159,-205],[-311,-22],[-257,-242],[-127,-229],[-168,-254],[-230,262],[-170,104],[43,308],[-152,-112],[-243,-428],[-240,160],[-158,94],[-159,42],[-269,171],[-179,364],[-52,449],[-64,298],[-137,240],[-267,71],[91,287],[-67,438],[-136,-408],[-247,-109],[146,327],[42,341],[107,289],[-22,438],[-226,-504],[-174,-202],[-106,-470],[-217,243],[9,313],[-174,429],[-147,221],[52,137],[-356,358],[-195,17],[-267,287],[-498,-56],[-359,-211],[-317,-197],[-265,39],[-294,-303],[-241,-137],[-53,-309],[-103,-240],[-236,-15],[-174,-52],[-246,107],[-199,-64],[-191,-27],[-165,-315],[-81,26],[-140,-167],[-133,-187],[-203,23],[-186,0],[-295,377],[-149,113],[6,338],[138,81],[47,134],[-10,212],[34,411],[-31,350],[-147,598],[-45,337],[12,336],[-111,385],[-7,174],[-123,235],[-35,463],[-158,467],[-39,252],[122,-255],[-93,548],[137,-171],[83,-229],[-5,303],[-138,465],[-26,186],[-65,177],[31,341],[56,146],[38,295],[-29,346],[114,425],[21,-450],[118,406],[225,198],[136,252],[212,217],[126,46],[77,-73],[219,220],[168,66],[42,129],[74,54],[153,-14],[292,173],[151,262],[71,316],[163,300],[13,236],[7,321],[194,502],[117,-510],[119,118],[-99,279],[87,287],[122,-128],[34,449],[152,291],[67,233],[140,101],[4,165],[122,-69],[5,148],[122,85],[134,80],[205,-271],[155,-350],[173,-4],[177,-56],[-59,325],[133,473],[126,155],[-44,147],[121,338],[168,208],[142,-70],[234,111],[-5,302],[-204,195],[148,86],[184,-147],[148,-242],[234,-151],[79,60],[172,-182],[162,169],[105,-51],[65,113],[127,-292],[-74,-316],[-105,-239],[-96,-20],[32,-236],[-81,-295],[-99,-291],[20,-166],[221,-327],[214,-189],[143,-204],[201,-350],[78,1],[145,-151],[43,-183],[265,-200],[183,202],[55,317],[56,262],[34,324],[85,470],[-39,286],[20,171],[-32,339],[37,445],[53,120],[-43,197],[67,313],[52,325],[7,168],[104,222],[78,-289],[19,-371],[70,-71],[11,-249],[101,-300],[21,-335],[-10,-214]],[[95032,44386],[78,-203],[-194,4],[-106,363],[166,-142],[56,-22]],[[83531,44530],[-117,-11],[-368,414],[259,116],[146,-180],[97,-180],[-17,-159]],[[94680,44747],[-108,-14],[-170,60],[-58,91],[17,235],[183,-93],[91,-124],[45,-155]],[[94910,44908],[-42,-109],[-206,512],[-57,353],[94,0],[100,-473],[111,-283]],[[84565,44589],[-238,-130],[-33,71],[25,201],[119,360],[275,235],[32,139],[239,133],[194,20],[87,74],[105,-74],[-102,-160],[-289,-258],[-233,-170],[-181,-441]],[[82749,45797],[100,-158],[172,48],[69,-251],[-321,-119],[-193,-79],[-149,5],[95,340],[153,5],[74,209]],[[84139,45797],[-41,-328],[-417,-168],[-370,73],[0,216],[220,123],[174,-177],[185,45],[249,216]],[[94409,45654],[12,-119],[-218,251],[-152,212],[-104,197],[41,60],[128,-142],[228,-272],[65,-187]],[[93760,46238],[-56,-33],[-121,134],[-114,243],[14,99],[166,-250],[111,-193]],[[80172,46575],[533,-59],[61,244],[515,-284],[101,-383],[417,-108],[341,-351],[-317,-225],[-306,238],[-251,-16],[-288,44],[-260,106],[-322,225],[-204,59],[-116,-74],[-506,243],[-48,254],[-255,44],[191,564],[337,-35],[224,-231],[115,-45],[38,-210]],[[87423,46908],[-143,-402],[-27,445],[49,212],[58,200],[63,-173],[0,-282]],[[93299,46550],[-78,-59],[-120,227],[-122,375],[-59,450],[38,57],[30,-175],[84,-134],[135,-375],[131,-200],[-39,-166]],[[92217,47343],[-146,-48],[-44,-166],[-152,-144],[-142,-138],[-148,1],[-228,171],[-158,165],[23,183],[249,-86],[152,46],[42,283],[40,15],[27,-314],[158,45],[78,202],[155,211],[-30,348],[166,11],[56,-97],[-5,-327],[-93,-361]],[[85346,48536],[-104,-196],[-192,108],[-54,254],[281,29],[69,-195]],[[86241,48752],[101,-452],[-234,244],[-232,49],[-157,-39],[-192,21],[65,325],[344,24],[305,-172]],[[92538,47921],[-87,-157],[-52,348],[-65,229],[-126,193],[-158,252],[-200,174],[77,143],[150,-166],[94,-130],[117,-142],[111,-248],[106,-189],[33,-307]],[[87261,49899],[78,-955],[287,-354],[232,627],[319,356],[247,1],[238,-206],[206,-212],[298,-113],[482,-407],[513,-338],[192,-302],[154,-297],[43,-349],[462,-365],[68,-313],[-256,-64],[62,-393],[248,-388],[180,-627],[159,20],[-11,-262],[215,-100],[-84,-111],[295,-249],[-30,-171],[-184,-41],[-69,153],[-238,66],[-281,89],[-216,377],[-158,325],[-144,517],[-362,259],[-235,-169],[-170,-195],[35,-436],[-218,-203],[-155,99],[-288,25],[-247,485],[-282,118],[-69,-168],[-352,-18],[118,481],[175,164],[-72,642],[-134,496],[-538,500],[-229,50],[-417,546],[-82,-287],[-107,-52],[-63,216],[-1,257],[-212,290],[299,213],[198,-11],[-23,156],[-407,1],[-110,352],[-248,109],[-117,293],[374,143],[142,192],[446,-242],[44,-220]],[[84788,51419],[-223,-587],[-209,-113],[-267,115],[-463,-29],[-243,-85],[-39,-447],[248,-526],[150,268],[518,201],[-22,-272],[-121,86],[-121,-347],[-245,-229],[263,-757],[-50,-203],[249,-682],[-2,-388],[-148,-173],[-109,207],[134,484],[-273,-229],[-69,164],[36,228],[-200,346],[21,576],[-186,-179],[24,-689],[11,-846],[-176,-85],[-119,173],[79,544],[-43,570],[-117,4],[-86,405],[115,387],[40,469],[139,891],[58,243],[237,439],[217,-174],[350,-82],[319,25],[275,429],[48,-132]],[[85746,51249],[-15,-517],[-143,58],[-42,-359],[114,-312],[-78,-71],[-112,374],[-82,755],[56,472],[92,215],[20,-322],[164,-52],[26,-241]],[[79393,47122],[-308,-12],[-234,494],[-356,482],[-119,358],[-210,481],[-138,443],[-212,827],[-244,493],[-81,508],[-103,461],[-250,372],[-145,506],[-209,330],[-290,652],[-24,300],[178,-24],[430,-114],[246,-577],[215,-401],[153,-246],[263,-635],[283,-9],[233,-405],[161,-495],[211,-270],[-111,-482],[159,-205],[100,-15],[47,-412],[97,-330],[204,-52],[135,-374],[-70,-735],[-11,-914]],[[82742,51659],[312,-546],[-329,-70],[-93,-403],[12,-535],[-267,-404],[-7,-589],[-107,-903],[-41,210],[-316,-266],[-110,361],[-198,34],[-139,189],[-330,-212],[-101,285],[-182,-32],[-229,68],[-43,793],[-138,164],[-134,505],[-38,517],[32,548],[165,392],[204,-202],[214,110],[56,500],[119,112],[333,128],[199,467],[137,374],[110,221],[236,323],[214,411],[140,462],[112,2],[143,-299],[13,-257],[183,-165],[231,-177],[-20,-232],[-186,-29],[50,-289],[-205,-201],[-158,-533],[204,-560],[-48,-272]],[[85104,55551],[28,-392],[16,-332],[-94,-540],[-102,602],[-130,-300],[89,-435],[-79,-277],[-327,343],[-78,428],[84,280],[-176,280],[-87,-245],[-131,23],[-205,-330],[-46,173],[109,498],[175,166],[151,223],[98,-268],[212,162],[45,264],[196,15],[-16,457],[225,-280],[23,-297],[20,-218]],[[72560,54241],[-242,-135],[-132,470],[-49,849],[126,959],[192,-328],[129,-416],[134,-616],[-42,-615],[-116,-168]],[[33073,56553],[-232,-65],[-50,53],[81,163],[-6,233],[160,77],[58,-21],[-11,-440]],[[84439,56653],[-100,-195],[-87,-373],[-87,-175],[-171,409],[57,158],[70,165],[30,367],[153,35],[-44,-398],[205,570],[-26,-563]],[[82917,56084],[-369,-561],[136,414],[200,364],[167,409],[146,587],[49,-482],[-183,-325],[-146,-406]],[[83856,57606],[166,-183],[177,1],[-5,-247],[-129,-251],[-176,-178],[-10,275],[20,301],[-43,282]],[[84861,57766],[78,-660],[-214,157],[5,-199],[68,-364],[-132,-133],[-11,416],[-84,31],[-43,357],[163,-47],[-4,224],[-169,451],[266,-13],[77,-220]],[[83757,58301],[-74,-510],[-119,295],[-142,450],[238,-22],[97,-213]],[[83700,61512],[171,-168],[85,153],[26,-150],[-46,-245],[95,-423],[-73,-491],[-164,-196],[-43,-476],[62,-471],[147,-65],[123,70],[347,-328],[-27,-321],[91,-142],[-29,-272],[-216,290],[-103,310],[-71,-217],[-177,354],[-253,-87],[-138,130],[14,244],[87,151],[-83,136],[-36,-213],[-137,340],[-41,257],[-11,566],[112,-195],[29,925],[90,535],[169,-1]],[[31780,61349],[-71,-149],[-209,4],[-163,-21],[-16,253],[40,86],[227,-3],[142,-52],[50,-118]],[[28638,61137],[-84,-99],[-156,95],[-159,215],[34,135],[116,41],[64,-20],[187,-53],[147,-142],[46,-161],[-195,-11]],[[29839,62320],[241,-93],[34,101],[217,-3],[165,-152],[73,15],[50,-209],[152,11],[-9,-176],[124,-21],[136,-217],[-103,-240],[-132,128],[-127,-25],[-92,28],[-50,-107],[-106,-37],[-43,144],[-92,-85],[-111,-405],[-71,94],[-14,170],[-185,100],[-131,-41],[-169,43],[-130,-110],[-149,184],[24,190],[256,-82],[210,-47],[100,131],[-127,256],[2,226],[-175,92],[62,163],[170,-26]],[[80649,61615],[-240,-284],[-228,183],[-8,509],[137,267],[304,166],[159,-14],[62,-226],[-122,-260],[-64,-341]],[[6794,61855],[-41,-99],[-69,84],[8,165],[-46,216],[14,65],[48,97],[-19,116],[16,55],[21,-11],[107,-100],[49,-51],[45,-79],[71,-207],[-7,-33],[-108,-126],[-89,-92]],[[6645,62777],[-94,-43],[-47,125],[-32,48],[-3,37],[27,50],[99,-56],[73,-90],[-23,-71]],[[6456,63091],[-9,-63],[-149,17],[21,72],[137,-26]],[[6207,63177],[-15,-34],[-19,8],[-97,21],[-35,133],[-11,24],[74,82],[23,-38],[80,-196]],[[5737,63567],[-33,-58],[-93,107],[14,43],[43,58],[64,-12],[5,-138]],[[27867,64030],[110,-216],[260,66],[98,-138],[235,-366],[173,-267],[92,8],[165,-120],[-20,-167],[205,-24],[210,-242],[-33,-138],[-185,-75],[-187,-29],[-191,46],[-398,-57],[186,329],[-113,154],[-179,39],[-96,171],[-66,336],[-157,-23],[-259,159],[-83,124],[-362,91],[-97,115],[104,148],[-273,30],[-199,-307],[-115,-8],[-40,-144],[-138,-65],[-118,56],[146,183],[60,213],[126,131],[142,116],[210,56],[67,65],[240,-42],[219,-7],[261,-201]],[[28462,64617],[-68,-29],[-70,340],[-104,171],[60,375],[84,-23],[97,-491],[1,-343]],[[83659,64045],[-119,-485],[-146,499],[-32,438],[163,581],[223,447],[127,-176],[-49,-357],[-167,-947]],[[28383,66284],[-303,-95],[-19,219],[130,47],[184,-18],[8,-153]],[[28611,66290],[-48,-420],[-51,75],[4,309],[-124,234],[-1,67],[220,-265]],[[87399,70756],[35,-203],[-156,-357],[-114,189],[-143,-137],[-73,-346],[-181,168],[2,281],[154,352],[158,-68],[114,248],[204,-127]],[[59604,71655],[-188,-251],[21,-111],[8,-48],[-285,-240],[-136,77],[-64,237],[132,22],[19,3],[40,143],[200,-8],[253,176]],[[56583,71675],[152,-199],[216,34],[207,-42],[-7,-103],[151,71],[-35,-175],[-400,-50],[3,98],[-339,115],[52,251]],[[54311,73167],[-100,-465],[41,-183],[-58,-303],[-213,222],[-141,64],[-387,300],[38,304],[325,-54],[284,64],[211,51]],[[52558,74927],[166,-419],[-39,-782],[-126,38],[-113,-197],[-105,156],[-11,713],[-64,338],[153,-30],[139,183]],[[89159,72524],[-104,-472],[48,-296],[-145,-416],[-355,-278],[-488,-36],[-396,-675],[-186,227],[-12,442],[-483,-130],[-329,-279],[-325,-11],[282,-435],[-186,-1004],[-179,-248],[-135,229],[69,533],[-176,172],[-113,405],[263,182],[145,371],[280,306],[203,403],[553,177],[297,-121],[291,1050],[185,-282],[408,591],[158,229],[174,723],[-47,664],[117,374],[295,108],[152,-819],[-9,-479],[-256,-595],[4,-610]],[[52655,75484],[-92,-456],[-126,120],[-64,398],[56,219],[179,226],[47,-507]],[[89974,76679],[195,-126],[197,250],[62,-663],[-412,-162],[-244,-587],[-436,404],[-152,-646],[-308,-9],[-39,587],[138,455],[296,33],[81,817],[83,460],[326,-615],[213,-198]],[[32315,78082],[202,-79],[257,16],[-137,-242],[-102,-38],[-353,250],[-69,198],[105,183],[97,-288]],[[32831,79592],[-135,-11],[-360,186],[-258,279],[96,49],[365,-148],[284,-247],[8,-108]],[[15692,79240],[-140,-82],[-456,269],[-84,209],[-248,207],[-50,168],[-286,107],[-107,321],[24,137],[291,-129],[171,-89],[261,-63],[94,-204],[138,-280],[277,-244],[115,-327]],[[34407,80527],[-184,-517],[181,199],[187,-126],[-98,-206],[247,-162],[128,144],[277,-182],[-86,-433],[194,101],[36,-313],[86,-367],[-117,-520],[-125,-22],[-183,111],[60,484],[-77,75],[-322,-513],[-166,21],[196,277],[-267,144],[-298,-35],[-539,18],[-43,175],[173,208],[-121,160],[234,356],[287,941],[172,336],[241,204],[129,-26],[-54,-160],[-148,-372]],[[13136,82508],[267,47],[-84,-671],[242,-475],[-111,1],[-167,270],[-103,272],[-140,184],[-51,260],[16,188],[131,-76]],[[89901,80562],[280,-1046],[-411,195],[-171,-854],[271,-605],[-8,-413],[-211,356],[-182,-457],[-51,496],[31,575],[-32,638],[64,446],[13,790],[-163,581],[24,808],[257,271],[-110,274],[123,83],[73,-391],[96,-569],[-7,-581],[114,-597]],[[48114,81456],[-493,-349],[-393,89],[225,617],[-145,601],[378,463],[210,276],[233,24],[298,-365],[-149,-406],[46,-422],[-210,-528]],[[53524,83435],[-166,-478],[-291,333],[-39,246],[408,195],[88,-296]],[[7498,84325],[-277,-225],[-142,152],[-43,277],[252,210],[148,90],[185,-40],[117,-183],[-240,-281]],[[49165,85222],[-297,-639],[283,81],[304,-3],[-72,-481],[-250,-530],[287,-38],[270,-759],[190,-95],[171,-673],[79,-233],[337,-113],[-34,-378],[-142,-173],[111,-305],[-250,-310],[-371,6],[-473,-163],[-130,116],[-183,-276],[-257,67],[-195,-226],[-148,118],[407,621],[249,127],[-436,99],[-79,235],[291,183],[-152,319],[52,387],[414,-54],[40,343],[-190,372],[-337,104],[-66,160],[101,264],[-92,163],[-149,-279],[-17,569],[-140,301],[101,611],[216,480],[222,-47],[335,49]],[[4006,85976],[-171,-92],[-182,110],[-168,161],[274,101],[220,-54],[27,-226]],[[27981,87304],[-108,-310],[-123,50],[-73,176],[13,41],[107,177],[114,-13],[70,-121]],[[27250,87631],[-325,-326],[-196,13],[-61,160],[207,273],[381,-6],[-6,-114]],[[2297,88264],[171,-113],[173,61],[225,-156],[276,-79],[-23,-64],[-211,-125],[-211,128],[-106,107],[-245,-34],[-66,52],[17,223]],[[26344,89371],[51,-259],[143,91],[161,-155],[304,-203],[318,-184],[25,-281],[204,46],[199,-196],[-247,-186],[-432,142],[-156,266],[-275,-314],[-396,-306],[-95,346],[-377,-57],[242,292],[35,465],[95,542],[201,-49]],[[45969,89843],[-64,-382],[314,-403],[-361,-451],[-801,-405],[-240,-107],[-365,87],[-775,187],[273,261],[-605,289],[492,114],[-12,174],[-583,137],[188,385],[421,87],[433,-400],[422,321],[349,-167],[453,315],[461,-42]],[[28926,90253],[-312,-30],[-69,289],[118,331],[255,82],[217,-163],[3,-253],[-32,-82],[-180,-174]],[[0,91325],[681,-451],[728,-588],[-24,-367],[187,-147],[-64,429],[754,-88],[544,-553],[-276,-257],[-455,-61],[-7,-578],[-111,-122],[-260,17],[-212,206],[-369,172],[-62,257],[-283,96],[-315,-76],[-151,207],[60,219],[-333,-140],[126,-278],[-158,-251]],[[0,88971],[0,2354]],[[23431,91410],[-173,-207],[-374,179],[-226,-65],[-380,266],[245,183],[194,256],[295,-168],[166,-106],[84,-112],[169,-226]],[[0,92833],[99999,-404],[-305,-30],[-49,187],[-99645,247]],[[0,92833],[36,24],[235,-1],[402,-169],[-24,-81],[-286,-141],[-363,-36],[0,404]],[[24848,91640],[-1,-604],[371,463],[332,-380],[-83,-438],[269,-399],[290,427],[202,510],[16,648],[394,-45],[411,-87],[373,-293],[17,-293],[-207,-315],[196,-316],[-36,-288],[-544,-413],[-386,-91],[-287,178],[-83,-297],[-268,-498],[-81,-258],[-322,-400],[-397,-39],[-220,-250],[-18,-384],[-323,-74],[-340,-479],[-301,-665],[-108,-466],[-15,-686],[408,-99],[125,-553],[130,-448],[388,117],[517,-256],[277,-225],[199,-279],[348,-162],[294,-249],[459,-34],[302,-58],[-45,-511],[86,-594],[201,-661],[414,-561],[214,192],[150,607],[-145,934],[-196,311],[445,276],[314,415],[154,411],[-22,395],[-189,502],[-338,445],[328,619],[-121,535],[-93,922],[194,137],[476,-161],[286,-57],[230,155],[258,-200],[342,-343],[85,-229],[495,-45],[-8,-496],[92,-747],[254,-92],[201,-348],[402,328],[266,652],[184,274],[216,-527],[362,-754],[307,-709],[-112,-371],[370,-333],[250,-338],[442,-152],[179,-189],[110,-500],[216,-78],[112,-223],[20,-664],[-202,-222],[-199,-207],[-458,-210],[-349,-486],[-470,-96],[-594,125],[-417,4],[-287,-41],[-233,-424],[-354,-262],[-401,-782],[-320,-545],[236,97],[446,776],[583,493],[416,59],[245,-290],[-262,-397],[88,-637],[91,-446],[361,-295],[459,86],[278,664],[19,-429],[180,-214],[-344,-387],[-615,-351],[-276,-239],[-310,-426],[-211,44],[-11,500],[483,488],[-445,-19],[-309,-72],[48,-194],[-296,-286],[-286,-204],[-293,-175],[-159,-386],[-35,-98],[-3,-313],[92,-313],[115,-15],[-29,216],[83,-131],[-22,-169],[-188,-96],[-133,12],[-205,-104],[-121,-29],[-162,-29],[-231,-171],[408,111],[82,-112],[-389,-177],[-177,-1],[8,72],[-84,-164],[82,-27],[-60,-424],[-203,-455],[-20,152],[-61,31],[-91,147],[57,-318],[66,-106],[8,-222],[-89,-230],[-157,-472],[-25,24],[86,402],[-142,226],[-33,490],[-53,-255],[59,-375],[-175,88],[183,-186],[12,-562],[79,-41],[29,-204],[39,-591],[-176,-439],[-288,-175],[-182,-346],[-139,-38],[-141,-217],[-39,-199],[-305,-383],[-157,-281],[-131,-351],[-43,-419],[50,-411],[92,-505],[124,-418],[1,-256],[132,-685],[-9,-398],[-12,-230],[-69,-361],[-83,-74],[-137,71],[-44,259],[-106,136],[-147,508],[-129,452],[-42,231],[57,393],[-77,325],[-217,494],[-108,91],[-281,-269],[-49,30],[-135,276],[-174,146],[-314,-75],[-247,66],[-212,-41],[-118,-83],[54,-166],[-5,-240],[59,-117],[-53,-77],[-103,87],[-104,-112],[-202,18],[-207,313],[-242,-74],[-202,137],[-173,-42],[-234,-138],[-253,-438],[-276,-255],[-152,-282],[-63,-266],[-3,-407],[14,-284],[52,-201],[1,-1],[-1,-1],[-107,-516],[-49,-426],[-20,-791],[-27,-289],[48,-322],[86,-288],[56,-458],[184,-440],[65,-337],[109,-291],[295,-157],[114,-247],[244,165],[212,60],[208,106],[175,101],[176,241],[67,345],[22,496],[48,173],[188,155],[294,137],[246,-21],[169,50],[66,-125],[-9,-285],[-149,-351],[-66,-360],[51,-103],[-42,-255],[-69,-461],[-71,152],[-58,-10],[1,-87],[53,-3],[-5,-160],[-45,-256],[24,-91],[-29,-212],[18,-56],[-32,-299],[-55,-156],[-50,-19],[-55,-205],[90,-107],[24,88],[82,-75],[29,-23],[61,104],[79,8],[26,-48],[43,29],[129,-53],[128,16],[90,65],[32,66],[89,-31],[66,-40],[73,14],[55,51],[127,-82],[44,-13],[85,-110],[80,-132],[101,-91],[73,-162],[-24,-57],[-14,-132],[29,-216],[-64,-202],[-30,-237],[-9,-261],[15,-152],[7,-266],[-43,-58],[-26,-253],[19,-156],[-56,-151],[12,-159],[43,-97],[70,-321],[108,-238],[130,-252],[100,-212],[-6,-125],[111,-27],[26,48],[77,-145],[136,42],[119,150],[168,119],[95,176],[153,-34],[-10,-58],[155,-21],[124,-102],[90,-177],[105,-164],[143,-18],[209,412],[114,63],[3,195],[51,500],[159,274],[175,11],[22,123],[218,-49],[218,298],[109,132],[134,285],[98,-36],[73,-156],[-54,-199],[-8,-139],[-163,-69],[91,-268],[-3,-309],[-123,-343],[105,-469],[120,38],[62,427],[-86,208],[-14,447],[346,241],[-38,278],[97,186],[100,-415],[195,-9],[180,-330],[11,-195],[249,-6],[297,61],[159,-264],[213,-73],[155,184],[4,149],[344,35],[333,9],[-236,-175],[95,-279],[222,-44],[210,-291],[45,-473],[144,13],[109,-139],[183,-217],[171,-385],[8,-304],[105,-14],[149,-289],[109,-205],[333,-119],[30,107],[225,43],[298,-159],[95,-65],[204,-140],[294,-499],[46,-242],[95,28],[69,-327],[155,-1033],[149,-97],[7,-408],[-208,-487],[86,-178],[491,-92],[10,-593],[211,388],[349,-212],[462,-361],[135,-346],[-45,-327],[323,182],[540,-313],[415,23],[411,-489],[355,-662],[214,-170],[237,-24],[101,-186],[94,-752],[46,-358],[-110,-977],[-142,-385],[-391,-822],[-177,-668],[-206,-513],[-69,-11],[-78,-435],[20,-1107],[-77,-910],[-30,-390],[-88,-233],[-49,-790],[-282,-771],[-47,-610],[-225,-256],[-65,-355],[-302,2],[-437,-227],[-195,-263],[-311,-173],[-327,-470],[-235,-586],[-41,-441],[46,-326],[-51,-597],[-63,-289],[-195,-325],[-308,-1040],[-244,-468],[-189,-277],[-127,-562],[-183,-337],[-121,-372],[-313,-328],[-205,118],[-151,-63],[-256,253],[-189,-19],[-169,327],[-19,-308],[353,-506],[-38,-408],[173,-257],[-14,-289],[-267,-757],[-412,-317],[-557,-123],[-305,59],[59,-352],[-57,-442],[51,-298],[-167,-208],[-284,-82],[-267,216],[-108,-155],[39,-587],[188,-178],[152,186],[82,-307],[-255,-183],[-223,-367],[-41,-595],[-66,-316],[-262,-2],[-218,-302],[-80,-443],[274,-433],[265,-119],[-96,-531],[-328,-333],[-180,-692],[-254,-234],[-113,-276],[89,-614],[185,-342],[-117,30],[-247,4],[-134,-145],[-250,-213],[-45,-552],[-118,-14],[-313,192],[-318,412],[-346,338],[-87,374],[79,346],[-140,393],[-36,1007],[119,568],[293,457],[-422,172],[265,522],[94,982],[309,-208],[145,1224],[-186,157],[-87,-738],[-175,83],[87,845],[95,1095],[127,404],[-79,576],[-23,666],[117,19],[170,954],[192,945],[118,881],[-64,885],[83,487],[-34,730],[163,721],[50,1143],[89,1227],[87,1321],[-20,967],[-58,832],[-279,340],[-24,242],[-551,593],[-498,646],[-214,365],[-115,488],[46,170],[-236,775],[-274,1090],[-262,1177],[-114,269],[-87,435],[-216,386],[-198,239],[90,264],[-134,563],[86,414],[221,373],[148,442],[-60,258],[-106,-275],[-166,259],[56,167],[-47,536],[97,89],[52,368],[105,381],[-20,241],[153,126],[190,236],[-37,183],[103,44],[-12,296],[65,214],[138,40],[117,371],[106,310],[-102,141],[52,343],[-62,540],[59,155],[-44,500],[-112,315],[-93,170],[-59,319],[68,158],[-70,40],[-52,195],[-138,165],[-122,-38],[-56,-205],[-112,-149],[-61,-20],[-27,-123],[132,-321],[-75,-76],[-40,-87],[-130,-30],[-48,353],[-36,-101],[-92,35],[-56,238],[-114,39],[-72,69],[-119,-1],[-8,-128],[-32,89],[-151,131],[-56,124],[32,103],[-11,130],[-77,142],[-109,116],[-95,76],[-19,173],[-73,105],[18,-172],[-55,-141],[-64,164],[-89,58],[-38,120],[2,179],[36,187],[-78,83],[64,114],[-96,186],[-130,238],[-61,200],[-117,185],[-140,267],[31,92],[46,-89],[21,41],[-48,185],[-84,52],[-31,-140],[-161,9],[-100,57],[-115,117],[-154,37],[-79,127],[-142,103],[-174,11],[-127,117],[-149,244],[-314,636],[-144,192],[-226,154],[-156,-43],[-223,-223],[-140,-58],[-196,156],[-208,112],[-260,271],[-208,83],[-314,275],[-233,282],[-70,158],[-155,35],[-284,187],[-116,270],[-299,335],[-139,373],[-66,288],[93,57],[-29,169],[64,153],[1,204],[-93,266],[-25,235],[-94,298],[-244,587],[-280,462],[-135,368],[-238,241],[-51,145],[42,365],[-142,137],[-164,288],[-69,412],[-149,48],[-162,311],[-130,288],[-12,184],[-149,446],[-99,452],[5,227],[-201,235],[-93,-26],[-159,163],[-44,-240],[46,-284],[27,-444],[95,-243],[206,-407],[46,-139],[42,-42],[37,-203],[49,8],[56,-381],[85,-150],[59,-210],[174,-300],[92,-550],[83,-259],[77,-277],[15,-311],[134,-20],[112,-268],[100,-264],[-6,-106],[-117,-217],[-49,3],[-74,359],[-182,337],[-200,286],[-142,150],[9,432],[-42,320],[-132,183],[-191,264],[-37,-76],[-70,154],[-171,143],[-164,343],[20,44],[115,-33],[103,221],[10,266],[-214,422],[-163,163],[-102,369],[-103,388],[-129,472],[-113,531],[-46,302],[-180,340],[-130,71],[-30,169],[-156,30],[-100,159],[-258,59],[-70,95],[-34,324],[-270,594],[-231,821],[10,137],[-123,195],[-215,495],[-38,482],[-148,323],[61,489],[-10,507],[-89,453],[109,557],[67,1072],[-50,792],[-88,506],[-80,274],[33,115],[402,-200],[148,-558],[68,156],[-44,485],[-94,484],[-38,1],[-537,581],[-199,255],[-503,245],[-155,523],[40,362],[-356,252],[-48,476],[-336,429],[-6,304],[-153,223],[-245,188],[-78,515],[-358,478],[-150,558],[-267,38],[-441,15],[-326,170],[-574,613],[-266,112],[-486,211],[-385,-50],[-546,271],[-330,252],[-309,-125],[58,-411],[-154,-38],[-321,-123],[-245,-199],[-307,-126],[-40,348],[125,580],[295,182],[-76,148],[-354,-329],[-190,-394],[-400,-420],[203,-287],[-262,-424],[-299,-247],[-278,-181],[-69,-261],[-434,-305],[-87,-278],[-325,-252],[-191,45],[-259,-165],[-282,-201],[-231,-197],[-477,-169],[-43,99],[304,276],[271,182],[296,324],[345,66],[137,243],[385,353],[62,119],[205,208],[48,448],[141,349],[-320,-179],[-90,102],[-150,-215],[-181,300],[-75,-212],[-104,294],[-278,-236],[-170,0],[-24,352],[50,217],[-179,210],[-361,-113],[-235,277],[-190,142],[-1,334],[-214,252],[108,340],[226,330],[99,303],[225,43],[191,-94],[224,285],[201,-51],[212,183],[-52,270],[-155,106],[205,228],[-170,-7],[-295,-128],[-85,-131],[-219,131],[-392,-67],[-407,142],[-117,238],[-351,343],[390,247],[620,289],[228,0],[-38,-295],[586,22],[-225,366],[-342,226],[-197,295],[-267,252],[-381,187],[155,309],[493,19],[350,270],[66,287],[284,281],[271,68],[526,262],[256,-40],[427,315],[421,-124],[201,-266],[123,114],[469,-35],[-16,-136],[425,-101],[283,59],[585,-186],[534,-56],[214,-77],[370,96],[421,-177],[302,-83],[518,-142],[438,-284],[289,-55],[244,247],[336,184],[413,-72],[416,259],[455,148],[191,-245],[207,138],[62,278],[192,-63],[470,-530],[369,401],[38,-448],[341,96],[105,173],[337,-34],[424,-248],[650,-217],[383,-100],[272,38],[375,-300],[-391,-293],[502,-127],[750,70],[236,103],[296,-354],[302,299],[-283,251],[179,202],[338,27],[223,59],[224,-141],[279,-321],[310,47],[491,-266],[431,94],[405,-14],[-32,367],[247,103],[431,-200],[-2,-559],[177,471],[223,-16],[126,594],[-298,364],[-324,239],[22,653],[329,429],[366,-95],[281,-261],[378,-666],[-247,-290],[517,-120]],[[18287,93781],[-139,-277],[618,179],[386,-298],[314,302],[254,-194],[227,-580],[140,244],[-197,606],[244,86],[276,-94],[311,-239],[175,-575],[86,-417],[466,-293],[502,-279],[-31,-260],[-456,-48],[178,-227],[-94,-217],[-503,93],[-478,160],[-322,-36],[-522,-201],[-824,-103],[-374,-41],[-151,279],[-379,161],[-246,-66],[-343,468],[185,62],[429,101],[392,-26],[362,103],[-537,138],[-594,-47],[-394,12],[-146,217],[644,237],[-428,-9],[-485,156],[233,443],[193,235],[744,359],[284,-114]],[[20972,93958],[-244,-390],[-434,413],[95,83],[372,24],[211,-130]],[[28794,93770],[25,-163],[-296,17],[-299,13],[-304,-80],[-80,36],[-306,313],[12,213],[133,39],[636,-63],[479,-325]],[[25955,93803],[219,-369],[256,477],[704,242],[477,-611],[-42,-387],[550,172],[263,235],[616,-299],[383,-282],[36,-258],[515,134],[290,-376],[670,-234],[242,-238],[263,-553],[-510,-275],[654,-386],[441,-130],[400,-543],[437,-39],[-87,-414],[-487,-687],[-342,253],[-437,568],[-359,-74],[-35,-338],[292,-344],[377,-272],[114,-157],[181,-584],[-96,-425],[-350,160],[-697,473],[393,-509],[289,-357],[45,-206],[-753,236],[-596,343],[-337,287],[97,167],[-414,304],[-405,286],[5,-171],[-803,-94],[-235,203],[183,435],[522,10],[571,76],[-92,211],[96,294],[360,576],[-77,261],[-107,203],[-425,286],[-563,201],[178,150],[-294,367],[-245,34],[-219,201],[-149,-175],[-503,-76],[-1011,132],[-588,174],[-450,89],[-231,207],[290,270],[-394,2],[-88,599],[213,528],[286,241],[717,158],[-204,-382]],[[22123,94208],[331,-124],[496,75],[72,-172],[-259,-283],[420,-254],[-50,-532],[-455,-229],[-268,50],[-192,225],[-690,456],[5,189],[567,-73],[-306,386],[329,286]],[[89889,93835],[-421,-4],[-569,66],[-49,31],[263,234],[348,54],[394,-226],[34,-155]],[[24112,93575],[-298,-442],[-317,22],[-173,519],[4,294],[145,251],[276,161],[579,-20],[530,-144],[-415,-526],[-331,-115]],[[16539,92764],[-731,-294],[-147,259],[-641,312],[93,193],[218,489],[241,388],[-272,362],[939,93],[397,-123],[709,-33],[270,-171],[298,-249],[-349,-149],[-681,-415],[-344,-414],[0,-248]],[[91869,94941],[-321,-234],[-444,53],[-516,233],[66,192],[518,-89],[697,-155]],[[23996,94879],[-151,-229],[-403,44],[-337,155],[148,266],[399,159],[243,-208],[101,-187]],[[90301,95224],[-219,-439],[-1023,16],[-461,-139],[-550,384],[149,406],[366,111],[734,-26],[1004,-313]],[[22639,95907],[212,-273],[9,-303],[-127,-440],[-458,-60],[-298,94],[5,345],[-455,-46],[-18,457],[299,-18],[419,201],[390,-34],[22,77]],[[19941,95601],[109,-210],[247,99],[291,-26],[49,-289],[-169,-281],[-940,-91],[-701,-256],[-423,-14],[-35,193],[577,261],[-1255,-70],[-389,106],[379,577],[262,165],[782,-199],[493,-350],[485,-45],[-397,565],[255,215],[286,-68],[94,-282]],[[65981,92363],[-164,-52],[-907,77],[-74,262],[-503,158],[-40,320],[284,126],[-10,323],[551,503],[-255,73],[665,518],[-75,268],[621,312],[917,380],[925,110],[475,220],[541,76],[193,-233],[-187,-184],[-984,-293],[-848,-282],[-863,-562],[-414,-577],[-435,-568],[56,-491],[531,-484]],[[23699,96131],[308,-190],[547,1],[240,-194],[-64,-222],[319,-134],[177,-140],[374,-26],[406,-50],[441,128],[566,51],[451,-42],[298,-223],[62,-244],[-174,-157],[-414,-127],[-355,72],[-797,-91],[-570,-11],[-449,73],[-738,190],[-96,325],[-34,293],[-279,258],[-574,72],[-322,183],[104,242],[573,-37]],[[17722,96454],[-38,-454],[-214,-205],[-259,-29],[-517,-252],[-444,-91],[-377,128],[472,442],[570,383],[426,-9],[381,87]],[[63641,74970],[141,-419],[130,-28],[85,-159],[-228,-47],[-49,-459],[-47,-207],[-102,-138],[7,-293],[88,-436],[263,-123],[193,-296],[395,-102],[434,156],[27,139],[-52,417],[40,618],[-216,200],[71,405],[-184,34],[61,498],[262,-145],[244,189],[-202,355],[-80,338],[-224,-151],[-28,-433],[-87,383],[-15,144],[68,246],[-53,206],[-322,202],[-125,530],[-154,150],[-9,192],[270,-56],[11,432],[236,96],[243,-88],[50,576],[-50,365],[-278,-28],[-236,144],[-321,-260],[-259,-124],[-127,-350],[-269,-97],[-276,-610],[252,-561],[-27,-398],[303,-696],[146,-311]],[[0,88971],[99997,-3],[-357,-260],[-360,44],[250,-315],[166,-487],[128,-159],[32,-244],[-71,-157],[-518,129],[-777,-445],[-247,-69],[-425,-415],[-403,-362],[-102,-269],[-397,409],[-724,-464],[-126,220],[-268,-254],[-371,81],[-90,-388],[-333,-572],[10,-239],[316,-132],[-37,-860],[-258,-22],[-119,-494],[116,-255],[-486,-301],[-96,-675],[-415,-144],[-83,-600],[-400,-551],[-103,407],[-119,862],[-155,1313],[134,819],[234,353],[15,276],[431,132],[496,744],[479,608],[499,471],[223,833],[-337,-50],[-167,-487],[-705,-648],[-227,726],[-717,-201],[-696,-990],[230,-362],[-620,-154],[-430,-61],[20,427],[-431,90],[-344,-291],[-850,102],[-913,-175],[-900,-1153],[-1065,-1394],[438,-74],[136,-370],[270,-132],[178,296],[305,-39],[401,-650],[9,-502],[-217,-591],[-23,-705],[-126,-945],[-418,-855],[-94,-409],[-377,-688],[-374,-682],[-179,-349],[-370,-346],[-175,-8],[-175,287],[-373,-432],[-43,-197],[-106,36],[-120,-201],[-83,-201],[10,-424],[-143,-130],[-50,-105],[-104,-174],[-185,-97],[-121,-159],[-9,-256],[-32,-65],[111,-96],[157,-259],[240,-697],[68,-383],[3,-681],[-105,-325],[-252,-113],[-222,-245],[-250,-51],[-31,322],[52,443],[-123,615],[206,99],[-190,506],[-135,113],[-34,-112],[-81,-49],[-10,112],[-72,54],[-75,94],[77,260],[65,69],[-25,108],[71,319],[-18,97],[-163,64],[-131,158],[-388,-171],[-204,-277],[-300,-161],[148,274],[-58,230],[220,397],[-147,310],[-242,-209],[-314,-411],[-171,-381],[-272,-29],[-142,-275],[147,-400],[227,-97],[9,-265],[220,-172],[311,421],[247,-230],[179,-15],[46,-310],[-394,-165],[-130,-319],[-270,-296],[-142,-414],[299,-324],[109,-582],[169,-541],[189,-454],[-5,-439],[-174,-161],[66,-315],[164,-184],[-43,-481],[-71,-468],[-155,-53],[-203,-640],[-225,-775],[-258,-705],[-382,-545],[-386,-498],[-313,-68],[-170,-262],[-96,192],[-157,-294],[-388,-296],[-294,-90],[-95,-624],[-154,-35],[-73,429],[66,228],[-373,190],[-131,-97],[-371,-505],[-231,-558],[-61,-410],[212,-623],[260,-772],[252,-365],[169,-475],[127,-1093],[-37,-1039],[-232,-389],[-318,-381],[-227,-492],[-346,-550],[-101,378],[78,401],[-206,335],[-233,87],[-112,307],[-141,611],[-249,271],[-238,-11],[41,464],[-245,-3],[-22,-650],[-150,-863],[-90,-522],[19,-428],[181,-18],[113,-539],[50,-512],[155,-338],[168,-69],[144,-306],[64,-56],[164,-356],[116,-396],[16,-398],[-29,-269],[27,-203],[20,-349],[98,-163],[109,-523],[-5,-199],[-197,-40],[-263,438],[-329,469],[-32,301],[-161,395],[-38,489],[-100,322],[30,431],[-61,250],[-110,227],[-47,292],[-148,334],[-135,280],[-45,-347],[-53,328],[30,369],[82,566],[-27,439],[86,452],[-94,350],[23,644],[-113,306],[-90,707],[-50,746],[-121,490],[-183,-297],[-315,-421],[-156,53],[-172,138],[96,732],[-58,554],[-218,681],[34,213],[-163,76],[-197,481],[-79,309],[-16,301],[-53,284],[-116,344],[-256,23],[25,-243],[-87,-329],[-118,120],[-41,-108],[-78,65],[-108,53],[-39,-216],[-189,7],[-343,-122],[16,-445],[-148,-349],[-400,-398],[-311,-695],[-209,-373],[-276,-386],[-1,-272],[-138,-146],[-250,-212],[-130,-31],[-84,-450],[58,-769],[15,-490],[-118,-561],[-1,-1004],[-144,-29],[-126,-450],[84,-195],[-253,-167],[-93,-402],[-112,-170],[-263,552],[-128,827],[-107,596],[-97,279],[-148,568],[-69,739],[-48,369],[-253,811],[-115,1145],[-83,756],[1,716],[-54,553],[-404,-353],[-196,70],[-362,716],[133,214],[-82,232],[-326,501],[-203,150],[-83,425],[-215,449],[-512,-111],[-451,-11],[-391,-83],[-523,179],[-302,136],[-314,76],[-118,725],[-133,105],[-214,-106],[-280,-286],[-339,196],[-281,454],[-267,168],[-186,561],[-205,788],[-149,-96],[-177,196],[-103,-231],[-165,29],[58,-261],[-25,-135],[89,-445],[109,-510],[137,-135],[47,-207],[190,-248],[16,-244],[-27,-197],[35,-199],[80,-165],[37,-194],[41,-145],[-18,430],[75,310],[76,64],[84,-186],[5,-345],[-61,-348],[53,-226],[49,29],[11,-162],[217,93],[230,-15],[168,-18],[190,400],[207,379],[176,364],[80,201],[35,-51],[-26,-244],[-37,-108],[38,-466],[125,-404],[155,-214],[204,-78],[164,-107],[125,-339],[75,-196],[100,-75],[-1,-132],[-101,-352],[-44,-166],[-117,-189],[-104,-404],[-126,31],[-58,-141],[-44,-300],[34,-395],[-26,-72],[-128,2],[-174,-221],[-27,-288],[-63,-125],[-173,5],[-109,-149],[1,-239],[-134,-164],[-153,56],[-186,-199],[-128,-33],[-201,-159],[-54,-263],[-6,-201],[-277,-249],[-444,-276],[-249,-417],[-122,-32],[-83,34],[-163,-245],[-177,-113],[-233,-31],[-70,-34],[-61,-156],[-73,-43],[-42,-150],[-138,13],[-89,-80],[-192,30],[-72,345],[8,323],[-46,174],[-54,437],[-80,243],[56,29],[-29,270],[34,114],[-12,257],[-36,253],[-84,177],[-22,236],[-143,212],[-148,495],[-79,482],[-192,406],[-124,97],[-184,563],[-32,411],[12,350],[-159,655],[-130,231],[-150,122],[-92,339],[15,133],[-77,307],[-81,131],[-108,440],[-170,476],[-141,406],[-139,-3],[44,325],[12,206],[34,236],[-9,86],[-78,-238],[-60,-446],[-75,-308],[-65,-103],[-93,191],[-125,263],[-198,847],[-29,-53],[115,-624],[171,-594],[210,-920],[102,-321],[90,-334],[249,-654],[-55,-103],[9,-384],[323,-530],[49,-121],[90,-580],[-61,-107],[40,-608],[102,-706],[106,-145],[152,-219],[161,-683],[77,-543],[152,-288],[379,-558],[154,-336],[151,-341],[87,-203],[136,-178],[66,-183],[-9,-245],[-158,-142],[119,-161],[91,-109],[54,-244],[125,-248],[138,-2],[262,151],[302,70],[245,184],[138,39],[99,108],[158,20],[89,12],[128,88],[147,59],[132,202],[105,2],[6,-163],[-25,-344],[1,-310],[-59,-214],[-78,-639],[-134,-659],[-172,-755],[-238,-866],[-237,-661],[-327,-806],[-278,-479],[-415,-586],[-259,-450],[-304,-715],[-64,-312],[-63,-140],[-195,-236],[-68,-246],[-104,-44],[-40,-416],[-89,-238],[-54,-393],[-112,-195],[-128,-728],[16,-335],[178,-216],[8,-153],[-76,-357],[16,-180],[-18,-282],[97,-370],[115,-583],[101,-129],[45,-265],[-11,-588],[34,-519],[11,-923],[49,-290],[-83,-422],[-108,-410],[-177,-366],[-254,-225],[-313,-287],[-313,-634],[-107,-108],[-194,-420],[-115,-136],[-23,-421],[132,-448],[54,-346],[4,-177],[49,29],[-8,-579],[-45,-274],[65,-102],[-41,-246],[-116,-210],[-229,-199],[-334,-320],[-122,-219],[24,-248],[71,-40],[-24,-311],[-70,-430],[-32,-491],[-72,-267],[-190,-298],[-54,-86],[-118,-300],[-77,-303],[-158,-424],[-314,-609],[-196,-355],[-209,-269],[-291,-229],[-141,-31],[-36,-164],[-169,88],[-138,-113],[-301,114],[-168,-72],[-115,31],[-286,-233],[-238,-94],[-171,-223],[-127,-14],[-117,210],[-94,11],[-120,264],[-13,-82],[-37,159],[2,346],[-90,396],[89,108],[-7,453],[-182,553],[-139,501],[-1,1],[-199,768],[-207,446],[-108,432],[-62,575],[-68,428],[-93,910],[-7,707],[-35,322],[-108,243],[-144,489],[-146,708],[-60,371],[-226,577],[-17,453],[-26,372],[38,519],[96,541],[15,254],[90,532],[66,243],[159,386],[90,263],[29,438],[-15,335],[-83,211],[-74,358],[-68,355],[15,122],[85,235],[-84,570],[-57,396],[-139,374],[26,115],[-39,183],[-74,444],[-228,626],[-285,596],[-184,488],[-169,610],[9,196],[61,189],[67,430],[56,438],[-52,90],[96,663],[40,467],[-108,390],[-127,100],[-56,265],[-71,85],[3,163],[-289,-213],[-105,32],[-107,-133],[-222,13],[-149,370],[-91,427],[-197,390],[-209,-8],[-245,1],[-229,-69],[-224,-126],[-436,-346],[-154,-203],[-250,-171],[-248,168],[-126,-7],[-194,116],[-178,-7],[-329,-103],[-193,-170],[-275,-217],[-54,15],[-73,-5],[-286,282],[-252,450],[-237,323],[-187,381],[-75,44],[-200,238],[-144,316],[-49,216],[-34,437],[-122,349],[-108,232],[-71,76],[-69,118],[-32,261],[-41,130],[-80,97],[-149,247],[-117,39],[-63,166],[1,90],[-84,125],[-18,127],[-46,453],[36,262],[-115,460],[-138,210],[122,112],[134,415],[66,304],[-24,318],[78,291],[34,557],[-30,583],[-34,294],[28,295],[-72,281],[-146,255],[12,249],[13,274],[106,161],[91,308],[-18,200],[96,417],[155,376],[93,95],[74,344],[6,315],[100,365],[185,216],[177,603],[144,235],[259,66],[219,403],[139,158],[232,493],[-70,735],[106,508],[37,312],[179,399],[278,270],[206,244],[186,612],[87,362],[205,-2],[167,-251],[264,41],[288,-131],[121,-6],[267,323],[300,102],[175,244],[268,180],[471,105],[459,48],[140,-87],[262,232],[297,5],[113,-137],[190,35],[302,239],[195,-71],[-9,-299],[236,217],[20,-113],[-139,-289],[-2,-274],[96,-147],[-36,-511],[-183,-297],[53,-322],[143,-10],[70,-281],[106,-92],[326,-204],[117,51],[232,-98],[368,-264],[130,-526],[250,-114],[391,-248],[296,-293],[136,153],[133,272],[-65,452],[87,288],[200,277],[192,80],[375,-121],[95,-264],[104,-2],[88,-101],[276,-69],[68,-196],[369,10],[268,-156],[275,-175],[129,-92],[214,188],[114,169],[245,49],[198,-75],[75,-293],[65,193],[222,-140],[217,-33],[137,149],[80,194],[-19,34],[74,276],[56,446],[40,149],[8,6],[99,482],[138,416],[5,21],[-26,452],[68,243],[-102,268],[105,222],[-169,-51],[-233,136],[-191,-340],[-421,-66],[-225,317],[-300,20],[-64,-245],[-192,-71],[-268,315],[-303,-10],[-165,587],[-203,328],[135,459],[-176,283],[308,565],[428,23],[117,449],[529,-78],[334,383],[324,167],[459,13],[485,-416],[399,-229],[323,91],[239,-53],[328,309],[42,252],[-70,403],[-160,218],[-154,68],[-102,181],[-354,499],[-317,223],[-240,347],[202,95],[231,494],[-156,234],[410,241],[-8,129],[-249,-95],[-222,-48],[-185,-191],[-260,-31],[-239,-220],[16,-368],[136,-142],[284,35],[-55,-210],[-304,-103],[-377,-342],[-154,121],[61,277],[-304,173],[50,113],[265,197],[-80,135],[-432,149],[-19,221],[-257,-73],[-103,-325],[-215,-437],[6,-152],[-135,-128],[-84,56],[-78,-713],[-144,-245],[-101,-422],[89,-337],[33,-228],[243,-190],[-51,-145],[-330,-33],[-118,-182],[-232,-319],[-87,275],[3,122],[-169,17],[-145,56],[-336,-154],[192,-332],[-141,-96],[-154,0],[-147,304],[-52,-130],[62,-353],[139,-277],[-105,-130],[155,-272],[137,-171],[4,-334],[-257,157],[82,-302],[-176,-62],[105,-521],[-184,-7],[-228,257],[-104,472],[-49,393],[-108,272],[-143,337],[-18,168],[-48,41],[-5,130],[-154,199],[-24,281],[23,403],[38,184],[-46,93],[-59,46],[-78,192],[-120,118],[-261,218],[-161,213],[-254,176],[-233,435],[56,44],[-127,248],[-5,200],[-179,93],[-85,-255],[-82,198],[6,205],[10,9],[62,54],[-221,86],[-226,-210],[15,-293],[-34,-168],[91,-301],[261,-298],[140,-488],[309,-476],[217,3],[68,-130],[-78,-118],[249,-213],[204,-179],[238,-308],[29,-111],[-52,-211],[-154,276],[-242,97],[-116,-382],[200,-219],[-33,-309],[-116,-35],[-148,-506],[-116,-46],[1,181],[57,317],[60,126],[-108,342],[-85,298],[-115,74],[-82,255],[-179,107],[-120,238],[-206,38],[-217,267],[-254,384],[-189,341],[-86,584],[-138,68],[-226,195],[-128,-80],[-161,-274],[-115,-43],[-252,-334],[-548,160],[-404,-192],[-32,-355],[15,-344],[-263,-393],[-356,-125],[-25,-199],[-171,-327],[-107,-481],[108,-338],[-160,-263],[-60,-384],[-210,-118],[-197,-455],[-352,-8],[-265,11],[-174,-209],[-106,-223],[-136,49],[-103,199],[-79,340],[-259,92],[-112,-153],[-146,83],[-143,-65],[42,462],[-26,363],[-124,55],[-67,224],[22,386],[111,215],[20,239],[58,355],[-6,250],[-56,212],[-12,200],[14,420],[-114,257],[393,426],[340,-107],[373,4],[296,-101],[230,31],[449,-19],[144,354],[53,1177],[-287,620],[-205,299],[-424,228],[-28,430],[360,129],[466,-152],[-88,669],[263,-254],[646,461],[84,484],[243,119],[222,117],[143,162],[244,870],[380,247],[231,-17],[54,125],[232,32],[52,-130],[188,291],[-63,222],[-13,335],[-113,328],[-8,604],[46,159],[80,178],[244,36],[98,163],[223,167],[-9,-304],[-82,-192],[33,-166],[151,-89],[-68,-223],[-83,64],[-200,-425],[76,-288],[4,-228],[281,-138],[-3,-210],[283,111],[156,162],[313,-233],[132,-189],[189,174],[434,273],[350,200],[277,-100],[21,-144],[268,-7],[63,260],[383,191],[-59,497],[10,445],[136,371],[262,202],[221,-442],[223,12],[53,453],[32,349],[-102,-75],[-176,210],[-24,340],[351,164],[350,86],[301,-97],[287,17],[316,327],[-291,280],[-504,-47],[-489,-216],[-452,-125],[-161,322],[-269,195],[62,581],[-135,534],[133,344],[252,371],[635,640],[185,124],[-28,250],[-387,279],[-478,-167],[-269,-413],[43,-361],[-441,-475],[-537,-509],[-202,-832],[198,-416],[265,-328],[-255,-666],[-289,-138],[-106,-992],[-157,-554],[-337,57],[-158,-468],[-321,-27],[-89,558],[-232,671],[-211,835],[-187,363],[-548,-684],[-370,-138],[-385,301],[-99,635],[-88,1364],[256,380],[733,496],[549,609],[508,824],[668,1141],[465,444],[763,741],[610,259],[457,-31],[423,489],[506,-26],[499,118],[869,-433],[-358,-158],[305,-371],[286,206],[456,-358],[761,-140],[1050,-668],[213,-281],[18,-393],[-308,-311],[-454,-157],[-1240,449],[-204,-75],[453,-433],[36,-878],[358,-180],[217,-153],[36,286],[-174,263],[183,215],[672,-368],[234,144],[-187,433],[647,578],[256,-34],[260,-206],[161,406],[-231,352],[136,353],[-204,367],[777,-190],[158,-331],[-351,-73],[2,-328],[218,-203],[429,128],[68,377],[581,282],[969,507],[209,-29],[-273,-359],[344,-61],[199,202],[521,16],[412,245],[317,-356],[315,391],[-291,343],[145,195],[820,-179],[385,-185],[1006,-675],[186,309],[-282,313],[-8,125],[-335,58],[92,280],[-149,461],[-8,189],[512,535],[182,537],[207,116],[735,-156],[58,-328],[-263,-479],[173,-189],[89,-413],[-63,-809],[307,-362],[-120,-395],[-544,-839],[318,-87],[110,213],[306,151],[74,293],[240,281],[-162,336],[130,390],[-304,49],[-67,328],[222,594],[-361,481],[497,398],[-64,421],[139,13],[145,-328],[-109,-570],[297,-108],[-127,426],[465,233],[577,31],[513,-337],[-247,492],[-28,630],[484,119],[668,-26],[602,77],[-226,309],[321,388],[319,16],[540,293],[734,79],[93,162],[729,55],[227,-133],[624,314],[510,-10],[77,255],[265,252],[656,242],[476,-191],[-378,-146],[629,-90],[75,-292],[254,143],[812,-7],[626,-289],[223,-221],[-69,-307],[-307,-175],[-730,-328],[-209,-175],[345,-83],[410,-149],[250,112],[142,-379],[122,153],[444,93],[892,-97],[67,-276],[1162,-88],[15,451],[590,-103],[443,3],[449,-312],[128,-378],[-165,-247],[349,-465],[437,-240],[268,620],[446,-266],[473,159],[538,-182],[204,166],[455,-83],[-201,549],[367,256],[2509,-384],[236,-351],[727,-451],[1122,112],[553,-98],[231,-244],[-33,-432],[342,-168],[372,121],[492,15],[525,-116],[526,66],[484,-526],[344,189],[-224,378],[123,263],[886,-166],[578,36],[799,-282],[-99610,-258]],[[23933,96380],[-126,-17],[-521,38],[-74,165],[559,-9],[195,-109],[-33,-68]],[[19392,96485],[-518,-170],[-411,191],[224,188],[406,60],[392,-92],[-93,-177]],[[56867,96577],[-620,-241],[-490,137],[191,152],[-167,189],[575,119],[110,-222],[401,-134]],[[19538,97019],[-339,-115],[-461,1],[5,84],[285,177],[149,-27],[361,-120]],[[23380,96697],[-411,-122],[-226,138],[-119,221],[-22,245],[360,-24],[162,-39],[332,-205],[-76,-214]],[[22205,96856],[108,-247],[-453,66],[-457,192],[-619,21],[268,176],[-335,142],[-21,227],[546,-81],[751,-215],[212,-281]],[[79187,96845],[-1566,-228],[507,776],[229,66],[208,-38],[704,-336],[-82,-240]],[[55069,97669],[915,-440],[-699,-233],[-155,-435],[-243,-111],[-132,-490],[-335,-23],[-598,361],[252,210],[-416,170],[-541,499],[-216,463],[757,212],[152,-207],[396,8],[105,202],[408,20],[350,-206]],[[57068,98086],[545,-207],[-412,-318],[-806,-70],[-819,98],[-50,163],[-398,11],[-304,271],[858,165],[403,-142],[281,177],[702,-148]],[[64204,98169],[-373,-78],[-250,-45],[-39,-97],[-324,-98],[-301,140],[158,185],[-618,18],[542,107],[422,8],[57,-160],[159,142],[262,97],[412,-129],[-107,-90]],[[77760,97184],[-606,-73],[-773,170],[-462,226],[-213,423],[-379,117],[722,404],[600,133],[540,-297],[640,-572],[-69,-531]],[[25828,97644],[334,-190],[-381,-176],[-513,-445],[-492,-42],[-575,76],[-299,240],[4,215],[220,157],[-508,-4],[-306,196],[-176,268],[193,262],[192,180],[285,42],[-122,135],[646,30],[355,-315],[468,-127],[455,-112],[220,-390]],[[30972,99681],[742,-47],[597,-75],[508,-161],[-12,-157],[-678,-257],[-672,-119],[-251,-133],[605,3],[-656,-358],[-452,-167],[-476,-483],[-573,-98],[-177,-120],[-841,-64],[383,-74],[-192,-105],[230,-292],[-264,-202],[-429,-167],[-132,-232],[-388,-176],[39,-134],[475,23],[6,-144],[-742,-355],[-726,163],[-816,-91],[-414,71],[-525,31],[-35,284],[514,133],[-137,427],[170,41],[742,-255],[-379,379],[-450,113],[225,229],[492,141],[79,206],[-392,231],[-118,304],[759,-26],[220,-64],[433,216],[-625,68],[-972,-38],[-491,201],[-232,239],[-324,173],[-61,202],[413,112],[324,19],[545,96],[409,220],[344,-30],[300,-166],[211,319],[367,95],[498,65],[849,24],[148,-63],[802,100],[601,-38],[602,-37]],[[42472,99925],[1737,-469],[-513,-227],[-1062,-26],[-1496,-58],[140,-105],[984,65],[836,-204],[540,181],[231,-212],[-305,-344],[707,220],[1348,229],[833,-114],[156,-253],[-1132,-420],[-157,-136],[-888,-102],[643,-28],[-324,-431],[-224,-383],[9,-658],[333,-386],[-434,-24],[-457,-187],[513,-313],[65,-502],[-297,-55],[360,-508],[-617,-42],[322,-241],[-91,-208],[-391,-91],[-388,-2],[348,-400],[4,-263],[-549,244],[-143,-158],[375,-148],[364,-361],[105,-476],[-495,-114],[-214,228],[-344,340],[95,-401],[-322,-311],[732,-25],[383,-32],[-745,-515],[-755,-466],[-813,-204],[-306,-2],[-288,-228],[-386,-624],[-597,-414],[-192,-24],[-370,-145],[-399,-138],[-238,-365],[-4,-415],[-141,-388],[-453,-472],[112,-462],[-125,-488],[-142,-577],[-391,-36],[-410,482],[-556,3],[-269,324],[-186,577],[-481,735],[-141,385],[-38,530],[-384,546],[100,435],[-186,208],[275,691],[418,220],[110,247],[58,461],[-318,-209],[-151,-88],[-249,-84],[-341,193],[-19,401],[109,314],[258,9],[567,-157],[-478,375],[-249,202],[-276,-83],[-232,147],[310,550],[-169,220],[-220,409],[-335,626],[-353,230],[3,247],[-745,346],[-590,43],[-743,-24],[-677,-44],[-323,188],[-482,372],[729,186],[559,31],[-1188,154],[-627,241],[39,229],[1051,285],[1018,284],[107,214],[-750,213],[243,235],[961,413],[404,63],[-115,265],[658,156],[854,93],[853,5],[303,-184],[737,325],[663,-221],[390,-46],[577,-192],[-660,318],[38,253],[932,353],[975,-27],[354,218],[982,57],[2219,-74]]],"transform":{"scale":[0.0036000360003600037,0.0016925586033320111],"translate":[-180,-85.60903777459777]}};
+
+    function decodeLandPolygons(topo) {
+      const scale = topo.transform.scale;
+      const translate = topo.transform.translate;
+
+      const decodedArcs = topo.arcs.map(arc => {
+        let x = 0, y = 0;
+        return arc.map(([dx, dy]) => {
+          x += dx;
+          y += dy;
+          return [x * scale[0] + translate[0], y * scale[1] + translate[1]];
+        });
+      });
+
+      function getRing(arcIndices) {
+        const ring = [];
+        arcIndices.forEach(idx => {
+          let coords;
+          if (idx >= 0) {
+            coords = decodedArcs[idx];
+          } else {
+            coords = [...decodedArcs[~idx]].reverse();
+          }
+          if (ring.length > 0) {
+            ring.push(...coords.slice(1));
+          } else {
+            ring.push(...coords);
+          }
+        });
+        return ring;
+      }
+
+      const polygons = [];
+      topo.objects.land.geometries.forEach(geom => {
+        if (geom.type === 'Polygon') {
+          polygons.push(getRing(geom.arcs[0]));
+        } else if (geom.type === 'MultiPolygon') {
+          geom.arcs.forEach(polyArcs => {
+            polygons.push(getRing(polyArcs[0]));
+          });
+        }
+      });
+      return polygons;
+    }
+
+    const LAND_POLYGONS = decodeLandPolygons(LAND_TOPO);
+
+    function createLandMaskData(polygons, width = 1024, height = 512) {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.fillStyle = '#ffffff';
+
+      polygons.forEach(ring => {
+        if (!ring || ring.length < 3) return;
+        ctx.beginPath();
+        for (let i = 0; i < ring.length; i++) {
+          const lon = ring[i][0];
+          const lat = ring[i][1];
+          const x = ((lon + 180) / 360) * width;
+          const y = ((90 - lat) / 180) * height;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fill();
+      });
+
+      return ctx.getImageData(0, 0, width, height);
+    }
+
+    const WORLD_MASK = createLandMaskData(LAND_POLYGONS, 1024, 512);
+
+    function isLand(lat, lon) {
+      let l = lon;
+      while (l < -180) l += 360;
+      while (l > 180) l -= 360;
+      const px = Math.min(1023, Math.max(0, Math.floor(((l + 180) / 360) * 1024)));
+      const py = Math.min(511, Math.max(0, Math.floor(((90 - lat) / 180) * 512)));
+      return WORLD_MASK.data[(py * 1024 + px) * 4] > 120;
+    }
+
+    function latLonToVector3(lat, lon, radius) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      return new THREE.Vector3(
+        -radius * Math.sin(phi) * Math.cos(theta),
+        radius * Math.cos(phi),
+        radius * Math.sin(phi) * Math.sin(theta)
+      );
+    }
+
+    // -------------------------------------------------------------
+    // Global Network Hubs & Routes
+    // -------------------------------------------------------------
+    const HUBS = [
+      { name: "New York", lat: 40.71, lon: -74.00 },
+      { name: "London", lat: 51.50, lon: -0.12 },
+      { name: "Tokyo", lat: 35.68, lon: 139.76 },
+      { name: "Paris", lat: 48.85, lon: 2.35 },
+      { name: "San Francisco", lat: 37.77, lon: -122.41 },
+      { name: "Singapore", lat: 1.35, lon: 103.82 },
+      { name: "Sydney", lat: -33.86, lon: 151.20 },
+      { name: "Frankfurt", lat: 50.11, lon: 8.68 },
+      { name: "Dubai", lat: 25.20, lon: 55.27 },
+      { name: "Hong Kong", lat: 22.31, lon: 114.16 },
+      { name: "São Paulo", lat: -23.55, lon: -46.63 },
+      { name: "Johannesburg", lat: -26.20, lon: 28.04 },
+      { name: "Mumbai", lat: 19.07, lon: 72.87 },
+      { name: "Shanghai", lat: 31.23, lon: 121.47 },
+      { name: "Seoul", lat: 37.56, lon: 126.97 },
+      { name: "Toronto", lat: 43.65, lon: -79.38 },
+      { name: "Los Angeles", lat: 34.05, lon: -118.24 },
+      { name: "Berlin", lat: 52.52, lon: 13.40 },
+      { name: "Cairo", lat: 30.04, lon: 31.23 },
+      { name: "Buenos Aires", lat: -34.60, lon: -58.38 },
+      { name: "Cape Town", lat: -33.92, lon: 18.42 },
+      { name: "Nairobi", lat: -1.29, lon: 36.82 },
+      { name: "Reykjavik", lat: 64.14, lon: -21.94 },
+      { name: "Honolulu", lat: 21.30, lon: -157.85 },
+      { name: "Auckland", lat: -36.84, lon: 174.76 },
+      { name: "Zurich", lat: 47.37, lon: 8.54 },
+      { name: "Santiago", lat: -33.44, lon: -70.66 }
+    ];
+
+    const HUB_CONNECTIONS = [
+      [0, 1], [0, 4], [0, 10], [0, 15], [0, 22],
+      [1, 3], [1, 7], [1, 8], [1, 11], [1, 22],
+      [2, 4], [2, 5], [2, 9], [2, 13], [2, 14], [2, 23],
+      [3, 7], [3, 8], [3, 25],
+      [4, 16], [4, 6], [4, 23],
+      [5, 6], [5, 8], [5, 9], [5, 12], [5, 13],
+      [6, 24], [6, 23],
+      [7, 17], [7, 25],
+      [8, 12], [8, 18],
+      [9, 13], [9, 14],
+      [10, 19], [10, 11], [10, 26],
+      [11, 20], [11, 21],
+      [12, 18],
+      [13, 14],
+      [15, 16],
+      [16, 23], [16, 26],
+      [18, 21],
+      [19, 26],
+      [20, 21],
+      [21, 8]
+    ];
+
+    // -------------------------------------------------------------
+    // Setup Scene, Camera, Controls & Renderer
+    // -------------------------------------------------------------
+    function init() {
+      scene = new THREE.Scene();
+      const initialScheme = COLOR_SCHEMES["Original"];
+      scene.background = new THREE.Color(initialScheme.bg);
+
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(0, 10, 32);
+
+      buildRenderer(params.antialias);
+      setupLights();
+      buildHologramGlobe();
+      buildBokehSystem();
+      setupUI();
+
+      window.addEventListener('resize', onWindowResize);
+      window.addEventListener('keydown', onKeyDown);
+
+      animate();
+    }
+
+    function buildRenderer(antialias) {
+      if (renderer) {
+        renderer.dispose();
+        if (renderer.domElement && renderer.domElement.parentNode) {
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        }
+      }
+
+      renderer = new THREE.WebGLRenderer({
+        antialias: antialias,
+        powerPreference: "high-performance",
+        alpha: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(params.dpr);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = params.exposure;
+      renderer.setClearColor(scene ? scene.background : 0x02040a, 1.0);
+
+      container.appendChild(renderer.domElement);
+
+      // Initialize or preserve PostProcessor Suite
+      if (!postProcessor) {
+        postProcessor = new PostProcessor(renderer, {
+          enabled: true,
+          bloomEnabled: true,
+          bloomStrength: 0.95,
+          bloomRadius: 0.5,
+          bloomThreshold: 0.22,
+          anamorphicEnabled: false,
+          raysEnabled: false,
+          chromaticAberration: 0.005,
+          vignetteBoost: 1.15,
+          vignetteReduction: 1.25,
+          noiseIntensity: 0.012,
+          exposure: 1.05
+        });
+      } else {
+        postProcessor.renderer = renderer;
+      }
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+      if (controls) controls.dispose();
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.enableZoom = true;
+      controls.zoomSpeed = 1.0;
+      controls.enablePan = true;
+      controls.panSpeed = 1.0;
+      controls.screenSpacePanning = true;
+      controls.minDistance = 14;
+      controls.maxDistance = 75;
+      controls.target.set(params.globePosX, params.globePosY, params.globePosZ);
+
+      updateMouseButtons();
+
+      // Dynamic wheel zoom during orbit and static camera
+      renderer.domElement.addEventListener('wheel', (e) => {
+        const factor = e.deltaY > 0 ? 1.06 : 0.94;
+        params.orbitDistance = THREE.MathUtils.clamp(
+          params.orbitDistance * factor,
+          controls.minDistance,
+          controls.maxDistance
+        );
+        if (guiOrbitDistCtrl) guiOrbitDistCtrl.updateDisplay();
+        if (params.animation === "Static (No Cam Move)" && globeGroup) {
+          const dir = camera.position.clone().sub(globeGroup.position).normalize();
+          camera.position.copy(globeGroup.position).addScaledVector(dir, params.orbitDistance);
+        }
+      }, { passive: true });
+
+      controls.addEventListener('start', () => {
+        isUserInteracting = true;
+        if (userInteractionTimeout) clearTimeout(userInteractionTimeout);
+      });
+
+      controls.addEventListener('change', () => {
+        if (isUserInteracting && globeGroup) {
+          // When user pans across screen, synchronize globeGroup position to controls.target
+          // so the globe is placed where dragged and always rotates around its own center!
+          globeGroup.position.copy(controls.target);
+          params.globePosX = globeGroup.position.x;
+          params.globePosY = globeGroup.position.y;
+          params.globePosZ = globeGroup.position.z;
+          params.orbitDistance = THREE.MathUtils.clamp(
+            camera.position.distanceTo(controls.target),
+            controls.minDistance,
+            controls.maxDistance
+          );
+          if (guiPosXCtrl) guiPosXCtrl.updateDisplay();
+          if (guiPosYCtrl) guiPosYCtrl.updateDisplay();
+          if (guiPosZCtrl) guiPosZCtrl.updateDisplay();
+          if (guiOrbitDistCtrl) guiOrbitDistCtrl.updateDisplay();
+        }
+      });
+
+      controls.addEventListener('end', () => {
+        if (globeGroup) {
+          const dx = camera.position.x - globeGroup.position.x;
+          const dz = camera.position.z - globeGroup.position.z;
+          animAngleOffset = Math.atan2(dx, dz) - (animClockTime * 0.15);
+          params.orbitDistance = THREE.MathUtils.clamp(
+            camera.position.distanceTo(globeGroup.position),
+            controls.minDistance,
+            controls.maxDistance
+          );
+          if (guiOrbitDistCtrl) guiOrbitDistCtrl.updateDisplay();
+        }
+        if (userInteractionTimeout) clearTimeout(userInteractionTimeout);
+        userInteractionTimeout = setTimeout(() => {
+          isUserInteracting = false;
+        }, 800);
+      });
+
+      setupPointerEvents();
+    }
+
+    function updateMouseButtons() {
+      if (!controls) return;
+      if (params.dragMode === "Pan (Right-click to Rotate)") {
+        controls.mouseButtons = {
+          LEFT: THREE.MOUSE.PAN,
+          MIDDLE: THREE.MOUSE.DOLLY,
+          RIGHT: THREE.MOUSE.ROTATE
+        };
+      } else {
+        controls.mouseButtons = {
+          LEFT: THREE.MOUSE.ROTATE,
+          MIDDLE: THREE.MOUSE.DOLLY,
+          RIGHT: THREE.MOUSE.PAN
+        };
+      }
+    }
+
+    function setupLights() {
+      ambientLight = new THREE.AmbientLight(params.ambientColor, params.ambientIntensity);
+      scene.add(ambientLight);
+
+      keyLight = new THREE.DirectionalLight(params.keyColor, params.keyIntensity);
+      keyLight.position.set(20, 25, 20);
+      scene.add(keyLight);
+
+      rimLight = new THREE.DirectionalLight(params.rimColor, params.rimIntensity);
+      rimLight.position.set(-25, -15, -20);
+      scene.add(rimLight);
+
+      coreLight = new THREE.PointLight(params.coreLightColor, params.coreIntensity, 40, 2);
+      coreLight.position.set(0, 0, 0);
+      scene.add(coreLight);
+    }
+
+    // -------------------------------------------------------------
+    // Build Premium Holographic Earth Globe
+    // -------------------------------------------------------------
+    let arcCurves = [];
+    let packetData = [];
+
+    function buildHologramGlobe() {
+      if (globeGroup) scene.remove(globeGroup);
+      globeGroup = new THREE.Group();
+      scene.add(globeGroup);
+
+      const R = params.globeRadius;
+
+      // 1. Deep Obsidian Inner Core (cleanly occludes back hemisphere)
+      const coreGeo = new THREE.SphereGeometry(R * 0.985, 64, 64);
+      const coreMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(params.innerCoreColor),
+        transparent: true,
+        opacity: 0.96
+      });
+      coreSphere = new THREE.Mesh(coreGeo, coreMat);
+      globeGroup.add(coreSphere);
+
+      // 2. High-Tech Latitude/Longitude Coordinate Lines
+      const gridMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.oceanColor),
+        transparent: true,
+        opacity: 0.22,
+        blending: THREE.AdditiveBlending
+      });
+
+      for (let lat = -60; lat <= 60; lat += 30) {
+        const ringRadius = R * Math.cos(lat * Math.PI / 180);
+        const y = R * Math.sin(lat * Math.PI / 180);
+        const ringGeo = new THREE.BufferGeometry();
+        const pts = [];
+        for (let i = 0; i <= 96; i++) {
+          const theta = (i / 96) * Math.PI * 2;
+          pts.push(new THREE.Vector3(ringRadius * Math.cos(theta), y, ringRadius * Math.sin(theta)));
+        }
+        ringGeo.setFromPoints(pts);
+        const ring = new THREE.Line(ringGeo, gridMat);
+        globeGroup.add(ring);
+      }
+
+      // Delicate Equator Ring
+      const eqRingGeo = new THREE.RingGeometry(R * 1.018, R * 1.025, 96);
+      const eqRingMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(params.haloColor),
+        transparent: true,
+        opacity: 0.25,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+      });
+      const eqRing = new THREE.Mesh(eqRingGeo, eqRingMat);
+      eqRing.rotation.x = Math.PI / 2;
+      globeGroup.add(eqRing);
+
+      // 3. Glowing High-Precision Vector Coastlines (Natural Earth Dataset)
+      const coastlinePositions = [];
+      LAND_POLYGONS.forEach(ring => {
+        for (let i = 0; i < ring.length - 1; i++) {
+          const lon1 = ring[i][0];
+          const lat1 = ring[i][1];
+          const lon2 = ring[i+1][0];
+          const lat2 = ring[i+1][1];
+          if (Math.abs(lon2 - lon1) > 180) continue;
+
+          const p1 = latLonToVector3(lat1, lon1, R * 1.004);
+          const p2 = latLonToVector3(lat2, lon2, R * 1.004);
+          coastlinePositions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+        }
+      });
+
+      const coastlineGeo = new THREE.BufferGeometry();
+      coastlineGeo.setAttribute('position', new THREE.Float32BufferAttribute(coastlinePositions, 3));
+      const coastlineMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.landColor),
+        transparent: true,
+        opacity: 0.70,
+        blending: THREE.AdditiveBlending
+      });
+      coastlinesMesh = new THREE.LineSegments(coastlineGeo, coastlineMat);
+      globeGroup.add(coastlinesMesh);
+
+      // 4. Globe Points Cloud (Dense Digital Matrix: 48,000 Fibonacci Nodes)
+      const totalPoints = 48000;
+      const landPos = [];
+      const oceanPos = [];
+      const landPhases = [];
+      const oceanPhases = [];
+
+      for (let i = 0; i < totalPoints; i++) {
+        const phi = Math.acos(1 - 2 * (i + 0.5) / totalPoints);
+        const theta = Math.PI * (1 + Math.sqrt(5)) * (i + 0.5);
+
+        const lat = 90 - (phi * 180 / Math.PI);
+        let lon = (theta * 180 / Math.PI) - 180;
+        while (lon < -180) lon += 360;
+        while (lon > 180) lon -= 360;
+
+        const isContinental = isLand(lat, lon);
+
+        if (isContinental) {
+          const rLand = R * 1.006;
+          const x = -rLand * Math.sin(phi) * Math.cos(theta);
+          const y = rLand * Math.cos(phi);
+          const z = rLand * Math.sin(phi) * Math.sin(theta);
+          landPos.push(x, y, z);
+          landPhases.push(Math.random() * Math.PI * 2);
+        } else if (i % 4 === 0) {
+          const x = -R * Math.sin(phi) * Math.cos(theta);
+          const y = R * Math.cos(phi);
+          const z = R * Math.sin(phi) * Math.sin(theta);
+          oceanPos.push(x, y, z);
+          oceanPhases.push(Math.random() * Math.PI * 2);
+        }
+      }
+
+      // Discrete Cyber Micro-Dots for Landmasses
+      const landGeo = new THREE.BufferGeometry();
+      landGeo.setAttribute('position', new THREE.Float32BufferAttribute(landPos, 3));
+      landGeo.setAttribute('aPhase', new THREE.Float32BufferAttribute(landPhases, 1));
+
+      const landShader = {
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(params.landColor) },
+          uSizeMultiplier: { value: params.pointSize * 11.0 }
+        },
+        vertexShader: `
+          uniform float uTime;
+          uniform float uSizeMultiplier;
+          attribute float aPhase;
+          varying float vPulse;
+          void main() {
+            vPulse = 0.85 + 0.15 * sin(uTime * 2.2 + aPhase);
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            float pSize = uSizeMultiplier * (13.5 / -mvPosition.z) * vPulse;
+            gl_PointSize = clamp(pSize, 1.0, 5.0);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          varying float vPulse;
+          void main() {
+            vec2 coord = gl_PointCoord - vec2(0.5);
+            float dist = length(coord);
+            if (dist > 0.5) discard;
+            float core = smoothstep(0.5, 0.04, dist);
+            float alpha = core * vPulse * 0.95;
+            gl_FragColor = vec4(uColor, alpha);
+          }
+        `
+      };
+
+      landPoints = new THREE.Points(
+        landGeo,
+        new THREE.ShaderMaterial({
+          ...landShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+        })
+      );
+      globeGroup.add(landPoints);
+
+      // Subtle Cyber Grid for Oceans
+      const oceanGeo = new THREE.BufferGeometry();
+      oceanGeo.setAttribute('position', new THREE.Float32BufferAttribute(oceanPos, 3));
+      oceanGeo.setAttribute('aPhase', new THREE.Float32BufferAttribute(oceanPhases, 1));
+
+      const oceanShader = {
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(params.oceanColor) },
+          uSizeMultiplier: { value: params.pointSize * 6.0 }
+        },
+        vertexShader: `
+          uniform float uTime;
+          uniform float uSizeMultiplier;
+          attribute float aPhase;
+          varying float vPulse;
+          void main() {
+            vPulse = 0.6 + 0.4 * sin(uTime * 1.5 + aPhase);
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            float pSize = uSizeMultiplier * (9.0 / -mvPosition.z) * vPulse;
+            gl_PointSize = clamp(pSize, 0.8, 2.6);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          varying float vPulse;
+          void main() {
+            vec2 coord = gl_PointCoord - vec2(0.5);
+            float dist = length(coord);
+            if (dist > 0.5) discard;
+            float alpha = (1.0 - dist * 2.0) * 0.16 * vPulse;
+            gl_FragColor = vec4(uColor, alpha);
+          }
+        `
+      };
+
+      oceanPoints = new THREE.Points(
+        oceanGeo,
+        new THREE.ShaderMaterial({
+          ...oceanShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+        })
+      );
+      globeGroup.add(oceanPoints);
+
+      // 4. Data Routes & Arcs
+      buildDataRoutes(R);
+
+      // 5. Hub Cities Markers & Radar Beacons
+      buildHubMarkers(R);
+
+      // 6. Smooth Horizon Atmosphere Rim (No harsh cutoffs)
+      const atmoGeo = new THREE.SphereGeometry(R * 1.05, 64, 64);
+      const atmoShader = {
+        uniforms: {
+          uColor: { value: new THREE.Color(params.haloColor) }
+        },
+        vertexShader: `
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            vNormal = normalize(normalMatrix * normal);
+            vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+            vViewDir = normalize(-mvPos.xyz);
+            gl_Position = projectionMatrix * mvPos;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          void main() {
+            float fresnel = 1.0 - max(0.0, dot(vNormal, vViewDir));
+            float intensity = pow(fresnel, 4.8) * 0.85;
+            gl_FragColor = vec4(uColor, intensity);
+          }
+        `
+      };
+      atmosphereMesh = new THREE.Mesh(
+        atmoGeo,
+        new THREE.ShaderMaterial({
+          ...atmoShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          side: THREE.FrontSide,
+          depthWrite: false
+        })
+      );
+      globeGroup.add(atmosphereMesh);
+    }
+
+    // -------------------------------------------------------------
+    // Build Data Routes & Animated Data Packets
+    // -------------------------------------------------------------
+    function buildDataRoutes(R) {
+      if (arcsGroup) globeGroup.remove(arcsGroup);
+      if (packetsMesh) globeGroup.remove(packetsMesh);
+
+      arcsGroup = new THREE.Group();
+      globeGroup.add(arcsGroup);
+
+      arcCurves = [];
+      packetData = [];
+
+      const arcMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.arcsColor),
+        transparent: true,
+        opacity: 0.45,
+        blending: THREE.AdditiveBlending
+      });
+
+      HUB_CONNECTIONS.forEach((conn, index) => {
+        const hubA = HUBS[conn[0]];
+        const hubB = HUBS[conn[1]];
+        if (!hubA || !hubB) return;
+
+        const pA = latLonToVector3(hubA.lat, hubA.lon, R);
+        const pB = latLonToVector3(hubB.lat, hubB.lon, R);
+
+        const dist = pA.distanceTo(pB);
+        const mid = pA.clone().add(pB).multiplyScalar(0.5);
+        const altitude = R + dist * 0.24 * params.arcHeight;
+        const ctrl = mid.normalize().multiplyScalar(altitude);
+
+        const curve = new THREE.QuadraticBezierCurve3(pA, ctrl, pB);
+        arcCurves.push(curve);
+
+        const points = curve.getPoints(48);
+        const arcGeo = new THREE.BufferGeometry().setFromPoints(points);
+        const line = new THREE.Line(arcGeo, arcMat);
+        arcsGroup.add(line);
+
+        packetData.push({
+          curveIndex: arcCurves.length - 1,
+          progress: Math.random(),
+          speed: 0.18 + Math.random() * 0.28,
+          offset: index * 0.05
+        });
+
+        if (index % 2 === 0) {
+          packetData.push({
+            curveIndex: arcCurves.length - 1,
+            progress: (Math.random() + 0.5) % 1.0,
+            speed: 0.22 + Math.random() * 0.25,
+            offset: index * 0.08
+          });
+        }
+      });
+
+      // Data Packets Particle Cloud
+      const packetCount = packetData.length;
+      const packetPositions = new Float32Array(packetCount * 3);
+      const packetGeo = new THREE.BufferGeometry();
+      packetGeo.setAttribute('position', new THREE.BufferAttribute(packetPositions, 3));
+
+      const packetShader = {
+        uniforms: {
+          uColor: { value: new THREE.Color(params.packetsColor) },
+          uSizeMultiplier: { value: params.pointSize * 22.0 }
+        },
+        vertexShader: `
+          uniform float uSizeMultiplier;
+          void main() {
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            float pSize = uSizeMultiplier * (18.0 / -mvPosition.z);
+            gl_PointSize = clamp(pSize, 2.0, 7.0);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          void main() {
+            vec2 coord = gl_PointCoord - vec2(0.5);
+            float dist = length(coord);
+            if (dist > 0.5) discard;
+            float core = 1.0 - smoothstep(0.0, 0.4, dist);
+            float glow = exp(-dist * 5.0);
+            float alpha = core * 0.9 + glow * 0.7;
+            gl_FragColor = vec4(uColor, alpha);
+          }
+        `
+      };
+
+      packetsMesh = new THREE.Points(
+        packetGeo,
+        new THREE.ShaderMaterial({
+          ...packetShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+        })
+      );
+      globeGroup.add(packetsMesh);
+    }
+
+    // -------------------------------------------------------------
+    // Build Minimalistic Hub City Markers & Beacons
+    // -------------------------------------------------------------
+    function buildHubMarkers(R) {
+      if (hubsGroup) globeGroup.remove(hubsGroup);
+      hubsGroup = new THREE.Group();
+      globeGroup.add(hubsGroup);
+
+      const hubMarkerGeo = new THREE.RingGeometry(0.04, 0.12, 24);
+      const hubMat = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(params.hubsColor),
+        transparent: true,
+        opacity: 0.8,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+      });
+
+      const beaconMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(params.hubsColor),
+        transparent: true,
+        opacity: 0.7,
+        blending: THREE.AdditiveBlending
+      });
+
+      HUBS.forEach(hub => {
+        const pos = latLonToVector3(hub.lat, hub.lon, R);
+        const norm = pos.clone().normalize();
+
+        const ring = new THREE.Mesh(hubMarkerGeo, hubMat);
+        ring.position.copy(pos.clone().multiplyScalar(1.002));
+        ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), norm);
+        hubsGroup.add(ring);
+
+        const topPos = pos.clone().add(norm.clone().multiplyScalar(0.7));
+        const pillarGeo = new THREE.BufferGeometry().setFromPoints([pos, topPos]);
+        const pillar = new THREE.Line(pillarGeo, beaconMat);
+        hubsGroup.add(pillar);
+      });
+    }
+
+    // -------------------------------------------------------------
+    // Deep Bokeh & Ambient Dust ("с глубоким боке")
+    // -------------------------------------------------------------
+    function buildBokehSystem() {
+      if (bokehPoints) scene.remove(bokehPoints);
+
+      const bokehCount = 140;
+      const positions = [];
+      const seeds = [];
+      const sizes = [];
+
+      for (let i = 0; i < bokehCount; i++) {
+        const r = 16.0 + Math.random() * 32.0;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+
+        positions.push(
+          r * Math.sin(phi) * Math.cos(theta),
+          r * Math.sin(phi) * Math.sin(theta),
+          r * Math.cos(phi)
+        );
+        seeds.push(Math.random());
+        sizes.push(8.0 + Math.random() * 22.0);
+      }
+
+      const bokehGeo = new THREE.BufferGeometry();
+      bokehGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      bokehGeo.setAttribute('aSeed', new THREE.Float32BufferAttribute(seeds, 1));
+      bokehGeo.setAttribute('aSize', new THREE.Float32BufferAttribute(sizes, 1));
+
+      const bokehShader = {
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(params.bokehColor) },
+          uIntensity: { value: params.bokehIntensity }
+        },
+        vertexShader: `
+          uniform float uTime;
+          attribute float aSeed;
+          attribute float aSize;
+          varying float vSeed;
+          void main() {
+            vSeed = aSeed;
+            vec3 pos = position;
+            pos.x += sin(uTime * 0.18 + aSeed * 6.28) * 1.2;
+            pos.y += cos(uTime * 0.15 + aSeed * 6.28) * 1.2;
+            pos.z += sin(uTime * 0.19 + aSeed * 3.14) * 1.2;
+
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            float pSize = aSize * (24.0 / -mvPosition.z);
+            gl_PointSize = clamp(pSize, 3.0, 65.0);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          uniform float uIntensity;
+          varying float vSeed;
+          void main() {
+            vec2 coord = gl_PointCoord - vec2(0.5);
+            float dist = length(coord);
+            if (dist > 0.5) discard;
+
+            float core = smoothstep(0.5, 0.0, dist);
+            float soft = exp(-dist * dist * 8.0);
+            float alpha = (core * 0.5 + soft * 0.5) * 0.28 * uIntensity;
+
+            vec3 col = uColor;
+            col.r += sin(vSeed * 6.28) * 0.08;
+            col.b += cos(vSeed * 6.28) * 0.08;
+
+            gl_FragColor = vec4(col, alpha);
+          }
+        `
+      };
+
+      bokehPoints = new THREE.Points(
+        bokehGeo,
+        new THREE.ShaderMaterial({
+          ...bokehShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+        })
+      );
+      scene.add(bokehPoints);
+    }
+
+    // -------------------------------------------------------------
+    // Apply Color Scheme
+    // -------------------------------------------------------------
+    function applyColorScheme(name) {
+      const p = COLOR_SCHEMES[name];
+      if (!p) return;
+
+      params.colorScheme = name;
+      params.landColor = p.land;
+      params.oceanColor = p.ocean;
+      params.arcsColor = p.arcs;
+      params.packetsColor = p.packets;
+      params.hubsColor = p.hubs;
+      params.bokehColor = p.bokeh;
+      params.haloColor = p.halo;
+      params.innerCoreColor = p.core;
+      params.ambientColor = p.ambient;
+      params.keyColor = p.keyLight;
+      params.rimColor = p.rimLight;
+      params.coreLightColor = p.coreLight;
+
+      updateSceneColors();
+      updateGUI();
+    }
+
+    function updateSceneColors() {
+      if (params.greenScreen) {
+        scene.background = new THREE.Color("#00ff00");
+        renderer.setClearColor(0x00ff00, 1.0);
+        if (bokehPoints) bokehPoints.visible = false;
+      } else {
+        const p = COLOR_SCHEMES[params.colorScheme] || COLOR_SCHEMES["Original"];
+        scene.background = new THREE.Color(p.bg);
+        renderer.setClearColor(scene.background, 1.0);
+        if (bokehPoints) bokehPoints.visible = true;
+      }
+
+      if (landPoints) landPoints.material.uniforms.uColor.value.set(params.landColor);
+      if (coastlinesMesh) coastlinesMesh.material.color.set(params.landColor);
+      if (oceanPoints) oceanPoints.material.uniforms.uColor.value.set(params.oceanColor);
+      if (packetsMesh) packetsMesh.material.uniforms.uColor.value.set(params.packetsColor);
+      if (bokehPoints) bokehPoints.material.uniforms.uColor.value.set(params.bokehColor);
+      if (atmosphereMesh) atmosphereMesh.material.uniforms.uColor.value.set(params.haloColor);
+      if (coreSphere) coreSphere.material.color.set(params.innerCoreColor);
+
+      if (arcsGroup) {
+        arcsGroup.children.forEach(line => {
+          line.material.color.set(params.arcsColor);
+        });
+      }
+
+      if (hubsGroup) {
+        hubsGroup.children.forEach(obj => {
+          obj.material.color.set(params.hubsColor);
+        });
+      }
+
+      if (ambientLight) {
+        ambientLight.color.set(params.ambientColor);
+        ambientLight.intensity = params.ambientIntensity;
+      }
+      if (keyLight) {
+        keyLight.color.set(params.keyColor);
+        keyLight.intensity = params.keyIntensity;
+      }
+      if (rimLight) {
+        rimLight.color.set(params.rimColor);
+        rimLight.intensity = params.rimIntensity;
+      }
+      if (coreLight) {
+        coreLight.color.set(params.coreLightColor);
+        coreLight.intensity = params.coreIntensity;
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Randomize Theme & Parameters (Do NOT Touch PostProcessor!)
+    // -------------------------------------------------------------
+    function randomizeScene() {
+      const keys = Object.keys(COLOR_SCHEMES);
+      const randomScheme = keys[Math.floor(Math.random() * keys.length)];
+      applyColorScheme(randomScheme);
+
+      const anims = ANIMATIONS;
+      params.animation = anims[Math.floor(Math.random() * anims.length)];
+
+      params.animationSpeed = THREE.MathUtils.lerp(0.6, 1.6, Math.random());
+      params.packetSpeed = THREE.MathUtils.lerp(0.7, 1.8, Math.random());
+      params.pointSize = THREE.MathUtils.lerp(0.85, 1.25, Math.random());
+      params.bokehIntensity = THREE.MathUtils.lerp(0.4, 0.9, Math.random());
+      params.exposure = THREE.MathUtils.lerp(0.95, 1.25, Math.random());
+      params.keyIntensity = THREE.MathUtils.lerp(1.2, 2.5, Math.random());
+      params.rimIntensity = THREE.MathUtils.lerp(1.5, 3.0, Math.random());
+      params.coreIntensity = THREE.MathUtils.lerp(1.0, 2.2, Math.random());
+
+      if (landPoints) landPoints.material.uniforms.uSizeMultiplier.value = params.pointSize * 11.0;
+      if (oceanPoints) oceanPoints.material.uniforms.uSizeMultiplier.value = params.pointSize * 6.0;
+      if (packetsMesh) packetsMesh.material.uniforms.uSizeMultiplier.value = params.pointSize * 22.0;
+      if (bokehPoints) bokehPoints.material.uniforms.uIntensity.value = params.bokehIntensity;
+      if (renderer) renderer.toneMappingExposure = params.exposure;
+
+      updateSceneColors();
+      updateGUI();
+    }
+
+    // -------------------------------------------------------------
+    // Setup Pointer Events (Distinguish Click from Orbit/Pan Drag)
+    // -------------------------------------------------------------
+    let pointerDownPos = { x: 0, y: 0, time: 0 };
+
+    function setupPointerEvents() {
+      const el = renderer.domElement;
+
+      el.addEventListener('pointerdown', (e) => {
+        pointerDownPos.x = e.clientX;
+        pointerDownPos.y = e.clientY;
+        pointerDownPos.time = Date.now();
+      });
+
+      el.addEventListener('pointerup', (e) => {
+        const dx = e.clientX - pointerDownPos.x;
+        const dy = e.clientY - pointerDownPos.y;
+        const dist = Math.hypot(dx, dy);
+        const elapsed = Date.now() - pointerDownPos.time;
+
+        if (dist < 6 && elapsed < 320) {
+          if (params.clickToRandomize && !e.target.closest('.lil-gui')) {
+            randomizeScene();
+          }
+        }
+      });
+    }
+
+    // -------------------------------------------------------------
+    // lil-gui Setup (Native Unstyled lil-gui)
+    // -------------------------------------------------------------
+    function setupUI() {
+      gui = new GUI({ title: "Global Data Globe Controls" });
+
+      // Folder 1: Color Themes & Palette
+      const fColor = gui.addFolder("Color & Theme");
+      fColor.add(params, "colorScheme", Object.keys(COLOR_SCHEMES)).name("Preset Scheme").onChange(applyColorScheme);
+      fColor.add(params, "greenScreen").name("Green Screen (#00ff00)").onChange(updateSceneColors);
+      fColor.addColor(params, "landColor").name("Land Points").onChange(updateSceneColors);
+      fColor.addColor(params, "oceanColor").name("Ocean Grid").onChange(updateSceneColors);
+      fColor.addColor(params, "arcsColor").name("Data Routes").onChange(updateSceneColors);
+      fColor.addColor(params, "packetsColor").name("Data Packets").onChange(updateSceneColors);
+      fColor.addColor(params, "hubsColor").name("Hub Markers").onChange(updateSceneColors);
+      fColor.addColor(params, "bokehColor").name("Bokeh Particles").onChange(updateSceneColors);
+      fColor.addColor(params, "haloColor").name("Atmosphere Rim").onChange(updateSceneColors);
+      fColor.addColor(params, "innerCoreColor").name("Inner Core").onChange(updateSceneColors);
+
+      // Folder 2: Camera & Motion Animations
+      const fAnim = gui.addFolder("Animation & Camera");
+      fAnim.add(params, "animation", ANIMATIONS).name("Camera Path");
+      fAnim.add(params, "animationSpeed", 0.0, 3.0, 0.05).name("Speed Multiplier");
+      fAnim.add(params, "globeRotation").name("Globe Spin");
+      fAnim.add(params, "packetSpeed", 0.1, 4.0, 0.1).name("Packet Speed");
+
+      // Folder: Globe Position & Orbit Zoom
+      const fPos = gui.addFolder("Globe Position & Orbit Zoom");
+      guiOrbitDistCtrl = fPos.add(params, "orbitDistance", 14, 75, 0.5).name("Orbit Distance (Zoom)").onChange(v => {
+        if (params.animation === "Static (No Cam Move)" && globeGroup) {
+          const dir = camera.position.clone().sub(globeGroup.position).normalize();
+          camera.position.copy(globeGroup.position).addScaledVector(dir, v);
+        }
+      });
+      guiPosXCtrl = fPos.add(params, "globePosX", -30, 30, 0.5).name("Globe Position X").onChange(updateGlobePosition);
+      guiPosYCtrl = fPos.add(params, "globePosY", -30, 30, 0.5).name("Globe Position Y").onChange(updateGlobePosition);
+      guiPosZCtrl = fPos.add(params, "globePosZ", -30, 30, 0.5).name("Globe Position Z").onChange(updateGlobePosition);
+      fPos.add({ resetGlobe: () => {
+        params.globePosX = 0;
+        params.globePosY = 0;
+        params.globePosZ = 0;
+        params.orbitDistance = 32.0;
+        if (globeGroup) globeGroup.position.set(0, 0, 0);
+        controls.target.set(0, 0, 0);
+        camera.position.set(0, 10, 32);
+        isUserInteracting = false;
+        animAngleOffset = 0;
+        updateGUI();
+      }}, "resetGlobe").name("Center Globe (Reset)");
+
+      // Folder 3: Geometry & Density
+      const fGeom = gui.addFolder("Geometry & Particles");
+      fGeom.add(params, "pointSize", 0.4, 2.5, 0.05).name("Point Size").onChange(v => {
+        if (landPoints) landPoints.material.uniforms.uSizeMultiplier.value = v * 11.0;
+        if (oceanPoints) oceanPoints.material.uniforms.uSizeMultiplier.value = v * 6.0;
+        if (packetsMesh) packetsMesh.material.uniforms.uSizeMultiplier.value = v * 22.0;
+      });
+      fGeom.add(params, "bokehIntensity", 0.0, 2.0, 0.05).name("Bokeh Glow").onChange(v => {
+        if (bokehPoints) bokehPoints.material.uniforms.uIntensity.value = v;
+      });
+      fGeom.add(params, "arcHeight", 0.5, 2.5, 0.1).name("Arc Height").onChange(() => {
+        buildDataRoutes(params.globeRadius);
+      });
+
+      // Folder 4: Lighting & Exposure
+      const fLight = gui.addFolder("Lighting & Exposure");
+      fLight.add(params, "exposure", 0.1, 3.0, 0.05).name("Tone Exposure").onChange(v => {
+        renderer.toneMappingExposure = v;
+      });
+      fLight.add(params, "ambientIntensity", 0.0, 3.0, 0.1).name("Ambient Intensity").onChange(updateSceneColors);
+      fLight.addColor(params, "ambientColor").name("Ambient Color").onChange(updateSceneColors);
+      fLight.add(params, "keyIntensity", 0.0, 5.0, 0.1).name("Key Light").onChange(updateSceneColors);
+      fLight.addColor(params, "keyColor").name("Key Color").onChange(updateSceneColors);
+      fLight.add(params, "rimIntensity", 0.0, 5.0, 0.1).name("Rim Light").onChange(updateSceneColors);
+      fLight.addColor(params, "rimColor").name("Rim Color").onChange(updateSceneColors);
+      fLight.add(params, "coreIntensity", 0.0, 5.0, 0.1).name("Core Light").onChange(updateSceneColors);
+      fLight.addColor(params, "coreLightColor").name("Core Light Color").onChange(updateSceneColors);
+
+      // Folder 5: PostProcessor Suite Integration
+      if (postProcessor) {
+        postProcessor.attachGUI(gui, "Post-Processing (PostProcessor.js)");
+      }
+
+      // Folder 6: System & Interaction
+      const fSys = gui.addFolder("System & Controls");
+      fSys.add(params, "dragMode", ["Rotate (Right-click to Pan)", "Pan (Right-click to Rotate)"]).name("Drag Mode").onChange(updateMouseButtons);
+      fSys.add(params, "dpr", 0.5, 3.0, 0.1).name("Pixel Ratio (DPR)").onChange(v => {
+        renderer.setPixelRatio(v);
+        if (postProcessor) postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+      });
+      fSys.add(params, "antialias").name("Antialiasing").onChange(v => {
+        buildRenderer(v);
+      });
+      fSys.add(params, "clickToRandomize").name("Click Scene to Re-roll");
+      fSys.add({ randomize: randomizeScene }, "randomize").name("Randomize Theme Now");
+      fSys.add({ resetCam: () => {
+        params.globePosX = 0;
+        params.globePosY = 0;
+        params.globePosZ = 0;
+        params.orbitDistance = 32.0;
+        if (globeGroup) globeGroup.position.set(0, 0, 0);
+        controls.reset();
+        camera.position.set(0, 10, 32);
+        controls.target.set(0, 0, 0);
+        isUserInteracting = false;
+        animAngleOffset = 0;
+        updateGUI();
+      }}, "resetCam").name("Reset Camera");
+    }
+
+    function updateGlobePosition() {
+      if (!globeGroup) return;
+      const oldPos = globeGroup.position.clone();
+      globeGroup.position.set(params.globePosX, params.globePosY, params.globePosZ);
+      const delta = globeGroup.position.clone().sub(oldPos);
+      controls.target.copy(globeGroup.position);
+      camera.position.add(delta);
+    }
+
+    function updateGUI() {
+      if (!gui) return;
+      gui.controllersRecursive().forEach(ctrl => ctrl.updateDisplay());
+    }
+
+    // -------------------------------------------------------------
+    // Keyboard Handler (Hide/Show UI with 'H' key)
+    // -------------------------------------------------------------
+    function onKeyDown(e) {
+      if (e.key === 'h' || e.key === 'H') {
+        if (gui._hidden) {
+          gui.show();
+        } else {
+          gui.hide();
+        }
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Window Resize Handler
+    // -------------------------------------------------------------
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if (postProcessor) {
+        postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Main Animation Loop
+    // -------------------------------------------------------------
+    let animClockTime = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const speed = params.animationSpeed;
+      animClockTime += delta * speed;
+
+      // 1. Globe & Data Rotation
+      if (params.globeRotation && globeGroup) {
+        globeGroup.rotation.y += delta * 0.12 * speed;
+      }
+
+      // 2. Shader Uniform Updates (Time)
+      if (landPoints) landPoints.material.uniforms.uTime.value = animClockTime;
+      if (oceanPoints) oceanPoints.material.uniforms.uTime.value = animClockTime;
+      if (bokehPoints) bokehPoints.material.uniforms.uTime.value = animClockTime;
+
+      // 3. Update Flowing Data Packets
+      if (packetData.length > 0 && packetsMesh) {
+        const positions = packetsMesh.geometry.attributes.position.array;
+        packetData.forEach((packet, idx) => {
+          packet.progress += delta * packet.speed * params.packetSpeed * speed;
+          if (packet.progress > 1.0) packet.progress -= 1.0;
+
+          const curve = arcCurves[packet.curveIndex];
+          if (curve) {
+            const pt = curve.getPointAt(packet.progress);
+            positions[idx * 3] = pt.x;
+            positions[idx * 3 + 1] = pt.y;
+            positions[idx * 3 + 2] = pt.z;
+          }
+        });
+        packetsMesh.geometry.attributes.position.needsUpdate = true;
+      }
+
+      // 4. Preconfigured Camera Animations
+      applyCameraAnimation(animClockTime, speed);
+
+      if (params.animation === "Static (No Cam Move)" || isUserInteracting) {
+        controls.update();
+      }
+
+      // 5. Render Scene via PostProcessor Pipeline or Direct WebGL
+      if (postProcessor && postProcessor.settings.enabled) {
+        postProcessor.finalPass.shader.uniforms.time.value = animClockTime;
+        postProcessor.rgbPass.shader.uniforms.time.value = animClockTime;
+        postProcessor.renderScene(scene, camera);
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Camera Animation Evaluation (Always Orbits Around Globe's Own Center)
+    // -------------------------------------------------------------
+    function applyCameraAnimation(time, speed) {
+      if (params.animation === "Static (No Cam Move)") {
+        return;
+      }
+
+      if (isUserInteracting) {
+        return;
+      }
+
+      const center = globeGroup ? globeGroup.position : controls.target;
+      const r = params.orbitDistance;
+      controls.target.copy(center);
+
+      switch (params.animation) {
+        case "Orbital Glide": {
+          const angle = time * 0.15 + animAngleOffset;
+          const relX = r * Math.sin(angle);
+          const relZ = r * Math.cos(angle);
+          const relY = (r * 0.25) + (r * 0.09) * Math.sin(angle * 0.6);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Polar Drift": {
+          const pitch = Math.sin(time * 0.22) * 1.05;
+          const yaw = time * 0.09 + animAngleOffset;
+          const relX = r * Math.cos(pitch) * Math.sin(yaw);
+          const relY = r * Math.sin(pitch);
+          const relZ = r * Math.cos(pitch) * Math.cos(yaw);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Breathing Zoom": {
+          const dist = r * (1.0 + 0.25 * Math.sin(time * 0.35));
+          const yaw = time * 0.12 + animAngleOffset;
+          const relX = dist * Math.sin(yaw);
+          const relZ = dist * Math.cos(yaw);
+          const relY = (r * 0.18) + (r * 0.08) * Math.cos(time * 0.35);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Figure Eight": {
+          const t = time * 0.18 + animAngleOffset;
+          const relX = r * Math.sin(t);
+          const relZ = r * Math.cos(t);
+          const relY = (r * 0.35) * Math.sin(2.0 * t);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Data Flyby": {
+          const t = time * 0.25 + animAngleOffset;
+          const flybyR = r * 0.65;
+          const dist = flybyR + (flybyR * 0.18) * Math.sin(t * 1.2);
+          const relX = dist * Math.sin(t);
+          const relZ = dist * Math.cos(t);
+          const relY = (flybyR * 0.22) + (flybyR * 0.15) * Math.sin(t * 0.8);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Satellite Pan": {
+          const t = time * 0.14 + animAngleOffset;
+          const relX = r * Math.sin(t);
+          const relZ = r * Math.cos(t * 0.9);
+          const relY = (r * 0.4) + (r * 0.12) * Math.sin(t * 0.4);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+
+        case "Zen Horizon": {
+          const t = time * 0.11 + animAngleOffset;
+          const relX = r * Math.sin(t * 0.5);
+          const relZ = r * Math.cos(t * 0.5);
+          const relY = (r * 0.08) + (r * 0.06) * Math.sin(t * 0.7);
+          camera.position.set(center.x + relX, center.y + relY, center.z + relZ);
+          camera.lookAt(center);
+          break;
+        }
+      }
+    }
+
+    // Launch application
+    init();
+  </script>
+</body>
+</html>

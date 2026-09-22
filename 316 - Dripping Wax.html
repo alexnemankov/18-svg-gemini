@@ -1,0 +1,1806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dripping Wax Candle Row</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body, html {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #webgl-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+      cursor: grab;
+    }
+    #webgl-canvas:active {
+      cursor: grabbing;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js",
+        "postprocessing/PostProcessor.js": "./postprocessing/PostProcessor.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (Standalone Fallback & Module Integration)
+    // =========================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+    }
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      vec3 finalCol = col.rgb;
+      vec3 exposedColor = finalCol * exposure;
+      vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+      finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class PostShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class PostShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class PostBloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new PostShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new PostShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        this.brightPass.setSize(w, h);
+        for (let i = 0; i < this.levels; i++) {
+          const div = Math.pow(2, i + 1);
+          this.blurPasses[i].setSize(Math.max(1, Math.floor(w / div)), Math.max(1, Math.floor(h / div)));
+        }
+      }
+
+      render(renderer) {
+        if (!this.enabled) return;
+        this.brightPass.shader.uniforms.inputTexture.value = this.source;
+        this.brightPass.shader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = this.radius * 2.0;
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const u = blurPass.shader.uniforms;
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class InlinePostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.2,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.65,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.22,
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.008,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.0,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.25,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          exposure: params.exposure !== undefined ? params.exposure : 1.15,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+        this.bloomPass = new PostBloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            time: { value: 0.0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new PostShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            time: { value: 0.0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new PostShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: { inputTexture: { value: null } },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new PostShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.shader.uniforms.inputTexture.value = this.finalPass.texture;
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing Suite") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Suite");
+
+        const bloom = root.addFolder("Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+        const lens = root.addFolder("Lens, Optics & Distortion");
+        lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+        lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+        lens.add(this.settings, "chromaticAberration", 0, 0.08, 0.002).name("Chromatic Aberration").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.08, 0.002).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "exposure", 0.5, 2.5, 0.05).name("Exposure").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+        lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+        lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // Dynamic import with graceful inline fallback
+    let PostProcessor = InlinePostProcessor;
+    try {
+      const module = await import('postprocessing/PostProcessor.js');
+      if (module && module.PostProcessor) {
+        PostProcessor = module.PostProcessor;
+      }
+    } catch (e) {
+      // Inline fallback active
+    }
+
+    // =========================================================================
+    // 18 PRECONFIGURED COLOR SCHEMES
+    // =========================================================================
+    const COLOR_SCHEMES = {
+      'Monochromatic': {
+        bg: '#080a0f',
+        wax: '#e2e8f0',
+        waxTranslucent: '#a0aec0',
+        flameCore: '#ffffff',
+        flameMantle: '#cbd5e1',
+        flameAura: '#64748b',
+        altar: '#14171f',
+        accent: '#f8fafc'
+      },
+      'Analogous': {
+        bg: '#140904',
+        wax: '#faecd8',
+        waxTranslucent: '#f97316',
+        flameCore: '#fff7d6',
+        flameMantle: '#ea580c',
+        flameAura: '#c2410c',
+        altar: '#200d07',
+        accent: '#ffedd5'
+      },
+      'Complementary': {
+        bg: '#080b18',
+        wax: '#fed7aa',
+        waxTranslucent: '#fb923c',
+        flameCore: '#fff1cc',
+        flameMantle: '#f59e0b',
+        flameAura: '#38bdf8',
+        altar: '#0f172a',
+        accent: '#0284c7'
+      },
+      'Split-complementary': {
+        bg: '#070e14',
+        wax: '#fef3c7',
+        waxTranslucent: '#f59e0b',
+        flameCore: '#fffbeb',
+        flameMantle: '#f97316',
+        flameAura: '#06b6d4',
+        altar: '#0e1e24',
+        accent: '#8b5cf6'
+      },
+      'Triadic': {
+        bg: '#100814',
+        wax: '#fce7f3',
+        waxTranslucent: '#ec4899',
+        flameCore: '#fef08a',
+        flameMantle: '#10b981',
+        flameAura: '#8b5cf6',
+        altar: '#1c0d24',
+        accent: '#f43f5e'
+      },
+      'Tetradic': {
+        bg: '#0c0d12',
+        wax: '#fef08a',
+        waxTranslucent: '#f97316',
+        flameCore: '#ffffff',
+        flameMantle: '#ef4444',
+        flameAura: '#06b6d4',
+        altar: '#161922',
+        accent: '#a855f7'
+      },
+      'Double split-complementary': {
+        bg: '#0d0812',
+        wax: '#fde047',
+        waxTranslucent: '#f43f5e',
+        flameCore: '#ffffff',
+        flameMantle: '#38bdf8',
+        flameAura: '#a855f7',
+        altar: '#180f20',
+        accent: '#fb7185'
+      },
+      'Achromatic (black and white version)': {
+        bg: '#050505',
+        wax: '#efefef',
+        waxTranslucent: '#909090',
+        flameCore: '#ffffff',
+        flameMantle: '#dcdcdc',
+        flameAura: '#aaaaaa',
+        altar: '#161616',
+        accent: '#ffffff'
+      },
+      'Achromatic (white and black version)': {
+        bg: '#e5e5e7',
+        wax: '#222224',
+        waxTranslucent: '#555558',
+        flameCore: '#ffffff',
+        flameMantle: '#333336',
+        flameAura: '#77777a',
+        altar: '#cccccc',
+        accent: '#111112'
+      },
+      'Neutral + accent': {
+        bg: '#0e0e11',
+        wax: '#dcdce0',
+        waxTranslucent: '#ff3b3b',
+        flameCore: '#ffffff',
+        flameMantle: '#ef4444',
+        flameAura: '#dc2626',
+        altar: '#1a1a1e',
+        accent: '#ff2020'
+      },
+      'Palette 1 (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)': {
+        bg: '#220901',
+        wax: '#F6AA1C',
+        waxTranslucent: '#BC3908',
+        flameCore: '#ffffff',
+        flameMantle: '#F6AA1C',
+        flameAura: '#BC3908',
+        altar: '#180600',
+        accent: '#941B0C'
+      },
+      'Palette 2 (63D1CF, 5BC0BE, 4BAD9E, 4BAD9E, 0B132B, 000000)': {
+        bg: '#0B132B',
+        wax: '#63D1CF',
+        waxTranslucent: '#4BAD9E',
+        flameCore: '#ffffff',
+        flameMantle: '#5BC0BE',
+        flameAura: '#4BAD9E',
+        altar: '#070c1b',
+        accent: '#5BC0BE'
+      },
+      'Palette 3 (AA60C8, D69ADE, C9A3C6, CFB5C2, 0D001D, 120A12)': {
+        bg: '#0D001D',
+        wax: '#CFB5C2',
+        waxTranslucent: '#AA60C8',
+        flameCore: '#ffffff',
+        flameMantle: '#D69ADE',
+        flameAura: '#C9A3C6',
+        altar: '#120A12',
+        accent: '#AA60C8'
+      },
+      'Palette 4 (FEF1BE, FFBA00, 008189, 00474D, 061210)': {
+        bg: '#061210',
+        wax: '#FEF1BE',
+        waxTranslucent: '#FFBA00',
+        flameCore: '#ffffff',
+        flameMantle: '#008189',
+        flameAura: '#00474D',
+        altar: '#030a08',
+        accent: '#FFBA00'
+      },
+      'Palette 5 (D4FFB0, 7FFF00, 00B894, 0A3322, 05140A)': {
+        bg: '#05140A',
+        wax: '#D4FFB0',
+        waxTranslucent: '#7FFF00',
+        flameCore: '#ffffff',
+        flameMantle: '#00B894',
+        flameAura: '#7FFF00',
+        altar: '#0A3322',
+        accent: '#7FFF00'
+      },
+      'Palette 6 (FFE8CC, FF8C00, C7501A, 3D1050, 0E0618)': {
+        bg: '#0E0618',
+        wax: '#FFE8CC',
+        waxTranslucent: '#FF8C00',
+        flameCore: '#ffffff',
+        flameMantle: '#C7501A',
+        flameAura: '#3D1050',
+        altar: '#08030e',
+        accent: '#FF8C00'
+      },
+      'Palette 7 (E8E0FF, B38FFF, 6A3DE8, 1A1250, 090612)': {
+        bg: '#090612',
+        wax: '#E8E0FF',
+        waxTranslucent: '#B38FFF',
+        flameCore: '#ffffff',
+        flameMantle: '#6A3DE8',
+        flameAura: '#1A1250',
+        altar: '#05030a',
+        accent: '#B38FFF'
+      },
+      'Palette 8 (E0FBFF, 00F0FF, D40078, 1E0A3D, 05020F)': {
+        bg: '#05020F',
+        wax: '#E0FBFF',
+        waxTranslucent: '#00F0FF',
+        flameCore: '#ffffff',
+        flameMantle: '#D40078',
+        flameAura: '#1E0A3D',
+        altar: '#0e051c',
+        accent: '#00F0FF'
+      }
+    };
+
+    // =========================================================================
+    // PARAMETERS & INITIAL SETTINGS
+    // =========================================================================
+    const initialSchemeName = 'Analogous';
+    const initTheme = COLOR_SCHEMES[initialSchemeName];
+
+    const params = {
+      // Color Scheme
+      colorScheme: initialSchemeName,
+      greenscreen: false,
+      waxColor: initTheme.wax,
+      waxTranslucent: initTheme.waxTranslucent,
+      flameCore: initTheme.flameCore,
+      flameMantle: initTheme.flameMantle,
+      flameAura: initTheme.flameAura,
+      bgColor: initTheme.bg,
+      altarColor: initTheme.altar,
+      accentColor: initTheme.accent,
+
+      // Animation & Camera
+      cameraAnimation: 'Slow Linear Dolly',
+      animationSpeed: 1.0,
+      waxDripSpeed: 1.0,
+      flameFlickerSpeed: 1.0,
+
+      // Wax Drip Shader Dynamics
+      dripIntensity: 1.35,
+      dripSize: 1.0,
+      waxTranslucency: 1.5,
+      waxGloss: 1.3,
+      topPoolDepth: 0.14,
+
+      // Flame & Lighting Dynamics
+      flameScale: 1.0,
+      flameBrightness: 1.4,
+      flameTurbulence: 1.0,
+      lightIntensity: 1.8,
+      showEmbers: true,
+
+      // Quality & Render
+      dpr: Math.min(window.devicePixelRatio || 1, 2.0),
+      clickRandomizer: true
+    };
+
+    // =========================================================================
+    // SETUP THREE.JS SCENE, RENDERER & CAMERA
+    // =========================================================================
+    const canvas = document.getElementById('webgl-canvas');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.bgColor);
+    scene.fog = new THREE.FogExp2(params.bgColor, 0.038);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 2.1, 7.5);
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas: canvas,
+      antialias: true,
+      powerPreference: 'high-performance'
+    });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(params.dpr);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+
+    // Post-Processing Suite Instance
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomEnabled: true,
+      bloomStrength: 1.25,
+      bloomRadius: 0.65,
+      bloomThreshold: 0.22,
+      fisheyeStrength: 0.0,
+      chromaticAberration: 0.008,
+      vignetteBoost: 1.0,
+      vignetteReduction: 0.25,
+      noiseIntensity: 0.012,
+      exposure: 1.15
+    });
+    postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+    // Orbit Controls with Wheel Zoom and Pan/Drag Across Screen
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enableZoom = true;
+    controls.zoomSpeed = 1.0;
+    controls.enablePan = true;
+    controls.panSpeed = 1.0;
+    controls.screenSpacePanning = true;
+    controls.target.set(0, 1.35, 0);
+    controls.maxPolarAngle = Math.PI * 0.52;
+    controls.minDistance = 1.5;
+    controls.maxDistance = 25.0;
+
+    let isUserInteracting = false;
+    controls.addEventListener('start', () => { isUserInteracting = true; });
+    controls.addEventListener('end', () => { isUserInteracting = false; });
+
+    // =========================================================================
+    // GLSL SHADER DEFINITIONS: DRIPPING WAX & NOISE FLAME
+    // =========================================================================
+
+    const simplexNoiseChunk = `
+      vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 permute(vec4 x) { return mod289(((x*34.0)+10.0)*x); }
+      vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+      float snoise(vec3 v) {
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+
+        vec3 i  = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy;
+        vec3 x3 = x0 - D.yyy;
+
+        i = mod289(i);
+        vec4 p = permute(permute(permute(
+                   i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                 + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                 + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+
+        float n_ = 0.142857142857;
+        vec3  ns = n_ * D.wyz - D.xzx;
+
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+        p0 *= norm.x;
+        p1 *= norm.y;
+        p2 *= norm.z;
+        p3 *= norm.w;
+
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+    `;
+
+    // 1. VERTEX-DISPLACED DRIPPING WAX CANDLE SHADER
+    const candleVertexShader = `
+      ${simplexNoiseChunk}
+
+      uniform float uTime;
+      uniform float uHeight;
+      uniform float uRadius;
+      uniform float uDripSpeed;
+      uniform float uDripIntensity;
+      uniform float uDripSize;
+      uniform float uTopPoolDepth;
+      uniform float uSeed;
+
+      varying vec3 vNormal;
+      varying vec3 vWorldPosition;
+      varying vec3 vLocalPosition;
+      varying float vDripFactor;
+      varying float vDistFromTop;
+
+      float getDisplacement(vec3 p, out float dripFac) {
+        float hNorm = (p.y + uHeight * 0.5) / uHeight;
+        hNorm = clamp(hNorm, 0.0, 1.0);
+        float theta = atan(p.z, p.x);
+
+        float totalDisp = 0.0;
+        float maxDrip = 0.0;
+
+        // 6 distinct procedural dripping wax streams around circumference
+        for (int i = 0; i < 6; i++) {
+          float fi = float(i);
+          float chanAngle = fract(sin(fi * 43.12 + uSeed * 17.5) * 43758.5453) * 6.2831853 - 3.14159265;
+          float chanSpeed = 0.65 + fract(sin(fi * 19.33 + uSeed * 9.1) * 23421.63) * 0.7;
+          float phase = fract(sin(fi * 67.81 + uSeed * 31.4) * 85934.12);
+
+          // Continuous seamless downward dripping wax loop
+          float dripProgress = fract(uTime * uDripSpeed * 0.15 * chanSpeed + phase);
+          float dropY = 0.95 - dripProgress * 0.88;
+
+          // Angular distance to channel
+          float diffAngle = abs(atan(sin(theta - chanAngle), cos(theta - chanAngle)));
+          float angWidth = 0.26 * uDripSize;
+          float angFalloff = exp(-pow(diffAngle / angWidth, 2.0));
+
+          // Droplet teardrop shape: bulbous bottom, tapered top
+          float distY = hNorm - dropY;
+          float ySigma = (distY < 0.0) ? (0.065 * uDripSize) : (0.04 * uDripSize);
+          float dropletBulge = exp(-pow(distY / ySigma, 2.0)) * angFalloff;
+
+          // Wax trail left behind the droplet
+          float trailMask = smoothstep(dropY - 0.02, dropY + 0.08, hNorm) * smoothstep(0.98, 0.88, hNorm);
+          float trail = angFalloff * trailMask * 0.38;
+
+          // Melted wax mound accumulation at bottom
+          float baseMound = (1.0 - smoothstep(0.0, 0.25, hNorm)) * angFalloff * 0.5;
+
+          float channelWax = (dropletBulge + trail + baseMound) * uDripIntensity * 0.12 * uRadius;
+          totalDisp += channelWax;
+          maxDrip = max(maxDrip, dropletBulge);
+        }
+
+        // Tactile organic wax waviness
+        float waxNoise = snoise(vec3(p.x * 2.8, p.y * 1.6, p.z * 2.8 + uSeed * 4.0)) * 0.022 * uRadius;
+        float waxRibs = sin(theta * 5.0 + snoise(vec3(theta * 2.0, p.y * 0.8, 0.0))) * 0.015 * uRadius;
+
+        dripFac = maxDrip;
+        return totalDisp + waxNoise + waxRibs;
+      }
+
+      void main() {
+        vLocalPosition = position;
+        vDistFromTop = max(0.0, (uHeight * 0.5) - position.y);
+
+        float dripFactor;
+        float d0 = getDisplacement(position, dripFactor);
+        vDripFactor = dripFactor;
+
+        // Displace position along geometric normal
+        vec3 displaced = position;
+        if (normal.y > 0.5) {
+          // Top cap: melted basin pool depression around the wick
+          float poolR = clamp(length(position.xz) / (uRadius * 0.95), 0.0, 1.0);
+          float depression = -uTopPoolDepth * (1.0 - poolR * poolR) * (1.0 - poolR * poolR);
+          displaced.y += depression;
+        } else if (normal.y < -0.5) {
+          // Bottom cap: flat on altar
+          displaced = position;
+        } else {
+          // Cylinder sides: radial outward dripping wax displacement
+          displaced += normal * d0;
+        }
+
+        // Finite difference analytical normal computation
+        vec3 vTangent = normalize(cross(normal, vec3(0.0, 1.0, 0.001)));
+        vec3 vBitangent = normalize(cross(normal, vTangent));
+
+        float eps = 0.012;
+        float dummy;
+        float d1 = getDisplacement(position + vTangent * eps, dummy);
+        float d2 = getDisplacement(position + vBitangent * eps, dummy);
+
+        vec3 p1 = position + vTangent * eps + normal * d1;
+        vec3 p2 = position + vBitangent * eps + normal * d2;
+
+        vec3 computedNormal = normalize(cross(p1 - displaced, p2 - displaced));
+        if (dot(computedNormal, normal) < 0.0) {
+          computedNormal = -computedNormal;
+        }
+        vNormal = normalize(normalMatrix * computedNormal);
+
+        vec4 worldPos = modelMatrix * vec4(displaced, 1.0);
+        vWorldPosition = worldPos.xyz;
+
+        gl_Position = projectionMatrix * viewMatrix * worldPos;
+      }
+    `;
+
+    const candleFragmentShader = `
+      uniform vec3 uWaxColor;
+      uniform vec3 uWaxTranslucent;
+      uniform vec3 uFlameColor;
+      uniform vec3 uFlameAura;
+      uniform vec3 uAmbientColor;
+      uniform vec3 uCameraPosition;
+      uniform float uHeight;
+      uniform float uTranslucency;
+      uniform float uGloss;
+      uniform float uFlameIntensity;
+
+      varying vec3 vNormal;
+      varying vec3 vWorldPosition;
+      varying vec3 vLocalPosition;
+      varying float vDripFactor;
+      varying float vDistFromTop;
+
+      void main() {
+        vec3 norm = normalize(vNormal);
+        vec3 viewDir = normalize(uCameraPosition - vWorldPosition);
+
+        // 1. Studio Key & Fill Lights for Rich Sculptural Volume
+        vec3 keyDir = normalize(vec3(0.55, 0.75, 0.85));
+        float keyDiff = max(0.0, dot(norm, keyDir));
+
+        vec3 fillDir = normalize(vec3(-0.65, 0.35, 0.65));
+        float fillDiff = max(0.0, dot(norm, fillDir));
+
+        // Soft silhouette rim lighting
+        float rim = pow(1.0 - max(0.0, dot(norm, viewDir)), 3.2);
+
+        // 2. Candle Flame Lighting
+        vec3 flameWorldPos = (modelMatrix * vec4(0.0, uHeight * 0.5 + 0.35, 0.0, 1.0)).xyz;
+        vec3 flameVec = flameWorldPos - vWorldPosition;
+        float flameDist = length(flameVec);
+        vec3 flameDir = flameVec / max(flameDist, 0.001);
+
+        // Wrapped flame diffuse (simulating volumetric luminous flame body)
+        float flameNdotL = dot(norm, flameDir);
+        float flameWrapped = clamp((flameNdotL + 0.5) / 1.5, 0.0, 1.0);
+        float flameAtten = 1.0 / (1.0 + flameDist * flameDist * 0.28);
+
+        // 3. Subsurface Scattering (SSS) inside Wax
+        // Flame light transmits down into the top translucent portion of the wax
+        float sssFactor = exp(-vDistFromTop / (0.7 * max(0.1, uTranslucency)));
+        float backScatter = pow(clamp(dot(-viewDir, flameDir) * 0.5 + 0.5, 0.0, 1.0), 2.6);
+        vec3 sssGlow = uWaxTranslucent * (sssFactor * (0.85 + 1.25 * backScatter)) * uTranslucency * 1.5;
+
+        // 4. Wet Glistening Specular on Dripping Wax
+        vec3 halfVec = normalize(flameDir + viewDir);
+        float nDotH = max(0.0, dot(norm, halfVec));
+        float wetness = clamp(vDripFactor * 3.5, 0.2, 1.0);
+        float shininess = mix(16.0, 95.0, wetness) * uGloss;
+        float specAmt = mix(0.18, 1.4, wetness) * uGloss;
+        float spec = pow(nDotH, shininess) * specAmt * flameAtten;
+
+        vec3 keyHalf = normalize(keyDir + viewDir);
+        float keySpec = pow(max(0.0, dot(norm, keyHalf)), 28.0) * 0.22 * uGloss;
+
+        // 5. Ambient Base (guarantees candle body is never black)
+        vec3 ambient = uAmbientColor * 0.4 + vec3(0.08, 0.075, 0.07);
+
+        // 6. Final Composite Wax Lighting
+        vec3 flameLight = uFlameColor * (flameWrapped * flameAtten * 1.5 * uFlameIntensity);
+        vec3 studioLight = vec3(1.0, 0.96, 0.91) * (keyDiff * 0.45 + fillDiff * 0.25);
+        vec3 totalDiffuse = flameLight + studioLight + ambient;
+
+        vec3 finalWax = uWaxColor * totalDiffuse + sssGlow + (uFlameColor * spec) + (vec3(1.0) * keySpec) + (uWaxTranslucent * rim * 0.28);
+
+        gl_FragColor = vec4(finalWax, 1.0);
+      }
+    `;
+
+    // 2. PROCEDURAL 3D NOISE FLAME SHADER
+    const flameVertexShader = `
+      ${simplexNoiseChunk}
+
+      uniform float uTime;
+      uniform float uFlameScale;
+      uniform float uTurbulence;
+      uniform float uFlameSeed;
+
+      varying vec3 vNormal;
+      varying vec3 vLocalPos;
+      varying float vHNorm;
+
+      void main() {
+        vLocalPos = position;
+        vHNorm = clamp(position.y / 1.0, 0.0, 1.0);
+
+        // Upward thermal buoyancy noise
+        vec3 noiseCoord = vec3(position.x * 4.2, position.y * 3.0 - uTime * 5.5, position.z * 4.2 + uFlameSeed * 8.0);
+        float noiseVal = snoise(noiseCoord) * uTurbulence * 0.16 * pow(vHNorm, 1.2);
+
+        // Wind sway & thermal flutter
+        float flutter = sin(uTime * 14.0 + uFlameSeed * 6.0) * 0.02 * vHNorm;
+        float sway = sin(uTime * 2.8 + uFlameSeed * 3.5) * 0.045 * vHNorm;
+
+        vec3 displaced = position;
+        displaced.x += noiseVal + sway + flutter;
+        displaced.z += snoise(noiseCoord + 17.3) * uTurbulence * 0.12 * pow(vHNorm, 1.2);
+        displaced.y += snoise(noiseCoord * 0.5) * 0.08 * vHNorm;
+        displaced *= uFlameScale;
+
+        vNormal = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+      }
+    `;
+
+    const flameFragmentShader = `
+      ${simplexNoiseChunk}
+
+      uniform float uTime;
+      uniform vec3 uFlameCore;
+      uniform vec3 uFlameMantle;
+      uniform vec3 uFlameAura;
+      uniform float uBrightness;
+      uniform float uFlameSeed;
+
+      varying vec3 vNormal;
+      varying vec3 vLocalPos;
+      varying float vHNorm;
+
+      void main() {
+        float r = length(vLocalPos.xz) / (0.35 * (1.0 - vHNorm * 0.75 + 0.05));
+
+        vec3 nCoord = vec3(vLocalPos.x * 9.0, vLocalPos.y * 7.0 - uTime * 7.5, vLocalPos.z * 9.0 + uFlameSeed);
+        float n = snoise(nCoord) * 0.4;
+
+        float density = 1.0 - smoothstep(0.0, 1.1, r + n);
+        density *= smoothstep(0.0, 0.15, vHNorm);
+        density *= (1.0 - smoothstep(0.72, 1.0, vHNorm));
+
+        if (density < 0.01) discard;
+
+        float coreMask = clamp(1.0 - r * 2.2, 0.0, 1.0);
+        float mantleMask = clamp(1.0 - r * 1.1, 0.0, 1.0);
+
+        vec3 baseTint = vec3(0.15, 0.45, 1.0);
+        float baseMask = (1.0 - smoothstep(0.0, 0.22, vHNorm)) * (1.0 - coreMask);
+
+        vec3 color = mix(uFlameAura, uFlameMantle, mantleMask);
+        color = mix(color, uFlameCore, pow(coreMask, 1.8));
+        color = mix(color, baseTint, baseMask * 0.7);
+        color *= uBrightness;
+
+        gl_FragColor = vec4(color, density * 0.95);
+      }
+    `;
+
+    // =========================================================================
+    // CANDLE ROW BUILDER
+    // =========================================================================
+    const candleGroup = new THREE.Group();
+    scene.add(candleGroup);
+
+    const candleConfigs = [
+      { x: -3.3, z:  0.08, radius: 0.38, height: 2.7, seed: 1.1 },
+      { x: -2.2, z: -0.06, radius: 0.34, height: 1.9, seed: 2.7 },
+      { x: -1.1, z:  0.05, radius: 0.42, height: 3.3, seed: 3.4 },
+      { x:  0.0, z: -0.04, radius: 0.44, height: 3.8, seed: 4.9 }, // Towering central candle
+      { x:  1.1, z:  0.06, radius: 0.39, height: 2.3, seed: 5.2 },
+      { x:  2.2, z: -0.05, radius: 0.35, height: 3.1, seed: 6.8 },
+      { x:  3.3, z:  0.07, radius: 0.40, height: 2.5, seed: 7.3 }
+    ];
+
+    const candleMaterials = [];
+    const flameMaterials = [];
+    const puddleMaterials = [];
+    const pointLights = [];
+
+    // Shared flame geometry: tapered egg/teardrop mesh
+    const flameGeo = new THREE.SphereGeometry(0.32, 32, 32);
+    const flamePositions = flameGeo.attributes.position;
+    for (let i = 0; i < flamePositions.count; i++) {
+      let y = flamePositions.getY(i) + 0.32;
+      let hNorm = y / 0.64;
+      let rScale = (1.0 - hNorm * 0.85) * (0.8 + 0.4 * hNorm);
+      let x = flamePositions.getX(i) * rScale;
+      let z = flamePositions.getZ(i) * rScale;
+      flamePositions.setXYZ(i, x, y * 1.8, z);
+    }
+    flameGeo.computeVertexNormals();
+
+    candleConfigs.forEach((cfg) => {
+      const singleCandle = new THREE.Group();
+      singleCandle.position.set(cfg.x, 0, cfg.z);
+
+      // High-resolution cylinder geometry for vertex-displaced dripping wax
+      const candleGeo = new THREE.CylinderGeometry(
+        cfg.radius,
+        cfg.radius * 1.05,
+        cfg.height,
+        64,
+        128,
+        false
+      );
+
+      const candleMat = new THREE.ShaderMaterial({
+        vertexShader: candleVertexShader,
+        fragmentShader: candleFragmentShader,
+        uniforms: {
+          uTime: { value: 0 },
+          uHeight: { value: cfg.height },
+          uRadius: { value: cfg.radius },
+          uDripSpeed: { value: params.waxDripSpeed },
+          uDripIntensity: { value: params.dripIntensity },
+          uDripSize: { value: params.dripSize },
+          uTopPoolDepth: { value: params.topPoolDepth },
+          uSeed: { value: cfg.seed },
+          uWaxColor: { value: new THREE.Color(params.waxColor) },
+          uWaxTranslucent: { value: new THREE.Color(params.waxTranslucent) },
+          uFlameColor: { value: new THREE.Color(params.flameMantle) },
+          uFlameAura: { value: new THREE.Color(params.flameAura) },
+          uAmbientColor: { value: new THREE.Color(params.bgColor) },
+          uCameraPosition: { value: camera.position },
+          uTranslucency: { value: params.waxTranslucency },
+          uGloss: { value: params.waxGloss },
+          uFlameIntensity: { value: params.flameBrightness }
+        }
+      });
+      candleMaterials.push(candleMat);
+
+      const candleMesh = new THREE.Mesh(candleGeo, candleMat);
+      candleMesh.position.y = cfg.height * 0.5;
+      singleCandle.add(candleMesh);
+
+      // Charred Wick at candle top
+      const wickGeo = new THREE.CylinderGeometry(0.015, 0.018, 0.22, 12);
+      const wickMat = new THREE.MeshStandardMaterial({
+        color: 0x181514,
+        roughness: 0.9,
+        metalness: 0.1
+      });
+      const wickMesh = new THREE.Mesh(wickGeo, wickMat);
+      wickMesh.position.set(0, cfg.height + 0.08, 0);
+      wickMesh.rotation.z = Math.sin(cfg.seed) * 0.12;
+      singleCandle.add(wickMesh);
+
+      // Flickering Noise Flame Mesh on Top
+      const flameMat = new THREE.ShaderMaterial({
+        vertexShader: flameVertexShader,
+        fragmentShader: flameFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uFlameScale: { value: params.flameScale },
+          uTurbulence: { value: params.flameTurbulence },
+          uFlameSeed: { value: cfg.seed },
+          uFlameCore: { value: new THREE.Color(params.flameCore) },
+          uFlameMantle: { value: new THREE.Color(params.flameMantle) },
+          uFlameAura: { value: new THREE.Color(params.flameAura) },
+          uBrightness: { value: params.flameBrightness }
+        }
+      });
+      flameMaterials.push(flameMat);
+
+      const flameMesh = new THREE.Mesh(flameGeo, flameMat);
+      flameMesh.position.set(0, cfg.height + 0.16, 0);
+      singleCandle.add(flameMesh);
+
+      // Dynamic Candle Flame Point Light
+      const pointLight = new THREE.PointLight(
+        new THREE.Color(params.flameMantle),
+        params.lightIntensity,
+        9.0,
+        1.6
+      );
+      pointLight.position.set(0, cfg.height + 0.45, 0);
+      singleCandle.add(pointLight);
+      pointLights.push({ light: pointLight, baseIntensity: params.lightIntensity, seed: cfg.seed });
+
+      // Organic Solidified Wax Puddle Mound at Altar Base
+      const puddleGeo = new THREE.CylinderGeometry(cfg.radius * 1.25, cfg.radius * 1.85, 0.05, 36);
+      const puddleMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(params.waxColor),
+        roughness: 0.35,
+        metalness: 0.05
+      });
+      puddleMaterials.push(puddleMat);
+
+      const puddleMesh = new THREE.Mesh(puddleGeo, puddleMat);
+      puddleMesh.position.set(0, 0.025, 0);
+      singleCandle.add(puddleMesh);
+
+      candleGroup.add(singleCandle);
+    });
+
+    // =========================================================================
+    // ALTAR SLATE & CANDLESTAND PEDESTAL
+    // =========================================================================
+    const altarGeo = new THREE.BoxGeometry(9.6, 0.28, 2.6);
+    const altarMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.altarColor),
+      roughness: 0.75,
+      metalness: 0.15
+    });
+    const altarMesh = new THREE.Mesh(altarGeo, altarMat);
+    altarMesh.position.set(0, -0.14, 0);
+    altarMesh.receiveShadow = true;
+    scene.add(altarMesh);
+
+    // Subtle Altar Lower Step
+    const baseSlabGeo = new THREE.BoxGeometry(11.0, 0.22, 3.6);
+    const baseSlabMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.altarColor).multiplyScalar(0.7),
+      roughness: 0.85,
+      metalness: 0.12
+    });
+    const baseSlabMesh = new THREE.Mesh(baseSlabGeo, baseSlabMat);
+    baseSlabMesh.position.set(0, -0.39, 0);
+    scene.add(baseSlabMesh);
+
+    // General Ambient & Fill Lighting
+    const hemiLight = new THREE.HemisphereLight(
+      new THREE.Color(params.flameAura),
+      new THREE.Color(params.bgColor),
+      0.55
+    );
+    scene.add(hemiLight);
+
+    const dirLight = new THREE.DirectionalLight(0xfffaed, 0.45);
+    dirLight.position.set(3, 8, 5);
+    scene.add(dirLight);
+
+    // =========================================================================
+    // FLOATING THERMAL EMBERS & PARTICLES
+    // =========================================================================
+    const emberCount = 180;
+    const emberGeo = new THREE.BufferGeometry();
+    const emberPositions = new Float32Array(emberCount * 3);
+    const emberVelocities = [];
+
+    for (let i = 0; i < emberCount; i++) {
+      const cx = (Math.random() - 0.5) * 8.0;
+      const cy = 1.0 + Math.random() * 4.5;
+      const cz = (Math.random() - 0.5) * 2.0;
+      emberPositions[i * 3] = cx;
+      emberPositions[i * 3 + 1] = cy;
+      emberPositions[i * 3 + 2] = cz;
+
+      emberVelocities.push({
+        vx: (Math.random() - 0.5) * 0.08,
+        vy: 0.25 + Math.random() * 0.45,
+        vz: (Math.random() - 0.5) * 0.08,
+        seed: Math.random() * 100
+      });
+    }
+    emberGeo.setAttribute('position', new THREE.BufferAttribute(emberPositions, 3));
+
+    const emberMat = new THREE.PointsMaterial({
+      color: new THREE.Color(params.flameMantle),
+      size: 0.05,
+      transparent: true,
+      opacity: 0.85,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const emberPoints = new THREE.Points(emberGeo, emberMat);
+    scene.add(emberPoints);
+
+    // =========================================================================
+    // 8 PRECONFIGURED CAMERA ANIMATIONS
+    // =========================================================================
+    const ANIMATIONS = [
+      'Static (No Camera Movement)',
+      'Slow Linear Dolly',
+      'Gentle Orbit',
+      'Subtle Breathing',
+      'Altar Sweep',
+      'Figure-8 Drift',
+      'Overhead Crown Sweep',
+      'Side Arc Glide'
+    ];
+
+    let globalAnimClock = 0;
+
+    function updateCameraAnimation(dt) {
+      if (isUserInteracting) return;
+      if (params.cameraAnimation === 'Static (No Camera Movement)') return;
+
+      globalAnimClock += dt * 0.45;
+      const t = globalAnimClock;
+
+      let targetCamPos = new THREE.Vector3();
+      let lookTarget = new THREE.Vector3(0, 1.35, 0);
+
+      switch (params.cameraAnimation) {
+        case 'Slow Linear Dolly':
+          targetCamPos.set(
+            Math.sin(t * 0.4) * 3.4,
+            1.9 + Math.cos(t * 0.3) * 0.25,
+            6.6
+          );
+          lookTarget.set(Math.sin(t * 0.4) * 0.8, 1.35, 0);
+          break;
+
+        case 'Gentle Orbit':
+          targetCamPos.set(
+            Math.sin(t * 0.35) * 6.8,
+            2.2 + Math.sin(t * 0.25) * 0.45,
+            Math.cos(t * 0.35) * 6.8
+          );
+          lookTarget.set(0, 1.4, 0);
+          break;
+
+        case 'Subtle Breathing':
+          const dist = 5.6 + Math.sin(t * 0.55) * 1.8;
+          targetCamPos.set(
+            Math.sin(t * 0.2) * 1.2,
+            1.8 + Math.cos(t * 0.3) * 0.3,
+            dist
+          );
+          lookTarget.set(0, 1.5, 0);
+          break;
+
+        case 'Altar Sweep':
+          targetCamPos.set(
+            Math.sin(t * 0.45) * 4.2,
+            0.75 + Math.sin(t * 0.3) * 0.2,
+            4.6
+          );
+          lookTarget.set(Math.sin(t * 0.45) * 0.4, 2.0, 0);
+          break;
+
+        case 'Figure-8 Drift':
+          targetCamPos.set(
+            Math.sin(t * 0.4) * 4.6,
+            2.0 + Math.cos(t * 0.4) * 0.5,
+            5.8 + Math.sin(t * 0.8) * 1.4
+          );
+          lookTarget.set(Math.sin(t * 0.4) * 0.6, 1.35, 0);
+          break;
+
+        case 'Overhead Crown Sweep':
+          targetCamPos.set(
+            Math.cos(t * 0.4) * 3.8,
+            4.4 + Math.sin(t * 0.3) * 0.5,
+            4.3
+          );
+          lookTarget.set(0, 1.15, 0);
+          break;
+
+        case 'Side Arc Glide':
+          const angle = -0.65 + Math.sin(t * 0.38) * 1.3;
+          targetCamPos.set(
+            Math.sin(angle) * 6.5,
+            1.9 + Math.cos(t * 0.3) * 0.25,
+            Math.cos(angle) * 6.5
+          );
+          lookTarget.set(0, 1.35, 0);
+          break;
+      }
+
+      camera.position.lerp(targetCamPos, 0.04);
+      controls.target.lerp(lookTarget, 0.04);
+    }
+
+    // =========================================================================
+    // COLOR THEME APPLIER & DYNAMIC SYNCHRONIZER
+    // =========================================================================
+    function applyColors() {
+      if (params.greenscreen) {
+        scene.background = new THREE.Color(0x00ff00);
+        scene.fog = null;
+        postProcessor.settings.enabled = false;
+      } else {
+        scene.background = new THREE.Color(params.bgColor);
+        scene.fog = new THREE.FogExp2(params.bgColor, 0.038);
+        postProcessor.settings.enabled = true;
+      }
+      postProcessor.updateSettings();
+
+      // Update Candle Materials
+      candleMaterials.forEach((mat) => {
+        mat.uniforms.uWaxColor.value.set(params.waxColor);
+        mat.uniforms.uWaxTranslucent.value.set(params.waxTranslucent);
+        mat.uniforms.uFlameColor.value.set(params.flameMantle);
+        mat.uniforms.uFlameAura.value.set(params.flameAura);
+        mat.uniforms.uAmbientColor.value.set(params.greenscreen ? 0x00ff00 : params.bgColor);
+        mat.uniforms.uTranslucency.value = params.waxTranslucency;
+        mat.uniforms.uGloss.value = params.waxGloss;
+        mat.uniforms.uDripIntensity.value = params.dripIntensity;
+        mat.uniforms.uDripSize.value = params.dripSize;
+        mat.uniforms.uTopPoolDepth.value = params.topPoolDepth;
+        mat.uniforms.uFlameIntensity.value = params.flameBrightness;
+      });
+
+      // Update Flame Materials
+      flameMaterials.forEach((mat) => {
+        mat.uniforms.uFlameCore.value.set(params.flameCore);
+        mat.uniforms.uFlameMantle.value.set(params.flameMantle);
+        mat.uniforms.uFlameAura.value.set(params.flameAura);
+        mat.uniforms.uBrightness.value = params.flameBrightness;
+        mat.uniforms.uFlameScale.value = params.flameScale;
+        mat.uniforms.uTurbulence.value = params.flameTurbulence;
+      });
+
+      // Update Puddle Materials
+      puddleMaterials.forEach((mat) => {
+        mat.color.set(params.waxColor);
+      });
+
+      // Update Dynamic Flame Point Lights
+      pointLights.forEach((pl) => {
+        pl.light.color.set(params.flameMantle);
+        pl.baseIntensity = params.lightIntensity;
+      });
+
+      // Update Altar & Studio Lights
+      altarMat.color.set(params.altarColor);
+      baseSlabMat.color.set(new THREE.Color(params.altarColor).multiplyScalar(0.7));
+      hemiLight.color.set(params.flameAura);
+      hemiLight.groundColor.set(params.greenscreen ? 0x00ff00 : params.bgColor);
+
+      // Update Embers
+      emberMat.color.set(params.flameMantle);
+    }
+
+    function applyPresetScheme(schemeName) {
+      const s = COLOR_SCHEMES[schemeName];
+      if (!s) return;
+      params.colorScheme = schemeName;
+      params.waxColor = s.wax;
+      params.waxTranslucent = s.waxTranslucent;
+      params.flameCore = s.flameCore;
+      params.flameMantle = s.flameMantle;
+      params.flameAura = s.flameAura;
+      params.bgColor = s.bg;
+      params.altarColor = s.altar;
+      params.accentColor = s.accent;
+
+      applyColors();
+      updateGuiDisplays();
+    }
+
+    // =========================================================================
+    // LIL-GUI CONTROL PANEL
+    // =========================================================================
+    const gui = new GUI({ title: 'Dripping Wax Candle Row' });
+
+    // 1. Color Schemes & Palette
+    const fColors = gui.addFolder('Color Schemes & Appearance');
+    fColors.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Preset Palette').onChange(applyPresetScheme);
+    fColors.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(applyColors);
+    fColors.addColor(params, 'waxColor').name('Wax Color').onChange(applyColors);
+    fColors.addColor(params, 'waxTranslucent').name('Translucent Glow').onChange(applyColors);
+    fColors.addColor(params, 'flameCore').name('Flame Core').onChange(applyColors);
+    fColors.addColor(params, 'flameMantle').name('Flame Mantle').onChange(applyColors);
+    fColors.addColor(params, 'flameAura').name('Flame Aura').onChange(applyColors);
+    fColors.addColor(params, 'bgColor').name('Background').onChange(applyColors);
+    fColors.addColor(params, 'altarColor').name('Altar Stone').onChange(applyColors);
+    fColors.addColor(params, 'accentColor').name('Accent Highlight').onChange(applyColors);
+
+    // 2. Animations & Camera
+    const fAnim = gui.addFolder('Animation & Motion');
+    fAnim.add(params, 'cameraAnimation', ANIMATIONS).name('Camera Mode');
+    fAnim.add(params, 'animationSpeed', 0.1, 3.0, 0.05).name('Animation Speed');
+    fAnim.add(params, 'waxDripSpeed', 0.2, 3.0, 0.05).name('Wax Drip Velocity');
+    fAnim.add(params, 'flameFlickerSpeed', 0.2, 3.0, 0.05).name('Flame Flicker Speed');
+
+    // 3. Wax Drip Shader Dynamics
+    const fWax = gui.addFolder('Wax & Drip Dynamics');
+    fWax.add(params, 'dripIntensity', 0.1, 2.5, 0.05).name('Drip Bulge Intensity').onChange(() => {
+      candleMaterials.forEach(m => m.uniforms.uDripIntensity.value = params.dripIntensity);
+    });
+    fWax.add(params, 'dripSize', 0.4, 2.2, 0.05).name('Droplet Size').onChange(() => {
+      candleMaterials.forEach(m => m.uniforms.uDripSize.value = params.dripSize);
+    });
+    fWax.add(params, 'waxTranslucency', 0.1, 3.0, 0.05).name('Subsurface Translucency').onChange(applyColors);
+    fWax.add(params, 'waxGloss', 0.1, 3.0, 0.05).name('Wet Wax Gloss').onChange(applyColors);
+    fWax.add(params, 'topPoolDepth', 0.0, 0.3, 0.01).name('Melted Basin Depth').onChange(() => {
+      candleMaterials.forEach(m => m.uniforms.uTopPoolDepth.value = params.topPoolDepth);
+    });
+
+    // 4. Flame Dynamics & Lighting
+    const fFlame = gui.addFolder('Flame & Atmosphere');
+    fFlame.add(params, 'flameScale', 0.5, 2.2, 0.05).name('Flame Height').onChange(applyColors);
+    fFlame.add(params, 'flameBrightness', 0.5, 3.0, 0.05).name('Flame Radiance').onChange(applyColors);
+    fFlame.add(params, 'flameTurbulence', 0.2, 2.5, 0.05).name('Flame Turbulence').onChange(applyColors);
+    fFlame.add(params, 'lightIntensity', 0.0, 3.5, 0.1).name('Point Light Intensity').onChange(applyColors);
+    fFlame.add(params, 'showEmbers').name('Rising Embers').onChange((v) => { emberPoints.visible = v; });
+
+    // 5. Render Quality
+    const fRender = gui.addFolder('Renderer & Quality');
+    fRender.add(params, 'dpr', 0.5, 2.5, 0.1).name('Pixel Ratio (DPR)').onChange((val) => {
+      renderer.setPixelRatio(val);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, val);
+    });
+    fRender.add(params, 'clickRandomizer').name('Click Scene to Randomize');
+
+    // 6. Integrated PostProcessor.js GUI Suite
+    postProcessor.attachGUI(gui, 'Post-Processing Suite');
+
+    fColors.open();
+    fAnim.open();
+
+    function updateGuiDisplays() {
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // =========================================================================
+    // H KEY: TOGGLE ALL UI VISIBILITY
+    // =========================================================================
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        if (gui._hidden !== undefined) {
+          gui.show(gui._hidden);
+        } else {
+          gui.domElement.style.display = gui.domElement.style.display === 'none' ? '' : 'none';
+        }
+      }
+    });
+
+    // =========================================================================
+    // CLICK RANDOMIZER: PROCEDURAL VARIATION ON SCENE CLICK
+    // Note: NEVER shuffle or alter Post-Processing settings on click!
+    // =========================================================================
+    let pointerDownPos = { x: 0, y: 0 };
+
+    window.addEventListener('pointerdown', (e) => {
+      pointerDownPos.x = e.clientX;
+      pointerDownPos.y = e.clientY;
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (e.target.closest('.lil-gui')) return;
+
+      const dist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+      if (dist < 6 && params.clickRandomizer) {
+        // Randomly pick a new visual theme from the 18 schemes
+        const schemeKeys = Object.keys(COLOR_SCHEMES);
+        const randomScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+        const s = COLOR_SCHEMES[randomScheme];
+
+        params.colorScheme = randomScheme;
+        params.waxColor = s.wax;
+        params.waxTranslucent = s.waxTranslucent;
+        params.flameCore = s.flameCore;
+        params.flameMantle = s.flameMantle;
+        params.flameAura = s.flameAura;
+        params.bgColor = s.bg;
+        params.altarColor = s.altar;
+        params.accentColor = s.accent;
+
+        // Re-roll geometric and motion parameters
+        params.waxDripSpeed = Number((0.6 + Math.random() * 1.5).toFixed(2));
+        params.dripIntensity = Number((0.8 + Math.random() * 1.3).toFixed(2));
+        params.dripSize = Number((0.7 + Math.random() * 0.9).toFixed(2));
+        params.waxTranslucency = Number((0.8 + Math.random() * 1.4).toFixed(2));
+        params.waxGloss = Number((0.8 + Math.random() * 1.4).toFixed(2));
+        params.topPoolDepth = Number((0.08 + Math.random() * 0.16).toFixed(2));
+        params.flameTurbulence = Number((0.7 + Math.random() * 1.1).toFixed(2));
+        params.flameScale = Number((0.85 + Math.random() * 0.5).toFixed(2));
+        params.flameBrightness = Number((1.1 + Math.random() * 0.8).toFixed(2));
+
+        // Re-roll candle drip seeds for unique procedural dripping patterns
+        candleMaterials.forEach((mat) => {
+          mat.uniforms.uSeed.value = Math.random() * 50.0;
+        });
+
+        // IMPORTANT: postProcessor.settings are PRESERVED and NOT shuffled or changed!
+        applyColors();
+        updateGuiDisplays();
+      }
+    });
+
+    // =========================================================================
+    // WINDOW RESIZE HANDLER
+    // =========================================================================
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      postProcessor.setSize(w, h, params.dpr);
+    });
+
+    // =========================================================================
+    // AUTO INFINITE ANIMATION LOOP
+    // =========================================================================
+    const clock = new THREE.Clock();
+    let accumulatedTime = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const scaledDelta = delta * params.animationSpeed;
+      accumulatedTime += scaledDelta;
+
+      // 1. Update Candle Wax Shader Uniforms (looping downward dripping wax tears)
+      candleMaterials.forEach((mat) => {
+        mat.uniforms.uTime.value = accumulatedTime;
+        mat.uniforms.uDripSpeed.value = params.waxDripSpeed;
+        mat.uniforms.uCameraPosition.value.copy(camera.position);
+      });
+
+      // 2. Update Noise Flame Shader Uniforms
+      const flameTime = accumulatedTime * params.flameFlickerSpeed;
+      flameMaterials.forEach((mat) => {
+        mat.uniforms.uTime.value = flameTime;
+      });
+
+      // 3. Dynamic Flame Point Light Flickering
+      pointLights.forEach((pl) => {
+        const flicker =
+          Math.sin(flameTime * 13.0 + pl.seed * 5.0) * 0.18 +
+          Math.cos(flameTime * 23.0 + pl.seed * 3.0) * 0.12 +
+          Math.sin(flameTime * 7.5) * 0.08;
+        pl.light.intensity = Math.max(0.0, pl.baseIntensity * (1.0 + flicker));
+      });
+
+      // 4. Animate Rising Thermal Embers
+      if (params.showEmbers) {
+        const posAttr = emberGeo.attributes.position;
+        for (let i = 0; i < emberCount; i++) {
+          let y = posAttr.getY(i) + emberVelocities[i].vy * scaledDelta;
+          let x = posAttr.getX(i) + Math.sin(accumulatedTime * 2.0 + emberVelocities[i].seed) * 0.006;
+          let z = posAttr.getZ(i) + Math.cos(accumulatedTime * 2.0 + emberVelocities[i].seed) * 0.006;
+
+          if (y > 6.0) {
+            y = 1.0 + Math.random() * 0.5;
+            x = (Math.random() - 0.5) * 7.5;
+            z = (Math.random() - 0.5) * 1.5;
+          }
+          posAttr.setXYZ(i, x, y, z);
+        }
+        posAttr.needsUpdate = true;
+      }
+
+      // 5. Camera Animation & Controls
+      updateCameraAnimation(scaledDelta);
+      controls.update();
+
+      // 6. Render Scene through PostProcessor Pipeline
+      postProcessor.renderScene(scene, camera);
+    }
+
+    // Initialize colors & start infinite loop
+    applyColors();
+    animate();
+  </script>
+</body>
+</html>

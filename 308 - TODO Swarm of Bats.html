@@ -1,0 +1,1772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boid-Driven Swarm of Bats Orbiting a Full Moon</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #webgl-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="webgl-canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================================
+    // POST PROCESSOR SUITE (Inlined from postprocessing/PostProcessor.js)
+    // =========================================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+    }
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      fragColor = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      fragColor.rgb = finalLevels(fragColor.rgb, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+      fragColor.a = 1.0;
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) {
+          renderer.setRenderTarget(this.fbo);
+        }
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) {
+          renderer.setRenderTarget(null);
+        }
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.8,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 1.3,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.12,
+
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.018,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.3,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.5,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.022,
+
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+        };
+
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing Suite") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Suite");
+
+        const bloom = root.addFolder("Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+        const lens = root.addFolder("Lens, Optics & Fisheye");
+        lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+        lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+        lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+        lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+        lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // --- 18 PRECONFIGURED COLOR SCHEMES ---
+    const COLOR_SCHEMES = {
+      'Monochromatic': {
+        name: 'Monochromatic (Midnight Deep)',
+        bg: '#050a14',
+        moon: '#dbe7f6',
+        glow: '#3c68a6',
+        bat: '#060d1a',
+        accent: '#7daaff',
+        cloud: '#0a1626'
+      },
+      'Analogous': {
+        name: 'Analogous (Twilight Indigo)',
+        bg: '#09041a',
+        moon: '#ddceff',
+        glow: '#6e38db',
+        bat: '#110726',
+        accent: '#9d56eb',
+        cloud: '#1a0d3b'
+      },
+      'Complementary': {
+        name: 'Complementary (Harvest Amber)',
+        bg: '#040b18',
+        moon: '#ffa726',
+        glow: '#e66700',
+        bat: '#050c18',
+        accent: '#2979ff',
+        cloud: '#0a1a36'
+      },
+      'Split-complementary': {
+        name: 'Split-complementary (Mystic Teal)',
+        bg: '#030f14',
+        moon: '#ff9838',
+        glow: '#d9531e',
+        bat: '#04141c',
+        accent: '#00e5ff',
+        cloud: '#092533'
+      },
+      'Triadic': {
+        name: 'Triadic (Crimson & Gold)',
+        bg: '#060f16',
+        moon: '#ffd13b',
+        glow: '#ff3344',
+        bat: '#07121b',
+        accent: '#00b4d8',
+        cloud: '#10222d'
+      },
+      'Tetradic': {
+        name: 'Tetradic (Enchanted Dusk)',
+        bg: '#0e061a',
+        moon: '#f7d84a',
+        glow: '#9d32ff',
+        bat: '#130824',
+        accent: '#00e676',
+        cloud: '#24103d'
+      },
+      'Double split-complementary': {
+        name: 'Double Split-Complementary',
+        bg: '#080818',
+        moon: '#ff7a29',
+        glow: '#7c5396',
+        bat: '#0f0f22',
+        accent: '#2ed573',
+        cloud: '#1b1b38'
+      },
+      'Achromatic (Black & White)': {
+        name: 'Achromatic (Black & White)',
+        bg: '#000000',
+        moon: '#ffffff',
+        glow: '#aaaaaa',
+        bat: '#070707',
+        accent: '#e0e0e0',
+        cloud: '#181818'
+      },
+      'Achromatic (White & Black)': {
+        name: 'Achromatic (White & Black)',
+        bg: '#ffffff',
+        moon: '#111111',
+        glow: '#444444',
+        bat: '#000000',
+        accent: '#222222',
+        cloud: '#dddddd'
+      },
+      'Neutral + accent': {
+        name: 'Neutral + Accent (Slate & Crimson)',
+        bg: '#ffffff',
+        moon: '#000000',
+        glow: '#ff0044',
+        bat: '#0d0f11',
+        accent: '#ff0044',
+        cloud: '#202428'
+      },
+      'Palette 1': {
+        name: 'Harvest Ember (#F6AA1C)',
+        bg: '#220901',
+        moon: '#f6aa1c',
+        glow: '#bc3908',
+        bat: '#120400',
+        accent: '#f6aa1c',
+        cloud: '#941b0c'
+      },
+      'Palette 2': {
+        name: 'Abyssal Cyan (#63D1CF)',
+        bg: '#000000',
+        moon: '#63d1cf',
+        glow: '#5bc0be',
+        bat: '#0b132b',
+        accent: '#63d1cf',
+        cloud: '#4bad9e'
+      },
+      'Palette 3': {
+        name: 'Velvet Lilac (#AA60C8)',
+        bg: '#0d001d',
+        moon: '#d69ade',
+        glow: '#aa60c8',
+        bat: '#120a12',
+        accent: '#cfb5c2',
+        cloud: '#c9a3c6'
+      },
+      'Palette 4': {
+        name: 'Gilded Emerald (#FEF1BE)',
+        bg: '#061210',
+        moon: '#fef1be',
+        glow: '#ffba00',
+        bat: '#00474d',
+        accent: '#ffba00',
+        cloud: '#008189'
+      },
+      'Palette 5': {
+        name: 'Toxic Aurora (#D4FFB0)',
+        bg: '#05140a',
+        moon: '#d4ffb0',
+        glow: '#7fff00',
+        bat: '#0a3322',
+        accent: '#7fff00',
+        cloud: '#00b894'
+      },
+      'Palette 6': {
+        name: 'Blood Dusk (#FFE8CC)',
+        bg: '#0e0618',
+        moon: '#ffe8cc',
+        glow: '#ff8c00',
+        bat: '#3d1050',
+        accent: '#ff8c00',
+        cloud: '#c7501a'
+      },
+      'Palette 7': {
+        name: 'Cosmic Amethyst (#E8E0FF)',
+        bg: '#090612',
+        moon: '#e8e0ff',
+        glow: '#b38fff',
+        bat: '#1a1250',
+        accent: '#b38fff',
+        cloud: '#6a3de8'
+      },
+      'Palette 8': {
+        name: 'Cyber Phantasm (#E0FBFF)',
+        bg: '#05020f',
+        moon: '#e0fbff',
+        glow: '#00f0ff',
+        bat: '#1e0a3d',
+        accent: '#00f0ff',
+        cloud: '#d40078'
+      }
+    };
+
+    const ANIMATION_MODES = [
+      'Static (No Camera Movement)',
+      'Slow Moon Orbit',
+      'Ascending Spiral',
+      'Cinematic Swoop',
+      'Drifting Eclipse',
+      'Vortex Underlook',
+      'Swarm Follower',
+      'Ethereal Breath'
+    ];
+
+    // Scene Parameters
+    const params = {
+      // Color & Atmosphere
+      colorScheme: 'Neutral + accent',
+      greenscreen: false,
+      moonColor: '#000000',
+      moonGlow: '#ff0044',
+      batColor: '#0d0f11',
+      bgColor: '#ffffff',
+      cloudColor: '#202428',
+
+      // Camera & Playback
+      cameraMode: 'Static (No Camera Movement)',
+      animSpeed: 1.24,
+      pixelRatio: 1.5,
+
+      // Swarm Geometry & Motion
+      batCount: 200,
+      vortexRadius: 36,
+      vortexHeight: 31,
+      swirlSpeed: 1.55,
+      wingFlapAmp: 0.75,
+      batScale: 1.1,
+
+      // Moon Geometry
+      moonRadius: 12,
+      moonGlowSize: 2.55,
+
+      // Interaction
+      clickToRandomize: true
+    };
+
+    // --- SETUP RENDERER, SCENE, CAMERA, CONTROLS ---
+    const canvas = document.getElementById('webgl-canvas');
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: 'high-performance'
+    });
+    renderer.setPixelRatio(params.pixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+
+    // --- INITIALIZE POST PROCESSOR ---
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      bloomEnabled: true,
+      bloomStrength: 1.8,
+      bloomRadius: 1.3,
+      bloomThreshold: 0.12,
+      fisheyeStrength: 0.0,
+      fisheyeRadius: 1.0,
+      chromaticAberration: 0.018,
+      vignetteBoost: 1.3,
+      vignetteReduction: 0.5,
+      noiseIntensity: 0.022,
+      gamma: 1.0,
+      minInputLevel: 0.0,
+      maxInputLevel: 1.0
+    });
+    postProcessor.setSize(window.innerWidth, window.innerHeight, params.pixelRatio);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(params.bgColor, 0.0035);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 1200);
+    camera.position.set(0, 15, 125);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.maxDistance = 450;
+    controls.minDistance = 15;
+    controls.target.set(0, 6, 0);
+
+    // --- LIGHTING ---
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+
+    const moonLight = new THREE.PointLight(params.moonColor, 2.5, 350);
+    moonLight.position.set(0, 10, 0);
+    scene.add(moonLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(40, 60, 60);
+    scene.add(dirLight);
+
+    // --- PROCEDURAL MOON TEXTURE GENERATOR ---
+    function createMoonTexture() {
+      const size = 1024;
+      const c = document.createElement('canvas');
+      c.width = size;
+      c.height = size;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#d2d5dc';
+      ctx.fillRect(0, 0, size, size);
+
+      const imgData = ctx.getImageData(0, 0, size, size);
+      const data = imgData.data;
+
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const nx = x / size;
+          const ny = y / size;
+
+          let n = Math.sin(nx * 8.0 + Math.cos(ny * 7.0)) * 0.5 + 0.5;
+          n += (Math.sin(nx * 19.0 + ny * 17.0) * 0.5 + 0.5) * 0.35;
+          n += (Math.sin(nx * 43.0 - ny * 37.0) * 0.5 + 0.5) * 0.15;
+          n = Math.pow(n, 1.6);
+
+          const idx = (y * size + x) * 4;
+          const shade = Math.floor(140 + n * 110);
+          data[idx] = shade;
+          data[idx + 1] = shade;
+          data[idx + 2] = Math.min(255, shade + 5);
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      const craters = [
+        { x: 320, y: 380, r: 65, rays: true },
+        { x: 710, y: 640, r: 90, rays: true },
+        { x: 490, y: 780, r: 50, rays: false },
+        { x: 620, y: 260, r: 40, rays: false },
+        { x: 230, y: 690, r: 45, rays: false },
+        { x: 780, y: 340, r: 55, rays: false },
+        { x: 500, y: 460, r: 35, rays: false }
+      ];
+
+      craters.forEach(cr => {
+        if (cr.rays) {
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+          ctx.lineWidth = 1.5;
+          for (let a = 0; a < Math.PI * 2; a += Math.PI / 16) {
+            ctx.beginPath();
+            ctx.moveTo(cr.x, cr.y);
+            const rayLen = cr.r * (3.0 + Math.sin(a * 7) * 1.5);
+            ctx.lineTo(cr.x + Math.cos(a) * rayLen, cr.y + Math.sin(a) * rayLen);
+            ctx.stroke();
+          }
+        }
+
+        const grad = ctx.createRadialGradient(cr.x, cr.y, 2, cr.x, cr.y, cr.r);
+        grad.addColorStop(0, 'rgba(80, 85, 95, 0.7)');
+        grad.addColorStop(0.7, 'rgba(110, 115, 125, 0.6)');
+        grad.addColorStop(0.9, 'rgba(240, 245, 255, 0.85)');
+        grad.addColorStop(1, 'rgba(160, 165, 175, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(cr.x, cr.y, cr.r, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    }
+
+    // --- MOON MESH ---
+    const moonTex = createMoonTexture();
+    const moonGeo = new THREE.SphereGeometry(params.moonRadius, 64, 64);
+    const moonMat = new THREE.MeshStandardMaterial({
+      map: moonTex,
+      color: new THREE.Color(params.moonColor),
+      roughness: 0.85,
+      metalness: 0.05,
+      emissive: new THREE.Color(params.moonColor),
+      emissiveIntensity: 0.65
+    });
+    const moonMesh = new THREE.Mesh(moonGeo, moonMat);
+    moonMesh.position.set(0, 10, 0);
+    scene.add(moonMesh);
+
+    // --- MOON CORONA / ATMOSPHERIC GLOW ---
+    const glowVertexShader = `
+      varying vec3 vNormal;
+      varying vec3 vPositionNormal;
+      void main() {
+        vNormal = normalize(normalMatrix * normal);
+        vPositionNormal = normalize((modelViewMatrix * vec4(position, 1.0)).xyz);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    const glowFragmentShader = `
+      uniform vec3 uGlowColor;
+      uniform float uIntensity;
+      varying vec3 vNormal;
+      varying vec3 vPositionNormal;
+      void main() {
+        float fresnel = pow(1.0 - abs(dot(vNormal, vec3(0.0, 0.0, 1.0))), 2.4);
+        gl_FragColor = vec4(uGlowColor, fresnel * uIntensity);
+      }
+    `;
+
+    const glowGeo = new THREE.SphereGeometry(params.moonRadius * params.moonGlowSize, 48, 48);
+    const glowMat = new THREE.ShaderMaterial({
+      vertexShader: glowVertexShader,
+      fragmentShader: glowFragmentShader,
+      uniforms: {
+        uGlowColor: { value: new THREE.Color(params.moonGlow) },
+        uIntensity: { value: 0.85 }
+      },
+      blending: THREE.AdditiveBlending,
+      side: THREE.BackSide,
+      transparent: true,
+      depthWrite: false
+    });
+    const moonGlowMesh = new THREE.Mesh(glowGeo, glowMat);
+    moonGlowMesh.position.copy(moonMesh.position);
+    scene.add(moonGlowMesh);
+
+    // Radial Billboard Aura
+    function createGlowSpriteTexture() {
+      const c = document.createElement('canvas');
+      c.width = 512;
+      c.height = 512;
+      const ctx = c.getContext('2d');
+      const grad = ctx.createRadialGradient(256, 256, 10, 256, 256, 256);
+      grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      grad.addColorStop(0.2, 'rgba(255, 255, 255, 0.7)');
+      grad.addColorStop(0.5, 'rgba(255, 255, 255, 0.25)');
+      grad.addColorStop(0.8, 'rgba(255, 255, 255, 0.05)');
+      grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 512, 512);
+      return new THREE.CanvasTexture(c);
+    }
+
+    const auraMat = new THREE.SpriteMaterial({
+      map: createGlowSpriteTexture(),
+      color: new THREE.Color(params.moonGlow),
+      blending: THREE.AdditiveBlending,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false
+    });
+    const auraSprite = new THREE.Sprite(auraMat);
+    auraSprite.position.copy(moonMesh.position);
+    auraSprite.scale.set(params.moonRadius * 4.2, params.moonRadius * 4.2, 1);
+    scene.add(auraSprite);
+
+    // --- BACKGROUND STARS ---
+    const starCount = 1600;
+    const starGeo = new THREE.BufferGeometry();
+    const starPos = new Float32Array(starCount * 3);
+    for (let i = 0; i < starCount; i++) {
+      const r = 350 + Math.random() * 250;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(Math.random() * 2 - 1);
+      starPos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      starPos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+      starPos[i * 3 + 2] = r * Math.cos(phi);
+    }
+    starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+    const starMat = new THREE.PointsMaterial({
+      color: 0xffffff,
+      size: 1.2,
+      transparent: true,
+      opacity: 0.65
+    });
+    const stars = new THREE.Points(starGeo, starMat);
+    scene.add(stars);
+
+    // --- SILHOUETTED WISPY DRIFTING CLOUDS ---
+    function createCloudTexture() {
+      const c = document.createElement('canvas');
+      c.width = 512;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#00000000';
+      ctx.clearRect(0, 0, 512, 256);
+
+      for (let i = 0; i < 28; i++) {
+        const x = 90 + Math.random() * 332;
+        const y = 80 + Math.random() * 96;
+        const r = 40 + Math.random() * 65;
+        const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+        grad.addColorStop(0, 'rgba(255, 255, 255, 0.22)');
+        grad.addColorStop(0.6, 'rgba(255, 255, 255, 0.08)');
+        grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      return new THREE.CanvasTexture(c);
+    }
+
+    const cloudTex = createCloudTexture();
+    const cloudGroup = new THREE.Group();
+    const cloudsList = [];
+    for (let i = 0; i < 6; i++) {
+      const planeMat = new THREE.MeshBasicMaterial({
+        map: cloudTex,
+        color: new THREE.Color(params.cloudColor),
+        transparent: true,
+        opacity: 0.45,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        side: THREE.DoubleSide
+      });
+      const plane = new THREE.Mesh(new THREE.PlaneGeometry(160, 80), planeMat);
+      plane.position.set(
+        (Math.random() - 0.5) * 120,
+        -10 + Math.random() * 45,
+        (Math.random() - 0.5) * 40 - 15
+      );
+      plane.scale.setScalar(0.7 + Math.random() * 0.6);
+      cloudGroup.add(plane);
+      cloudsList.push({ mesh: plane, speed: 0.02 + Math.random() * 0.03 });
+    }
+    scene.add(cloudGroup);
+
+    // --- TWO-BONE PROCEDURAL BAT GEOMETRY ---
+    function buildTwoBoneBatGeometry() {
+      const geo = new THREE.BufferGeometry();
+
+      const positions = [];
+      const boneIds = [];   // 0: body/ears, 1: inner wing, 2: outer wing
+      const wingSides = []; // -1: left, 0: center, +1: right
+
+      function addVertex(x, y, z, bone, side) {
+        positions.push(x, y, z);
+        boneIds.push(bone);
+        wingSides.push(side);
+        return (positions.length / 3) - 1;
+      }
+
+      const indices = [];
+      function addTri(a, b, c) {
+        indices.push(a, b, c);
+      }
+
+      // 1. Center Body (Bone 0)
+      const snout = addVertex(0, 0.1, 0.8, 0, 0);
+      const crown = addVertex(0, 0.25, 0.35, 0, 0);
+      const throat = addVertex(0, -0.15, 0.35, 0, 0);
+      const leftEar = addVertex(-0.16, 0.65, 0.28, 0, 0);
+      const rightEar = addVertex(0.16, 0.65, 0.28, 0, 0);
+
+      const upperBack = addVertex(0, 0.18, -0.15, 0, 0);
+      const chest = addVertex(0, -0.22, -0.15, 0, 0);
+      const spine = addVertex(0, 0.08, -0.75, 0, 0);
+      const tail = addVertex(0, -0.06, -1.05, 0, 0);
+
+      // Body triangles
+      addTri(snout, crown, throat);
+      addTri(crown, leftEar, snout);
+      addTri(crown, rightEar, snout);
+      addTri(crown, upperBack, chest);
+      addTri(chest, throat, crown);
+      addTri(upperBack, spine, chest);
+      addTri(chest, spine, tail);
+
+      // 2. Wings (Left side = -1, Right side = +1)
+      [-1, 1].forEach(side => {
+        const s = side;
+
+        // Inner Wing (Bone 1): Shoulder to Elbow
+        const shoulder = addVertex(s * 0.35, 0.12, 0.0, 1, s);
+        const elbow = addVertex(s * 1.45, 0.15, -0.18, 1, s);
+        const bodyAnchor = addVertex(s * 0.25, -0.12, -0.65, 1, s);
+        const innerScallop = addVertex(s * 1.15, -0.1, -0.75, 1, s);
+
+        addTri(shoulder, elbow, innerScallop);
+        addTri(shoulder, innerScallop, bodyAnchor);
+        addTri(upperBack, shoulder, bodyAnchor);
+
+        // Outer Wing (Bone 2): Elbow to Wingtip & Fingers
+        const wrist = addVertex(s * 2.05, 0.22, -0.22, 2, s);
+        const thumb = addVertex(s * 2.15, 0.42, -0.12, 2, s);
+        const mainTip = addVertex(s * 3.35, 0.12, -0.45, 2, s);
+        const digit4 = addVertex(s * 2.75, -0.06, -0.92, 2, s);
+        const digit5 = addVertex(s * 1.95, -0.12, -1.15, 2, s);
+
+        const scallop1 = addVertex(s * 3.0, 0.02, -0.65, 2, s);
+        const scallop2 = addVertex(s * 2.32, -0.08, -1.02, 2, s);
+
+        addTri(elbow, wrist, digit5);
+        addTri(wrist, thumb, mainTip);
+        addTri(wrist, mainTip, scallop1);
+        addTri(wrist, scallop1, digit4);
+        addTri(wrist, digit4, scallop2);
+        addTri(wrist, scallop2, digit5);
+
+        addTri(elbow, digit5, innerScallop);
+      });
+
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('boneId', new THREE.Float32BufferAttribute(boneIds, 1));
+      geo.setAttribute('wingSide', new THREE.Float32BufferAttribute(wingSides, 1));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+
+      return geo;
+    }
+
+    const batGeo = buildTwoBoneBatGeometry();
+
+    // --- INSTANCED BAT MESH & WING FLAP VERTEX SHADER ---
+    const batUniforms = {
+      uTime: { value: 0 },
+      uFlapAmp: { value: params.wingFlapAmp }
+    };
+
+    const batMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(params.batColor),
+      roughness: 0.9,
+      metalness: 0.1,
+      side: THREE.DoubleSide
+    });
+
+    batMat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = batUniforms.uTime;
+      shader.uniforms.uFlapAmp = batUniforms.uFlapAmp;
+
+      shader.vertexShader = `
+        attribute float aFlapPhase;
+        attribute float aFlapSpeed;
+        attribute float aBatScale;
+        attribute float aSpeedRatio;
+        attribute float boneId;
+        attribute float wingSide;
+
+        uniform float uTime;
+        uniform float uFlapAmp;
+      ` + shader.vertexShader;
+
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `
+        #include <begin_vertex>
+
+        float bScale = aBatScale > 0.0 ? aBatScale : 1.0;
+        transformed = position * bScale;
+
+        if (boneId > 0.5) {
+          float flapRate = aFlapSpeed * (0.8 + 0.6 * aSpeedRatio);
+          float t = uTime * flapRate + aFlapPhase;
+
+          float theta1 = sin(t) * uFlapAmp;
+          float theta2 = sin(t - 0.65) * (uFlapAmp * 1.45);
+
+          if (boneId < 1.5) {
+            vec3 pivot1 = vec3(wingSide * 0.35 * bScale, 0.12 * bScale, 0.0);
+            vec3 pRel = transformed - pivot1;
+            float ang = -wingSide * theta1;
+            float ca = cos(ang), sa = sin(ang);
+            vec3 pRot = vec3(pRel.x * ca - pRel.y * sa, pRel.x * sa + pRel.y * ca, pRel.z - abs(sa) * 0.12 * pRel.x);
+            transformed = pivot1 + pRot;
+          } else {
+            vec3 shoulder = vec3(wingSide * 0.35 * bScale, 0.12 * bScale, 0.0);
+            vec3 elbowBase = vec3(wingSide * 1.45 * bScale, 0.15 * bScale, -0.18 * bScale);
+
+            float ang1 = -wingSide * theta1;
+            float ca1 = cos(ang1), sa1 = sin(ang1);
+            vec3 elbowRel = elbowBase - shoulder;
+            vec3 elbowRot = vec3(elbowRel.x * ca1 - elbowRel.y * sa1, elbowRel.x * sa1 + elbowRel.y * ca1, elbowRel.z);
+            vec3 elbowWorld = shoulder + elbowRot;
+
+            float ang2 = -wingSide * (theta1 + theta2);
+            float ca2 = cos(ang2), sa2 = sin(ang2);
+            vec3 pRel = transformed - elbowBase;
+            vec3 pRot = vec3(pRel.x * ca2 - pRel.y * sa2, pRel.x * sa2 + pRel.y * ca2, pRel.z - abs(sa2) * 0.18 * pRel.x);
+            transformed = elbowWorld + pRot;
+          }
+        }
+        `
+      );
+    };
+
+    const MAX_BATS = 1500;
+    const batInstancedMesh = new THREE.InstancedMesh(batGeo, batMat, MAX_BATS);
+    batInstancedMesh.count = params.batCount;
+    scene.add(batInstancedMesh);
+
+    const aFlapPhase = new Float32Array(MAX_BATS);
+    const aFlapSpeed = new Float32Array(MAX_BATS);
+    const aBatScale = new Float32Array(MAX_BATS);
+    const aSpeedRatio = new Float32Array(MAX_BATS);
+
+    const boidPos = new Float32Array(MAX_BATS * 3);
+    const boidVel = new Float32Array(MAX_BATS * 3);
+    const boidAcc = new Float32Array(MAX_BATS * 3);
+
+    function initBoids() {
+      for (let i = 0; i < MAX_BATS; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const radius = params.vortexRadius * (0.6 + Math.random() * 0.8);
+        const y = (Math.random() - 0.5) * params.vortexHeight;
+
+        boidPos[i * 3] = Math.cos(angle) * radius;
+        boidPos[i * 3 + 1] = y + 10;
+        boidPos[i * 3 + 2] = Math.sin(angle) * radius;
+
+        const speed = 14 + Math.random() * 8;
+        boidVel[i * 3] = -Math.sin(angle) * speed;
+        boidVel[i * 3 + 1] = (Math.random() - 0.5) * 3;
+        boidVel[i * 3 + 2] = Math.cos(angle) * speed;
+
+        aFlapPhase[i] = Math.random() * Math.PI * 2;
+        aFlapSpeed[i] = 12.0 + Math.random() * 6.0;
+        aBatScale[i] = params.batScale * (0.8 + Math.random() * 0.4);
+        aSpeedRatio[i] = 1.0;
+      }
+
+      batGeo.setAttribute('aFlapPhase', new THREE.InstancedBufferAttribute(aFlapPhase, 1));
+      batGeo.setAttribute('aFlapSpeed', new THREE.InstancedBufferAttribute(aFlapSpeed, 1));
+      batGeo.setAttribute('aBatScale', new THREE.InstancedBufferAttribute(aBatScale, 1));
+      batGeo.setAttribute('aSpeedRatio', new THREE.InstancedBufferAttribute(aSpeedRatio, 1));
+    }
+    initBoids();
+
+    // --- CRAIG REYNOLDS' BOID FLOCKING SIMULATION ---
+    const forwardVec = new THREE.Vector3();
+    const upVec = new THREE.Vector3(0, 1, 0);
+    const rightVec = new THREE.Vector3();
+    const matrix = new THREE.Matrix4();
+
+    const cellSize = 16.0;
+    const spatialGrid = new Map();
+
+    function getCellKey(x, y, z) {
+      const cx = Math.floor(x / cellSize);
+      const cy = Math.floor(y / cellSize);
+      const cz = Math.floor(z / cellSize);
+      return `${cx},${cy},${cz}`;
+    }
+
+    function updateBoids(dt) {
+      const count = params.batCount;
+      batInstancedMesh.count = count;
+
+      spatialGrid.clear();
+      for (let i = 0; i < count; i++) {
+        const key = getCellKey(boidPos[i * 3], boidPos[i * 3 + 1], boidPos[i * 3 + 2]);
+        let cell = spatialGrid.get(key);
+        if (!cell) {
+          cell = [];
+          spatialGrid.set(key, cell);
+        }
+        cell.push(i);
+      }
+
+      const vRadius = params.vortexRadius;
+      const vHeight = params.vortexHeight;
+      const swirl = params.swirlSpeed;
+      const maxSpeed = 26.0 * swirl;
+      const minSpeed = 9.0 * swirl;
+
+      const sepDist = 5.0;
+      const aliDist = 14.0;
+      const cohDist = 18.0;
+
+      for (let i = 0; i < count; i++) {
+        const px = boidPos[i * 3];
+        const py = boidPos[i * 3 + 1];
+        const pz = boidPos[i * 3 + 2];
+
+        const vx = boidVel[i * 3];
+        const vy = boidVel[i * 3 + 1];
+        const vz = boidVel[i * 3 + 2];
+
+        let ax = 0, ay = 0, az = 0;
+
+        const dx = px;
+        const dy = py - 10.0;
+        const dz = pz;
+        const rCurrent = Math.sqrt(dx * dx + dz * dz) + 0.001;
+
+        const tx = -dz / rCurrent;
+        const tz = dx / rCurrent;
+
+        const desiredSpeed = 16.0 * swirl;
+        const desiredVx = tx * desiredSpeed;
+        const desiredVz = tz * desiredSpeed;
+
+        ax += (desiredVx - vx) * 1.4;
+        az += (desiredVz - vz) * 1.4;
+
+        const rDelta = rCurrent - vRadius;
+        const rForce = -rDelta * 0.9;
+        ax += (dx / rCurrent) * rForce;
+        az += (dz / rCurrent) * rForce;
+
+        const targetY = 10.0 + Math.sin(Math.atan2(dz, dx) * 2.0) * (vHeight * 0.35);
+        ay += (targetY - py) * 0.8;
+
+        ay += 0.8 * swirl;
+        if (py > 10.0 + vHeight * 0.6) {
+          ay -= 3.5;
+        } else if (py < 10.0 - vHeight * 0.6) {
+          ay += 3.5;
+        }
+
+        let sepX = 0, sepY = 0, sepZ = 0;
+        let aliX = 0, aliY = 0, aliZ = 0;
+        let cohX = 0, cohY = 0, cohZ = 0;
+        let neighborCount = 0;
+
+        const cx = Math.floor(px / cellSize);
+        const cy = Math.floor(py / cellSize);
+        const cz = Math.floor(pz / cellSize);
+
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            for (let oz = -1; oz <= 1; oz++) {
+              const neighborList = spatialGrid.get(`${cx + ox},${cy + oy},${cz + oz}`);
+              if (!neighborList) continue;
+
+              for (let n = 0; n < neighborList.length; n++) {
+                const j = neighborList[n];
+                if (j === i) continue;
+
+                const diffX = px - boidPos[j * 3];
+                const diffY = py - boidPos[j * 3 + 1];
+                const diffZ = pz - boidPos[j * 3 + 2];
+                const dist = Math.sqrt(diffX * diffX + diffY * diffY + diffZ * diffZ) + 0.001;
+
+                if (dist < sepDist) {
+                  const rep = (sepDist - dist) / dist;
+                  sepX += diffX * rep;
+                  sepY += diffY * rep;
+                  sepZ += diffZ * rep;
+                }
+
+                if (dist < cohDist) {
+                  aliX += boidVel[j * 3];
+                  aliY += boidVel[j * 3 + 1];
+                  aliZ += boidVel[j * 3 + 2];
+
+                  cohX += boidPos[j * 3];
+                  cohY += boidPos[j * 3 + 1];
+                  cohZ += boidPos[j * 3 + 2];
+                  neighborCount++;
+                }
+              }
+            }
+          }
+        }
+
+        ax += sepX * 3.8;
+        ay += sepY * 3.8;
+        az += sepZ * 3.8;
+
+        if (neighborCount > 0) {
+          aliX /= neighborCount;
+          aliY /= neighborCount;
+          aliZ /= neighborCount;
+          ax += (aliX - vx) * 0.65;
+          ay += (aliY - vy) * 0.65;
+          az += (aliZ - vz) * 0.65;
+
+          cohX /= neighborCount;
+          cohY /= neighborCount;
+          cohZ /= neighborCount;
+          ax += (cohX - px) * 0.25;
+          ay += (cohY - py) * 0.25;
+          az += (cohZ - pz) * 0.25;
+        }
+
+        const turbTime = (batUniforms.uTime.value * 0.8 + i * 0.23);
+        ax += Math.sin(turbTime) * 1.5;
+        ay += Math.cos(turbTime * 1.3) * 1.2;
+        az += Math.sin(turbTime * 0.7) * 1.5;
+
+        boidAcc[i * 3] = ax;
+        boidAcc[i * 3 + 1] = ay;
+        boidAcc[i * 3 + 2] = az;
+      }
+
+      const speedRatioAttr = batGeo.attributes.aSpeedRatio;
+
+      for (let i = 0; i < count; i++) {
+        let vx = boidVel[i * 3] + boidAcc[i * 3] * dt;
+        let vy = boidVel[i * 3 + 1] + boidAcc[i * 3 + 1] * dt;
+        let vz = boidVel[i * 3 + 2] + boidAcc[i * 3 + 2] * dt;
+
+        let curSpeed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (curSpeed > maxSpeed) {
+          const s = maxSpeed / curSpeed;
+          vx *= s; vy *= s; vz *= s;
+          curSpeed = maxSpeed;
+        } else if (curSpeed < minSpeed) {
+          const s = minSpeed / curSpeed;
+          vx *= s; vy *= s; vz *= s;
+          curSpeed = minSpeed;
+        }
+
+        boidVel[i * 3] = vx;
+        boidVel[i * 3 + 1] = vy;
+        boidVel[i * 3 + 2] = vz;
+
+        boidPos[i * 3] += vx * dt;
+        boidPos[i * 3 + 1] += vy * dt;
+        boidPos[i * 3 + 2] += vz * dt;
+
+        forwardVec.set(vx, vy, vz).normalize();
+
+        const turnX = boidAcc[i * 3];
+        const turnZ = boidAcc[i * 3 + 2];
+        const bankCross = forwardVec.x * turnZ - forwardVec.z * turnX;
+        const rollAngle = THREE.MathUtils.clamp(bankCross * 0.04, -0.9, 0.9);
+
+        upVec.set(0, 1, 0);
+        rightVec.crossVectors(forwardVec, upVec).normalize();
+        upVec.crossVectors(rightVec, forwardVec).normalize();
+        upVec.applyAxisAngle(forwardVec, rollAngle);
+        rightVec.crossVectors(forwardVec, upVec).normalize();
+
+        matrix.makeBasis(rightVec, upVec, forwardVec);
+        matrix.setPosition(boidPos[i * 3], boidPos[i * 3 + 1], boidPos[i * 3 + 2]);
+        batInstancedMesh.setMatrixAt(i, matrix);
+
+        speedRatioAttr.setX(i, (curSpeed - minSpeed) / (maxSpeed - minSpeed));
+      }
+
+      batInstancedMesh.instanceMatrix.needsUpdate = true;
+      speedRatioAttr.needsUpdate = true;
+    }
+
+    // --- APPLY COLOR SCHEME ---
+    function applyColorScheme(schemeKey) {
+      const scheme = COLOR_SCHEMES[schemeKey];
+      if (!scheme) return;
+
+      params.colorScheme = schemeKey;
+      params.moonColor = scheme.moon;
+      params.moonGlow = scheme.glow;
+      params.batColor = scheme.bat;
+      params.bgColor = scheme.bg;
+      params.cloudColor = scheme.cloud;
+
+      if (!params.greenscreen) {
+        scene.background = new THREE.Color(scheme.bg);
+        renderer.setClearColor(scheme.bg, 1);
+        if (scene.fog) scene.fog.color.set(scheme.bg);
+        stars.visible = true;
+        cloudGroup.visible = true;
+      }
+
+      moonMat.color.set(scheme.moon);
+      moonMat.emissive.set(scheme.moon);
+      moonLight.color.set(scheme.moon);
+
+      glowMat.uniforms.uGlowColor.value.set(scheme.glow);
+      auraMat.color.set(scheme.glow);
+
+      batMat.color.set(scheme.bat);
+
+      cloudGroup.children.forEach(c => {
+        c.material.color.set(scheme.cloud);
+      });
+    }
+
+    // --- GREENSCREEN TOGGLE ---
+    let savedPostSettings = null;
+
+    function updateGreenscreen() {
+      if (params.greenscreen) {
+        scene.background = new THREE.Color(0x00ff00);
+        renderer.setClearColor(0x00ff00, 1);
+        if (scene.fog) scene.fog.color.set(0x00ff00);
+        stars.visible = false;
+        cloudGroup.visible = false;
+
+        savedPostSettings = {
+          vignetteReduction: postProcessor.settings.vignetteReduction,
+          noiseIntensity: postProcessor.settings.noiseIntensity,
+          chromaticAberration: postProcessor.settings.chromaticAberration
+        };
+        postProcessor.settings.vignetteReduction = 0.0;
+        postProcessor.settings.noiseIntensity = 0.0;
+        postProcessor.settings.chromaticAberration = 0.0;
+        postProcessor.updateSettings();
+      } else {
+        if (savedPostSettings) {
+          postProcessor.settings.vignetteReduction = savedPostSettings.vignetteReduction;
+          postProcessor.settings.noiseIntensity = savedPostSettings.noiseIntensity;
+          postProcessor.settings.chromaticAberration = savedPostSettings.chromaticAberration;
+          postProcessor.updateSettings();
+        }
+        applyColorScheme(params.colorScheme);
+      }
+    }
+
+    // --- PROCEDURAL RE-ROLL FUNCTION ---
+    function randomizeScene() {
+      const schemeKeys = Object.keys(COLOR_SCHEMES);
+      const chosenScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+
+      params.colorScheme = chosenScheme;
+      params.cameraMode = ANIMATION_MODES[Math.floor(Math.random() * ANIMATION_MODES.length)];
+      params.animSpeed = parseFloat((0.65 + Math.random() * 0.95).toFixed(2));
+      params.vortexRadius = Math.round(34 + Math.random() * 42);
+      params.vortexHeight = Math.round(45 + Math.random() * 45);
+      params.swirlSpeed = parseFloat((0.85 + Math.random() * 0.95).toFixed(2));
+      params.wingFlapAmp = parseFloat((0.52 + Math.random() * 0.42).toFixed(2));
+      batUniforms.uFlapAmp.value = params.wingFlapAmp;
+
+      params.moonRadius = Math.round(18 + Math.random() * 12);
+      moonMesh.geometry.dispose();
+      moonMesh.geometry = new THREE.SphereGeometry(params.moonRadius, 64, 64);
+
+      params.moonGlowSize = parseFloat((1.35 + Math.random() * 0.7).toFixed(2));
+      moonGlowMesh.geometry.dispose();
+      moonGlowMesh.geometry = new THREE.SphereGeometry(params.moonRadius * params.moonGlowSize, 48, 48);
+      auraSprite.scale.set(params.moonRadius * 4.4, params.moonRadius * 4.4, 1);
+
+      // Randomize PostProcessor optics
+      postProcessor.settings.bloomStrength = parseFloat((0.6 + Math.random() * 0.8).toFixed(2));
+      postProcessor.settings.bloomRadius = parseFloat((0.35 + Math.random() * 0.5).toFixed(2));
+      postProcessor.settings.chromaticAberration = parseFloat((0.005 + Math.random() * 0.035).toFixed(3));
+      postProcessor.settings.noiseIntensity = parseFloat((0.008 + Math.random() * 0.025).toFixed(3));
+      postProcessor.settings.vignetteReduction = parseFloat((0.35 + Math.random() * 0.45).toFixed(2));
+      postProcessor.updateSettings();
+
+      applyColorScheme(chosenScheme);
+      if (params.greenscreen) updateGreenscreen();
+
+      if (gui) {
+        gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    // --- CLICK TO RANDOMIZE LISTENER ---
+    let pointerDownPos = { x: 0, y: 0 };
+    window.addEventListener('pointerdown', (e) => {
+      pointerDownPos.x = e.clientX;
+      pointerDownPos.y = e.clientY;
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      const dist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+      if (dist < 6 && params.clickToRandomize && e.button === 0) {
+        if (gui && gui.domElement && gui.domElement.contains(e.target)) return;
+        randomizeScene();
+      }
+    });
+
+    // --- KEYBOARD LISTENER (H to toggle UI) ---
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        if (gui) {
+          gui._hidden ? gui.show() : gui.hide();
+        }
+      }
+    });
+
+    // --- LIL-GUI SETUP ---
+    const gui = new GUI({ title: 'Bat Swarm & Moon' });
+
+    // Palette & Colors Folder
+    const fTheme = gui.addFolder('Color Schemes & Atmosphere');
+    fTheme.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Color Scheme').onChange(applyColorScheme);
+    fTheme.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(updateGreenscreen);
+    fTheme.addColor(params, 'moonColor').name('Moon Color').onChange(v => {
+      moonMat.color.set(v);
+      moonMat.emissive.set(v);
+      moonLight.color.set(v);
+    });
+    fTheme.addColor(params, 'moonGlow').name('Glow Color').onChange(v => {
+      glowMat.uniforms.uGlowColor.value.set(v);
+      auraMat.color.set(v);
+    });
+    fTheme.addColor(params, 'batColor').name('Bat Color').onChange(v => {
+      batMat.color.set(v);
+    });
+    fTheme.addColor(params, 'bgColor').name('Background Color').onChange(v => {
+      if (!params.greenscreen) {
+        scene.background = new THREE.Color(v);
+        renderer.setClearColor(v, 1);
+        if (scene.fog) scene.fog.color.set(v);
+      }
+    });
+    fTheme.addColor(params, 'cloudColor').name('Cloud Color').onChange(v => {
+      cloudGroup.children.forEach(c => c.material.color.set(v));
+    });
+
+    // Camera & Playback Folder
+    const fCam = gui.addFolder('Camera & Playback');
+    fCam.add(params, 'cameraMode', ANIMATION_MODES).name('Camera Motion');
+    fCam.add(params, 'animSpeed', 0.1, 3.0, 0.05).name('Animation Speed');
+    fCam.add(params, 'pixelRatio', 0.5, 3.0, 0.25).name('Pixel Ratio (DPR)').onChange(v => {
+      renderer.setPixelRatio(v);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+    });
+
+    // Swarm Dynamics Folder
+    const fSwarm = gui.addFolder('Bat Swarm Dynamics');
+    fSwarm.add(params, 'batCount', 200, MAX_BATS, 10).name('Bat Count');
+    fSwarm.add(params, 'vortexRadius', 25, 90, 1).name('Vortex Radius');
+    fSwarm.add(params, 'vortexHeight', 25, 120, 1).name('Vortex Height');
+    fSwarm.add(params, 'swirlSpeed', 0.2, 3.0, 0.05).name('Swirl Speed');
+    fSwarm.add(params, 'wingFlapAmp', 0.2, 1.2, 0.02).name('Wing Flap Amplitude').onChange(v => {
+      batUniforms.uFlapAmp.value = v;
+    });
+
+    // Moon Controls Folder
+    const fMoon = gui.addFolder('Lunar Parameters');
+    fMoon.add(params, 'moonRadius', 12, 36, 1).name('Moon Radius').onChange(v => {
+      moonMesh.geometry.dispose();
+      moonMesh.geometry = new THREE.SphereGeometry(v, 64, 64);
+      moonGlowMesh.geometry.dispose();
+      moonGlowMesh.geometry = new THREE.SphereGeometry(v * params.moonGlowSize, 48, 48);
+      auraSprite.scale.set(v * 4.2, v * 4.2, 1);
+    });
+    fMoon.add(params, 'moonGlowSize', 1.1, 2.8, 0.05).name('Glow Spread').onChange(v => {
+      moonGlowMesh.geometry.dispose();
+      moonGlowMesh.geometry = new THREE.SphereGeometry(params.moonRadius * v, 48, 48);
+    });
+
+    // Procedural Re-roll Folder
+    const fRandom = gui.addFolder('Procedural Variations');
+    fRandom.add(params, 'clickToRandomize').name('Click Scene to Re-roll');
+    fRandom.add({ randomize: randomizeScene }, 'randomize').name('Re-roll Scene Now');
+
+    // Attach PostProcessor Suite to lil-gui
+    postProcessor.attachGUI(gui, 'Post-Processing Suite');
+
+    applyColorScheme(params.colorScheme);
+
+    // --- ANIMATION LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const rawDt = clock.getDelta();
+      const dt = Math.min(rawDt, 0.08) * params.animSpeed;
+      const elapsedTime = clock.getElapsedTime() * params.animSpeed;
+
+      batUniforms.uTime.value = elapsedTime;
+
+      updateBoids(dt);
+
+      moonMesh.rotation.y = elapsedTime * 0.012;
+
+      cloudsList.forEach(item => {
+        item.mesh.position.x += item.speed * params.animSpeed;
+        if (item.mesh.position.x > 90) {
+          item.mesh.position.x = -90;
+        }
+      });
+
+      const t = elapsedTime * 0.08;
+      switch (params.cameraMode) {
+        case 'Slow Moon Orbit': {
+          const dist = 125;
+          camera.position.x = Math.sin(t * 0.7) * dist;
+          camera.position.z = Math.cos(t * 0.7) * dist;
+          camera.position.y = 14 + Math.sin(t * 0.35) * 10;
+          controls.target.set(0, 8, 0);
+          break;
+        }
+        case 'Ascending Spiral': {
+          const r = 95 + Math.sin(t * 0.5) * 22;
+          camera.position.x = Math.cos(t * 0.6) * r;
+          camera.position.z = Math.sin(t * 0.6) * r;
+          camera.position.y = 12 + Math.sin(t * 0.9) * 32;
+          controls.target.set(0, 10, 0);
+          break;
+        }
+        case 'Cinematic Swoop': {
+          camera.position.x = Math.sin(t * 0.8) * 80;
+          camera.position.y = -14 + Math.cos(t * 0.4) * 8;
+          camera.position.z = 105 + Math.sin(t * 0.4) * 25;
+          controls.target.set(0, 18, 0);
+          break;
+        }
+        case 'Drifting Eclipse': {
+          camera.position.x = Math.sin(t * 0.5) * 65;
+          camera.position.y = 8 + Math.sin(t * 1.0) * 12;
+          camera.position.z = 120;
+          controls.target.set(0, 6, 0);
+          break;
+        }
+        case 'Vortex Underlook': {
+          camera.position.x = Math.sin(t * 0.6) * 30;
+          camera.position.z = Math.cos(t * 0.6) * 30;
+          camera.position.y = -35 + Math.sin(t * 0.3) * 6;
+          controls.target.set(0, 32, 0);
+          break;
+        }
+        case 'Swarm Follower': {
+          const r = params.vortexRadius * 1.15;
+          camera.position.x = Math.sin(t * 0.9) * r;
+          camera.position.z = Math.cos(t * 0.9) * r;
+          camera.position.y = 12 + Math.sin(t * 1.4) * 16;
+          const targetX = Math.sin(t * 0.9 + 0.5) * params.vortexRadius * 0.8;
+          const targetZ = Math.cos(t * 0.9 + 0.5) * params.vortexRadius * 0.8;
+          controls.target.set(targetX, 10, targetZ);
+          break;
+        }
+        case 'Ethereal Breath': {
+          const dist = 110 + Math.sin(t * 0.8) * 45;
+          camera.position.x = Math.sin(t * 0.3) * 22;
+          camera.position.y = 10 + Math.cos(t * 0.4) * 14;
+          camera.position.z = dist;
+          controls.target.set(0, 8, 0);
+          break;
+        }
+        case 'Static (No Camera Movement)':
+        default:
+          break;
+      }
+
+      controls.update();
+      postProcessor.renderScene(scene, camera);
+    }
+    animate();
+
+    // --- RESIZE HANDLER ---
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.pixelRatio);
+    });
+  </script>
+</body>
+</html>
