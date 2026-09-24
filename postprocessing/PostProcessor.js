@@ -33,7 +33,7 @@ in vec3 position;
 out vec2 vUv;
 void main() {
   vUv = position.xy * 0.5 + 0.5;
-  gl_Position = vec4(position, 1.0);
+  gl_Position = vec4(position.xy, 0.0, 1.0);
 }
 `;
 
@@ -44,18 +44,27 @@ uniform float bloomThreshold;
 in vec2 vUv;
 out vec4 fragColor;
 
+vec3 sanitize(vec3 v) {
+  if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+  if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+  if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+  return clamp(v, vec3(0.0), vec3(65000.0));
+}
+
 void main() {
-  vec4 color = texture(inputTexture, vUv);
+  vec4 raw = texture(inputTexture, vUv);
+  vec3 color = sanitize(raw.rgb);
   // Calculate relative luminance (Rec. 709)
-  float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+  float luminance = max(0.0, dot(color, vec3(0.2126, 0.7152, 0.0722)));
   // Soft knee thresholding
   float knee = 0.1;
   float soft = luminance - bloomThreshold + knee;
   soft = clamp(soft, 0.0, 2.0 * knee);
   soft = (soft * soft) / (4.0 * knee + 0.00001);
   float contribution = max(soft, luminance - bloomThreshold);
-  contribution /= max(luminance, 0.00001);
-  fragColor = vec4(color.rgb * contribution, color.a);
+  contribution /= max(luminance, 0.0001);
+  vec3 result = color * contribution;
+  fragColor = vec4(sanitize(result), clamp(raw.a, 0.0, 1.0));
 }
 `;
 
@@ -84,8 +93,17 @@ uniform vec2 direction;
 in vec2 vUv;
 out vec4 color;
 ${blur13ShaderChunk}
+
+vec4 sanitize(vec4 v) {
+  if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+  if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+  if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+  if (isnan(v.w) || isinf(v.w)) v.w = 0.0;
+  return clamp(v, vec4(0.0), vec4(65000.0));
+}
+
 void main() {
-  color = blur13(inputTexture, vUv, direction);
+  color = sanitize(blur13(inputTexture, vUv, direction));
 }
 `;
 
@@ -221,6 +239,13 @@ uniform float time;
 in vec2 vUv;
 out vec4 fragColor;
 
+vec3 sanitize(vec3 v) {
+  if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+  if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+  if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+  return clamp(v, vec3(0.0), vec3(65000.0));
+}
+
 float vignette(vec2 uv, float boost, float reduction) {
   vec2 position = vUv - 0.5;
   return boost - length(position) * reduction;
@@ -234,38 +259,40 @@ float hash1(uint n) {
 
 float noise(in vec2 uv, in float timeVal) {
   uvec2 p = uvec2(uv);
-  return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+  return hash1(p.x + 1920U * p.y + (1920U * 1080U) * (uint(timeVal) % 65536U));
 }
 
 void main() {
-  vec4 color = texture(inputTexture, vUv);
+  vec4 raw = texture(inputTexture, vUv);
+  vec3 color = sanitize(raw.rgb);
 
   if (bloomEnabled && bloomStrength > 0.001) {
-    vec4 b0 = texture(blur0Texture, vUv);
-    vec4 b1 = texture(blur1Texture, vUv);
-    vec4 b2 = texture(blur2Texture, vUv);
-    vec4 b3 = texture(blur3Texture, vUv);
-    vec4 b4 = texture(blur4Texture, vUv);
+    vec3 b0 = sanitize(texture(blur0Texture, vUv).rgb);
+    vec3 b1 = sanitize(texture(blur1Texture, vUv).rgb);
+    vec3 b2 = sanitize(texture(blur2Texture, vUv).rgb);
+    vec3 b3 = sanitize(texture(blur3Texture, vUv).rgb);
+    vec3 b4 = sanitize(texture(blur4Texture, vUv).rgb);
 
-    vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+    vec3 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
     color += bloomSum * bloomStrength;
   }
 
   // Three.js Godrays composite (additive with color tint & intensity attenuation)
   if (raysEnabled && raysStrength > 0.001) {
-    vec4 r = texture(raysTexture, vUv);
-    color.rgb += r.rgb * raysColor * raysStrength;
+    vec3 r = sanitize(texture(raysTexture, vUv).rgb);
+    color += r * raysColor * raysStrength;
   }
 
   // Three.js Anamorphic bloom composite (high-pass streak filter)
   if (anamorphicEnabled) {
-    vec4 a = texture(anamorphicTexture, vUv);
-    color.rgb += a.rgb;
+    vec3 a = sanitize(texture(anamorphicTexture, vUv).rgb);
+    color += a;
   }
 
-  color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
-  color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
-  fragColor = vec4(color.rgb, 1.0);
+  float vig = max(0.0, vignette(vUv, vignetteBoost, vignetteReduction));
+  color *= vig;
+  color += max(0.0, noiseIntensity) * noise(gl_FragCoord.xy, time);
+  fragColor = vec4(sanitize(color), 1.0);
 }
 `;
 
@@ -334,16 +361,18 @@ vec2 applyFisheye(vec2 uv, float strength, float radius) {
 }
 
 vec3 ACESFilmicToneMapping(vec3 color) {
+  color = max(vec3(0.0), color);
   float a = 2.51;
   float b = 0.03;
   float c = 2.43;
   float d = 0.59;
   float e = 0.14;
-  return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+  vec3 denom = max(color * (c * color + d) + e, vec3(0.0001));
+  return clamp((color * (a * color + b)) / denom, 0.0, 1.0);
 }
 
 vec3 gammaCorrect(vec3 color, vec3 gamma) {
-  return pow(max(color, vec3(0.0)), 1.0 / gamma);
+  return pow(max(color, vec3(0.0)), 1.0 / max(gamma, vec3(0.001)));
 }
 vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
   return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
@@ -408,6 +437,10 @@ void main() {
   vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
   vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
   vec3 finalCol = col.rgb;
+  if (isnan(finalCol.x) || isinf(finalCol.x)) finalCol.x = 0.0;
+  if (isnan(finalCol.y) || isinf(finalCol.y)) finalCol.y = 0.0;
+  if (isnan(finalCol.z) || isinf(finalCol.z)) finalCol.z = 0.0;
+  finalCol = clamp(finalCol, vec3(0.0), vec3(65000.0));
   
   if (visionMode == 1) {
     // Night Vision Mode
@@ -455,7 +488,7 @@ function createFBO(w, h, options = {}) {
     format: options.format || THREE.RGBAFormat,
     type: options.type || THREE.HalfFloatType,
     stencilBuffer: options.stencilBuffer || false,
-    depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+    depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : false,
     samples: options.samples || 0,
   });
 }
@@ -463,6 +496,8 @@ function createFBO(w, h, options = {}) {
 class ShaderPass {
   constructor(shader, options = {}) {
     this.shader = shader;
+    this.shader.depthTest = false;
+    this.shader.depthWrite = false;
     this.orthoScene = new THREE.Scene();
     this.fbo = createFBO(1, 1, options);
     this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -481,13 +516,14 @@ class ShaderPass {
   }
   setSize(width, height) {
     this.fbo.setSize(Math.max(1, width), Math.max(1, height));
-    this.orthoQuad.scale.set(width, height, 1);
   }
 }
 
 class ShaderPingPongPass {
   constructor(shader, options = {}) {
     this.shader = shader;
+    this.shader.depthTest = false;
+    this.shader.depthWrite = false;
     this.orthoScene = new THREE.Scene();
     this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
     this.currentFBO = 0;
@@ -506,7 +542,6 @@ class ShaderPingPongPass {
   setSize(width, height) {
     const w = Math.max(1, width);
     const h = Math.max(1, height);
-    this.orthoQuad.scale.set(w, h, 1);
     this.fbos[0].setSize(w, h);
     this.fbos[1].setSize(w, h);
   }
@@ -663,7 +698,7 @@ export class PostProcessor {
 
     const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
     const targetSamples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
-    this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples });
+    this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples, depthBuffer: true });
 
     this.bloomPass = new BloomPass(
       this.settings.bloomStrength,
@@ -876,6 +911,7 @@ export class PostProcessor {
       this.sceneTarget = createFBO(oldTarget.width, oldTarget.height, {
         type: THREE.HalfFloatType,
         samples: samples,
+        depthBuffer: true,
       });
       oldTarget.dispose();
     }

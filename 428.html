@@ -1,0 +1,2896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Landfill Conveyor to the Clouds</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      outline: none;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POSTPROCESSOR SUITE (Inlined for Standalone & file:// Compatibility)
+    // =========================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.00001);
+      fragColor = vec4(color.rgb * contribution, color.a);
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+    void main() {
+      color = blur13(inputTexture, vUv, direction);
+    }
+    `;
+
+    const godRaysDepthMaskShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float factor = smoothstep(threshold, threshold + 0.15, lum);
+      fragColor = vec4(vec3(factor), 1.0);
+    }
+    `;
+
+    const godRaysGenerateShader = `
+    precision highp float;
+    #define TAPS_PER_PASS 6.0
+    uniform sampler2D inputTexture;
+    uniform vec3 vSunPositionScreenSpace;
+    uniform float fStepSize;
+    uniform float distanceAttenuation;
+    uniform float maxDensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      vec2 delta = vSunPositionScreenSpace.xy - vUv;
+      float dist = length(delta);
+      vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+      float iters = dist / max(fStepSize, 0.00001);
+      vec2 uv = vUv;
+      float col = 0.0;
+      float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+      float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+      if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+      fragColor = vec4(vec3(finalVal), 1.0);
+    }
+    `;
+
+    const anamorphicBrightShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    uniform float smoothWidth;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+      fragColor = mix(vec4(0.0), color, alpha);
+    }
+    `;
+
+    const anamorphicBlurShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    uniform float samples;
+    uniform float intensity;
+    uniform vec3 tintColor;
+    uniform float bloomRadius;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      int halfSamples = max(1, int(samples) / 2);
+      float fHalfSamples = float(halfSamples);
+      vec2 invSize = 1.0 / resolution;
+      vec4 total = vec4(0.0);
+      for (int i = -64; i <= 64; i++) {
+        if (i < -halfSamples || i > halfSamples) continue;
+        float softness = 1.0 - abs(float(i)) / fHalfSamples;
+        softness = pow(softness, 2.0);
+        vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+        shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+        total += texture(inputTexture, shiftedUV) * softness;
+      }
+      fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform sampler2D raysTexture;
+    uniform sampler2D anamorphicTexture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform bool raysEnabled;
+    uniform float raysStrength;
+    uniform vec3 raysColor;
+    uniform bool anamorphicEnabled;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * uint(timeVal));
+    }
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec4 b0 = texture(blur0Texture, vUv);
+        vec4 b1 = texture(blur1Texture, vUv);
+        vec4 b2 = texture(blur2Texture, vUv);
+        vec4 b3 = texture(blur3Texture, vUv);
+        vec4 b4 = texture(blur4Texture, vUv);
+        vec4 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+      if (raysEnabled && raysStrength > 0.001) {
+        vec4 r = texture(raysTexture, vUv);
+        color.rgb += r.rgb * raysColor * raysStrength;
+      }
+      if (anamorphicEnabled) {
+        vec4 a = texture(anamorphicTexture, vUv);
+        color.rgb += a.rgb;
+      }
+      color.rgb *= vignette(vUv, vignetteBoost, vignetteReduction);
+      color.rgb += noiseIntensity * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(color.rgb, 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    uniform int visionMode;
+    uniform float thermalSensitivity;
+    uniform float nightVisionNoise;
+    uniform float nightVisionGain;
+    uniform float crtIntensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+    }
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / gamma);
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      vec3 finalCol = col.rgb;
+      vec3 exposedColor = finalCol * exposure;
+      vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+      finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+        this.orthoQuad.scale.set(width, height, 1);
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.orthoQuad.scale.set(w, h, 1);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          antialias: params.antialias !== undefined ? params.antialias : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.8,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.25,
+          raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : true,
+          raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.75,
+          raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+          raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+          raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+          raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.15,
+          raysColor: new THREE.Color(params.raysColor || 0xfff4e0),
+          raysColorHex: params.raysColorHex || '#fff4e0',
+          // ANAMORPHIC DEFAULT IS OFF AS REQUESTED!
+          anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+          anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+          anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.35,
+          anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 64,
+          anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+          anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+          anamorphicColor: new THREE.Color(params.anamorphicColor || 0x7a8aff),
+          anamorphicColorHex: params.anamorphicColorHex || '#7a8aff',
+          fisheyeStrength: 0.0,
+          fisheyeRadius: 1.0,
+          chromaticAberration: 0.015,
+          vignetteBoost: 1.15,
+          vignetteReduction: 0.65,
+          noiseIntensity: 0.012,
+          gamma: 1.0,
+          minInputLevel: 0.0,
+          maxInputLevel: 1.0,
+          exposure: params.exposure !== undefined ? params.exposure : 1.15,
+        };
+
+        const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+        const targetSamples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples });
+
+        this.bloomPass = new BloomPass(this.settings.bloomStrength, this.settings.bloomRadius, this.settings.bloomThreshold, 5);
+        this.sunScreenPos = new THREE.Vector3(0.5, 0.7, 1.0);
+        this.sunInFront = true;
+
+        this.godRaysMaskShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.raysThreshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysDepthMaskShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysMaskPass = new ShaderPass(this.godRaysMaskShader, { format: THREE.RGBAFormat, type: THREE.HalfFloatType });
+
+        this.godRaysGenShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            vSunPositionScreenSpace: { value: this.sunScreenPos },
+            fStepSize: { value: 1.0 },
+            distanceAttenuation: { value: this.settings.raysDistanceAttenuation },
+            maxDensity: { value: this.settings.raysMaxDensity },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysGenerateShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysPingPong = new ShaderPingPongPass(this.godRaysGenShader, { format: THREE.RGBAFormat, type: THREE.HalfFloatType });
+
+        this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.anamorphicThreshold },
+            smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBrightShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, { format: THREE.RGBAFormat, type: THREE.HalfFloatType });
+
+        this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+            samples: { value: this.settings.anamorphicSamples },
+            intensity: { value: this.settings.anamorphicIntensity },
+            tintColor: { value: this.settings.anamorphicColor },
+            bloomRadius: { value: this.settings.anamorphicRadius },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBlurShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, { format: THREE.RGBAFormat, type: THREE.HalfFloatType });
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            raysEnabled: { value: this.settings.raysEnabled },
+            raysStrength: { value: this.settings.raysStrength },
+            raysColor: { value: this.settings.raysColor },
+            anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            raysTexture: { value: null },
+            anamorphicTexture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+            visionMode: { value: 0 },
+            thermalSensitivity: { value: 1.0 },
+            nightVisionGain: { value: 1.0 },
+            nightVisionNoise: { value: 0.0 },
+            crtIntensity: { value: 0.0 },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: { inputTexture: { value: null } },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+        this.godRaysGenShader.uniforms.distanceAttenuation.value = this.settings.raysDistanceAttenuation;
+        this.godRaysGenShader.uniforms.maxDensity.value = this.settings.raysMaxDensity;
+
+        this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+        this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+        this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+        this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+        this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+        this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.raysEnabled.value = this.settings.raysEnabled && this.sunInFront;
+        this.finalShader.uniforms.raysStrength.value = this.settings.raysStrength;
+        this.finalShader.uniforms.raysColor.value.copy(this.settings.raysColor);
+        this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        const w = Math.max(1, Math.floor(w0 * dpr));
+        const h = Math.max(1, Math.floor(h0 * dpr));
+        this.sceneTarget.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+        this.bloomPass.setSize(w, h);
+
+        const grW = Math.max(1, Math.round(w / 2));
+        const grH = Math.max(1, Math.round(h / 2));
+        this.godRaysMaskPass.setSize(grW, grH);
+        this.godRaysPingPong.setSize(grW, grH);
+
+        const anW = Math.max(1, Math.round(w / 4));
+        const anH = Math.max(1, Math.round(h / 4));
+        this.anamorphicBrightPass.setSize(anW, anH);
+        this.anamorphicBlurPass.setSize(anW, anH);
+        this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+        this.rgbPass.setSize(w, h);
+        this.copyPass.setSize(w, h);
+      }
+
+      setAntialias(enabled) {
+        this.settings.antialias = !!enabled;
+        const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+        const samples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
+        if (this.sceneTarget.samples !== samples) {
+          const oldTarget = this.sceneTarget;
+          this.sceneTarget = createFBO(oldTarget.width, oldTarget.height, {
+            type: THREE.HalfFloatType,
+            samples: samples,
+          });
+          oldTarget.dispose();
+        }
+      }
+
+      setSunScreenPosition(camera, sunWorldPos) {
+        if (!this._camDir) {
+          this._camDir = new THREE.Vector3();
+          this._toSun = new THREE.Vector3();
+          this._ndc = new THREE.Vector3();
+        }
+        camera.getWorldDirection(this._camDir);
+        this._toSun.copy(sunWorldPos).sub(camera.position).normalize();
+        const dot = this._camDir.dot(this._toSun);
+
+        if (dot <= 0.02) {
+          this.sunInFront = false;
+          this.finalShader.uniforms.raysEnabled.value = false;
+          return;
+        }
+
+        this.sunInFront = true;
+        const fade = THREE.MathUtils.clamp((dot - 0.02) / 0.15, 0.0, 1.0);
+        this._ndc.copy(sunWorldPos).project(camera);
+        const screenX = this._ndc.x * 0.5 + 0.5;
+        const screenY = this._ndc.y * 0.5 + 0.5;
+        const screenZ = fade;
+
+        this.sunScreenPos.set(screenX, screenY, screenZ);
+        this.godRaysGenShader.uniforms.vSunPositionScreenSpace.value.set(screenX, screenY, screenZ);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.render(scene, camera);
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        this.updateSettings();
+
+        // 1. Bloom Pass
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        // 2. Godrays Pass
+        if (this.settings.raysEnabled && this.settings.raysStrength > 0.001 && this.sunInFront) {
+          this.godRaysMaskShader.uniforms.inputTexture.value = sourceTexture;
+          this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+          this.godRaysMaskPass.render(this.renderer);
+
+          const filterLen = this.settings.raysDensity;
+          const tapsPerPass = 6.0;
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -1.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysMaskPass.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -2.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -3.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.finalPass.shader.uniforms.raysTexture.value = this.godRaysPingPong.texture;
+          this.finalPass.shader.uniforms.raysEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.raysEnabled.value = false;
+        }
+
+        // 3. Anamorphic Flare Pass (Default OFF)
+        if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+          this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+          this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+          this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+          this.anamorphicBrightPass.render(this.renderer);
+
+          this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+          this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+          this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+          this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+          this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+          this.anamorphicBlurPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+        }
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = "Post-Processing Suite") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Post-Process");
+        root.add(this.settings, "antialias").name("MSAA Antialias").onChange((v) => this.setAntialias(v));
+
+        const rays = root.addFolder("Three.js Godrays");
+        rays.add(this.settings, "raysEnabled").name("Enable Godrays").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysStrength", 0, 3.0, 0.05).name("Intensity").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysDensity", 0.1, 2.5, 0.05).name("Density (Spread)").onChange(() => this.updateSettings());
+        rays.addColor(this.settings, "raysColorHex").name("Ray Tint").onChange((v) => {
+          this.settings.raysColor.set(v);
+          this.updateSettings();
+        });
+
+        const anamorphic = root.addFolder("Three.js Anamorphic Flare");
+        anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Anamorphic").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+        anamorphic.addColor(this.settings, "anamorphicColorHex").name("Tint Color").onChange((v) => {
+          this.settings.anamorphicColor.set(v);
+          this.updateSettings();
+        });
+
+        const bloom = root.addFolder("Atmospheric Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Threshold").onChange(() => this.updateSettings());
+
+        const lens = root.addFolder("Lens Optics & Film Grain");
+        lens.add(this.settings, "chromaticAberration", 0, 0.1, 0.002).name("Chromatic Aberr.").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.08, 0.002).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "exposure", 0.2, 3.0, 0.05).name("Post Exposure").onChange(() => this.updateSettings());
+
+        return root;
+      }
+    }
+
+    // =========================================================================
+    // COLOR SCHEMES (19+ Presets)
+    // =========================================================================
+    const COLOR_SCHEMES = {
+      'Original': {
+        sky: '#5a7082',
+        fog: '#6d8599',
+        ground: '#1d2328',
+        scrapPrimary: '#262d35',
+        scrapSecondary: '#3e4854',
+        pcb: '#1c6328',
+        crt: '#4f5da8',
+        ramp: '#9aa2a8',
+        conveyor: '#181b1f',
+        machinery: '#f59e0b',
+        gadget: '#f8fafc',
+        cloud: '#f1f5f9',
+        godRay: '#fff8e7',
+        steam: '#e8edf2',
+        sun: '#fff4dc',
+        ambientSky: '#69849e',
+        ambientGround: '#232a31',
+        incinerator: '#ffe7b8'
+      },
+      'Monochromatic': {
+        sky: '#243342',
+        fog: '#2c3e50',
+        ground: '#131b23',
+        scrapPrimary: '#1a2632',
+        scrapSecondary: '#243444',
+        pcb: '#34495e',
+        crt: '#4a627a',
+        ramp: '#7088a0',
+        conveyor: '#0e151c',
+        machinery: '#5d82a6',
+        gadget: '#cddceb',
+        cloud: '#8faec9',
+        godRay: '#b3d1ed',
+        steam: '#e1effa',
+        sun: '#9bc4e8',
+        ambientSky: '#364e66',
+        ambientGround: '#111820',
+        incinerator: '#9bc4e8'
+      },
+      'Analogous': {
+        sky: '#1b4965',
+        fog: '#2b5f7e',
+        ground: '#0f2736',
+        scrapPrimary: '#163b4f',
+        scrapSecondary: '#205674',
+        pcb: '#2a9d8f',
+        crt: '#457b9d',
+        ramp: '#62b6cb',
+        conveyor: '#0a1d27',
+        machinery: '#e9c46a',
+        gadget: '#bee9e8',
+        cloud: '#e0fbfc',
+        godRay: '#cbf3f0',
+        steam: '#f4feff',
+        sun: '#ffe8a3',
+        ambientSky: '#31708e',
+        ambientGround: '#12263a',
+        incinerator: '#ffd166'
+      },
+      'Complementary': {
+        sky: '#1d2d44',
+        fog: '#2b3f5c',
+        ground: '#111b29',
+        scrapPrimary: '#1a2636',
+        scrapSecondary: '#25374d',
+        pcb: '#385773',
+        crt: '#e76f51',
+        ramp: '#8da4c4',
+        conveyor: '#0c131c',
+        machinery: '#f4a261',
+        gadget: '#f8edeb',
+        cloud: '#d8e2dc',
+        godRay: '#ffd166',
+        steam: '#ffe5d9',
+        sun: '#ffbe0b',
+        ambientSky: '#3a506b',
+        ambientGround: '#1c1917',
+        incinerator: '#ff7b00'
+      },
+      'Split-complementary': {
+        sky: '#0f3846',
+        fog: '#1b4e5f',
+        ground: '#0a232c',
+        scrapPrimary: '#133540',
+        scrapSecondary: '#1d4857',
+        pcb: '#008189',
+        crt: '#d90429',
+        ramp: '#4895ef',
+        conveyor: '#07161c',
+        machinery: '#ffb703',
+        gadget: '#edf2f4',
+        cloud: '#e2ece9',
+        godRay: '#ffdd00',
+        steam: '#ffe3e0',
+        sun: '#ffd000',
+        ambientSky: '#226f87',
+        ambientGround: '#1f130b',
+        incinerator: '#fb8500'
+      },
+      'Triadic': {
+        sky: '#2b3a42',
+        fog: '#3d4f59',
+        ground: '#1c2429',
+        scrapPrimary: '#252f36',
+        scrapSecondary: '#33414a',
+        pcb: '#2a9d8f',
+        crt: '#9d0208',
+        ramp: '#738a9c',
+        conveyor: '#141a1d',
+        machinery: '#ffb703',
+        gadget: '#f1faee',
+        cloud: '#e9ecef',
+        godRay: '#ffe6a7',
+        steam: '#ffffff',
+        sun: '#ffc300',
+        ambientSky: '#475d69',
+        ambientGround: '#241a14',
+        incinerator: '#ff5400'
+      },
+      'Tetradic': {
+        sky: '#22223b',
+        fog: '#353556',
+        ground: '#151524',
+        scrapPrimary: '#1e1e33',
+        scrapSecondary: '#2b2b48',
+        pcb: '#52b788',
+        crt: '#e07a5f',
+        ramp: '#9a8c98',
+        conveyor: '#0d0d17',
+        machinery: '#f2cc8f',
+        gadget: '#f4f1de',
+        cloud: '#e0dcd3',
+        godRay: '#ffe5b4',
+        steam: '#fdfbf7',
+        sun: '#ffb703',
+        ambientSky: '#4a4e69',
+        ambientGround: '#231926',
+        incinerator: '#f38375'
+      },
+      'Double split-complementary': {
+        sky: '#1e2d2f',
+        fog: '#2d3f42',
+        ground: '#131d1e',
+        scrapPrimary: '#1b2729',
+        scrapSecondary: '#253538',
+        pcb: '#2a9d8f',
+        crt: '#d81159',
+        ramp: '#6b9080',
+        conveyor: '#0c1314',
+        machinery: '#ffbc42',
+        gadget: '#f8f9fa',
+        cloud: '#cce3de',
+        godRay: '#fdf0d5',
+        steam: '#fcf6bd',
+        sun: '#ffaa00',
+        ambientSky: '#3c5a5e',
+        ambientGround: '#221518',
+        incinerator: '#ff5964'
+      },
+      'Achromatic (Black & White)': {
+        sky: '#0f0f0f',
+        fog: '#1c1c1c',
+        ground: '#080808',
+        scrapPrimary: '#141414',
+        scrapSecondary: '#222222',
+        pcb: '#303030',
+        crt: '#454545',
+        ramp: '#888888',
+        conveyor: '#080808',
+        machinery: '#555555',
+        gadget: '#e5e5e5',
+        cloud: '#bfbfbf',
+        godRay: '#e0e0e0',
+        steam: '#ffffff',
+        sun: '#ffffff',
+        ambientSky: '#333333',
+        ambientGround: '#0d0d0d',
+        incinerator: '#ffffff'
+      },
+      'Achromatic (White & Black)': {
+        sky: '#e2e2e2',
+        fog: '#cfcfcf',
+        ground: '#b0b0b0',
+        scrapPrimary: '#888888',
+        scrapSecondary: '#666666',
+        pcb: '#444444',
+        crt: '#222222',
+        ramp: '#333333',
+        conveyor: '#111111',
+        machinery: '#1a1a1a',
+        gadget: '#0a0a0a',
+        cloud: '#ffffff',
+        godRay: '#ffffff',
+        steam: '#ffffff',
+        sun: '#ffffff',
+        ambientSky: '#cccccc',
+        ambientGround: '#777777',
+        incinerator: '#ffffff'
+      },
+      'Achromatic + Accent (B&W + Red)': {
+        sky: '#141414',
+        fog: '#202020',
+        ground: '#0a0a0a',
+        scrapPrimary: '#181818',
+        scrapSecondary: '#282828',
+        pcb: '#383838',
+        crt: '#e50914',
+        ramp: '#737373',
+        conveyor: '#0c0c0c',
+        machinery: '#ff1e2d',
+        gadget: '#f5f5f5',
+        cloud: '#b3b3b3',
+        godRay: '#ff4d5a',
+        steam: '#ffccd0',
+        sun: '#ffffff',
+        ambientSky: '#383838',
+        ambientGround: '#140809',
+        incinerator: '#ff0015'
+      },
+      'Achromatic + Accent (W&B + Red)': {
+        sky: '#e5e5e5',
+        fog: '#d4d4d4',
+        ground: '#a8a8a8',
+        scrapPrimary: '#737373',
+        scrapSecondary: '#525252',
+        pcb: '#333333',
+        crt: '#d90429',
+        ramp: '#262626',
+        conveyor: '#121212',
+        machinery: '#ef233c',
+        gadget: '#171717',
+        cloud: '#ffffff',
+        godRay: '#ffccd5',
+        steam: '#ffe5e8',
+        sun: '#ffffff',
+        ambientSky: '#cccccc',
+        ambientGround: '#664448',
+        incinerator: '#d90429'
+      },
+      'Neutral + Accent': {
+        sky: '#3a3a3c',
+        fog: '#48484a',
+        ground: '#1c1c1e',
+        scrapPrimary: '#2c2c2e',
+        scrapSecondary: '#3a3a3c',
+        pcb: '#48484a',
+        crt: '#636366',
+        ramp: '#8e8e93',
+        conveyor: '#161618',
+        machinery: '#00e5ff',
+        gadget: '#f2f2f7',
+        cloud: '#d1d1d6',
+        godRay: '#80f2ff',
+        steam: '#e0fcff',
+        sun: '#ffffff',
+        ambientSky: '#636366',
+        ambientGround: '#1c1c1e',
+        incinerator: '#00e5ff'
+      },
+      'Palette 1 (Amber Flame)': {
+        sky: '#220901',
+        fog: '#411406',
+        ground: '#170600',
+        scrapPrimary: '#380e03',
+        scrapSecondary: '#541505',
+        pcb: '#941B0C',
+        crt: '#BC3908',
+        ramp: '#BC3908',
+        conveyor: '#0f0400',
+        machinery: '#F6AA1C',
+        gadget: '#ffedd5',
+        cloud: '#F6AA1C',
+        godRay: '#F6AA1C',
+        steam: '#ffedd5',
+        sun: '#ffaa00',
+        ambientSky: '#73220b',
+        ambientGround: '#1f0802',
+        incinerator: '#F6AA1C'
+      },
+      'Palette 2 (Teal Depths)': {
+        sky: '#0B132B',
+        fog: '#132145',
+        ground: '#000000',
+        scrapPrimary: '#081021',
+        scrapSecondary: '#0d1d3d',
+        pcb: '#4BAD9E',
+        crt: '#5BC0BE',
+        ramp: '#4BAD9E',
+        conveyor: '#040812',
+        machinery: '#63D1CF',
+        gadget: '#e0fbfc',
+        cloud: '#5BC0BE',
+        godRay: '#63D1CF',
+        steam: '#c8f7f5',
+        sun: '#63D1CF',
+        ambientSky: '#1f385c',
+        ambientGround: '#030814',
+        incinerator: '#63D1CF'
+      },
+      'Palette 3 (Lilac Orchid)': {
+        sky: '#0D001D',
+        fog: '#1d0936',
+        ground: '#120A12',
+        scrapPrimary: '#201026',
+        scrapSecondary: '#361b40',
+        pcb: '#CFB5C2',
+        crt: '#C9A3C6',
+        ramp: '#AA60C8',
+        conveyor: '#08020e',
+        machinery: '#D69ADE',
+        gadget: '#fbf5fc',
+        cloud: '#D69ADE',
+        godRay: '#D69ADE',
+        steam: '#fdf2ff',
+        sun: '#D69ADE',
+        ambientSky: '#4a2559',
+        ambientGround: '#170c1a',
+        incinerator: '#D69ADE'
+      },
+      'Palette 4 (Golden Teal)': {
+        sky: '#061210',
+        fog: '#0c2420',
+        ground: '#040a09',
+        scrapPrimary: '#00474D',
+        scrapSecondary: '#00626b',
+        pcb: '#008189',
+        crt: '#008189',
+        ramp: '#008189',
+        conveyor: '#020706',
+        machinery: '#FFBA00',
+        gadget: '#FEF1BE',
+        cloud: '#FEF1BE',
+        godRay: '#FFBA00',
+        steam: '#FEF1BE',
+        sun: '#FFBA00',
+        ambientSky: '#0e3a38',
+        ambientGround: '#081413',
+        incinerator: '#FFBA00'
+      },
+      'Palette 5 (Cyber Lime)': {
+        sky: '#05140A',
+        fog: '#0c2615',
+        ground: '#030c06',
+        scrapPrimary: '#0A3322',
+        scrapSecondary: '#124a33',
+        pcb: '#00B894',
+        crt: '#00B894',
+        ramp: '#00B894',
+        conveyor: '#020a05',
+        machinery: '#7FFF00',
+        gadget: '#D4FFB0',
+        cloud: '#D4FFB0',
+        godRay: '#7FFF00',
+        steam: '#D4FFB0',
+        sun: '#7FFF00',
+        ambientSky: '#164a2c',
+        ambientGround: '#05170b',
+        incinerator: '#7FFF00'
+      },
+      'Palette 6 (Sunset Blaze)': {
+        sky: '#0E0618',
+        fog: '#241038',
+        ground: '#0a0412',
+        scrapPrimary: '#3D1050',
+        scrapSecondary: '#5a1975',
+        pcb: '#C7501A',
+        crt: '#C7501A',
+        ramp: '#C7501A',
+        conveyor: '#08030f',
+        machinery: '#FF8C00',
+        gadget: '#FFE8CC',
+        cloud: '#FFE8CC',
+        godRay: '#FF8C00',
+        steam: '#FFE8CC',
+        sun: '#FF8C00',
+        ambientSky: '#4d1e63',
+        ambientGround: '#14061f',
+        incinerator: '#FF8C00'
+      },
+      'Palette 7 (Purple Velvet)': {
+        sky: '#090612',
+        fog: '#1d1238',
+        ground: '#06040d',
+        scrapPrimary: '#1A1250',
+        scrapSecondary: '#2d1f85',
+        pcb: '#6A3DE8',
+        crt: '#6A3DE8',
+        ramp: '#6A3DE8',
+        conveyor: '#05030a',
+        machinery: '#B38FFF',
+        gadget: '#E8E0FF',
+        cloud: '#E8E0FF',
+        godRay: '#B38FFF',
+        steam: '#E8E0FF',
+        sun: '#B38FFF',
+        ambientSky: '#36237a',
+        ambientGround: '#0c071a',
+        incinerator: '#B38FFF'
+      },
+      'Palette 8 (Cyberpunk Neon)': {
+        sky: '#05020F',
+        fog: '#180730',
+        ground: '#03010a',
+        scrapPrimary: '#1E0A3D',
+        scrapSecondary: '#36106e',
+        pcb: '#D40078',
+        crt: '#D40078',
+        ramp: '#00F0FF',
+        conveyor: '#04010a',
+        machinery: '#00F0FF',
+        gadget: '#E0FBFF',
+        cloud: '#E0FBFF',
+        godRay: '#00F0FF',
+        steam: '#fce4f4',
+        sun: '#00F0FF',
+        ambientSky: '#4a156e',
+        ambientGround: '#0d0217',
+        incinerator: '#D40078'
+      }
+    };
+
+    // =========================================================================
+    // PARAMETERS & INITIAL SETUP
+    // =========================================================================
+    const params = {
+      colorScheme: 'Original',
+      animation: 'Static Overview',
+      greenScreen: false,
+      clickToRandomize: true,
+      antialias: true,
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+      animationSpeed: 1.0,
+      exposure: 1.15,
+      sunIntensity: 2.4,
+      sunColor: '#fff4dc',
+      ambientIntensity: 0.95,
+      ambientSkyColor: '#69849e',
+      ambientGroundColor: '#232a31',
+      godRayIntensity: 0.35,
+      incineratorGlow: 4.0,
+      incineratorColor: '#ffe7b8',
+      skyColor: '#5a7082',
+      fogColor: '#6d8599',
+      landfillColor: '#262d35',
+      pcbColor: '#1c6328',
+      crtColor: '#4f5da8',
+      rampSteelColor: '#9aa2a8',
+      machineryColor: '#f59e0b',
+      gadgetColor: '#f8fafc',
+      cloudColor: '#f1f5f9',
+      steamColor: '#e8edf2'
+    };
+
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.skyColor);
+    scene.fog = new THREE.FogExp2(params.fogColor, 0.011);
+
+    const camera = new THREE.PerspectiveCamera(44, window.innerWidth / window.innerHeight, 0.1, 500);
+    // Camera framing matching Image 2 exactly!
+    camera.position.set(8.2, 5.5, 15.5);
+
+    let renderer = new THREE.WebGLRenderer({
+      antialias: params.antialias,
+      powerPreference: 'high-performance'
+    });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(params.dpr);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = params.exposure;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    // Initialize PostProcessor Suite (with Anamorphic Flare DEFAULT OFF!)
+    const postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      antialias: params.antialias,
+      bloomEnabled: true,
+      bloomStrength: 0.75,
+      bloomRadius: 0.45,
+      bloomThreshold: 0.22,
+      raysEnabled: true,
+      raysStrength: 0.7,
+      raysThreshold: 0.18,
+      raysColor: params.sunColor,
+      anamorphicEnabled: false, // DEFAULT IS OFF AS REQUESTED!
+      chromaticAberration: 0.012,
+      vignetteBoost: 1.15,
+      vignetteReduction: 0.6,
+      noiseIntensity: 0.01,
+      exposure: params.exposure
+    });
+    postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+
+    let controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enableZoom = true;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.maxPolarAngle = Math.PI / 2 + 0.02;
+    controls.minDistance = 3;
+    controls.maxDistance = 250;
+    // LookAt matching Image 2 composition
+    controls.target.set(4.0, 16.5, -17.0);
+    controls.update();
+
+    // =========================================================================
+    // LIGHTING
+    // =========================================================================
+    const ambientLight = new THREE.HemisphereLight(
+      params.ambientSkyColor,
+      params.ambientGroundColor,
+      params.ambientIntensity
+    );
+    scene.add(ambientLight);
+
+    const sunLight = new THREE.DirectionalLight(params.sunColor, params.sunIntensity);
+    sunLight.position.set(28, 55, -45);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.width = 2048;
+    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.camera.near = 10;
+    sunLight.shadow.camera.far = 180;
+    sunLight.shadow.camera.left = -45;
+    sunLight.shadow.camera.right = 45;
+    sunLight.shadow.camera.top = 55;
+    sunLight.shadow.camera.bottom = -40;
+    sunLight.shadow.bias = -0.0005;
+    scene.add(sunLight);
+
+    const incineratorLight = new THREE.PointLight(params.incineratorColor, params.incineratorGlow, 55, 1.2);
+    incineratorLight.position.set(18, 38.5, -48);
+    scene.add(incineratorLight);
+
+    // =========================================================================
+    // PROCEDURAL TEXTURES (Canvas 2D)
+    // =========================================================================
+    function createPhoneBoxTexture() {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillRect(0, 0, 256, 256);
+      ctx.strokeStyle = '#e2e8f0';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(2, 2, 252, 252);
+
+      // Smartphone graphic front face
+      ctx.fillStyle = '#0b0f19';
+      ctx.beginPath();
+      ctx.roundRect(42, 22, 172, 212, 18);
+      ctx.fill();
+
+      // Colorful OLED wallpaper
+      const grad = ctx.createLinearGradient(45, 30, 210, 220);
+      grad.addColorStop(0, '#00f0ff');
+      grad.addColorStop(0.4, '#7b2cbf');
+      grad.addColorStop(1, '#ff007f');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(47, 27, 162, 202, 14);
+      ctx.fill();
+
+      // Punch-hole camera
+      ctx.fillStyle = '#0b0f19';
+      ctx.beginPath();
+      ctx.arc(128, 38, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Minimalist tech icon
+      ctx.fillStyle = '#94a3b8';
+      ctx.beginPath();
+      ctx.arc(128, 243, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function createPCBTexture() {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#144c20';
+      ctx.fillRect(0, 0, 256, 256);
+
+      ctx.strokeStyle = '#c5a059';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 28; i++) {
+        ctx.beginPath();
+        let x = (i * 29) % 256;
+        let y = (i * 37) % 256;
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + 40, y);
+        ctx.lineTo(x + 60, y + 40);
+        ctx.lineTo(x + 110, y + 40);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = '#e2e8f0';
+      for (let i = 0; i < 48; i++) {
+        let x = (i * 47) % 240 + 8;
+        let y = (i * 53) % 240 + 8;
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(35, 35, 55, 55);
+      ctx.fillRect(145, 115, 65, 45);
+      ctx.fillRect(55, 155, 45, 45);
+
+      ctx.fillStyle = '#ffd166';
+      ctx.fillRect(33, 40, 2, 45);
+      ctx.fillRect(90, 40, 2, 45);
+      ctx.fillRect(143, 120, 2, 35);
+      ctx.fillRect(210, 120, 2, 35);
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function createCRTTexture() {
+      const c = document.createElement('canvas');
+      c.width = 128;
+      c.height = 128;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(0, 0, 128, 128);
+
+      const grad = ctx.createLinearGradient(0, 0, 128, 128);
+      grad.addColorStop(0, 'rgba(129, 140, 248, 0.5)');
+      grad.addColorStop(0.3, 'rgba(99, 102, 241, 0.2)');
+      grad.addColorStop(0.7, 'rgba(0, 0, 0, 0.9)');
+      grad.addColorStop(1, 'rgba(168, 85, 247, 0.4)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(8, 8, 112, 112, 16);
+      ctx.fill();
+
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+      for (let y = 10; y < 118; y += 4) {
+        ctx.fillRect(10, y, 108, 1.5);
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function createConveyorTexture() {
+      const c = document.createElement('canvas');
+      c.width = 64;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#171a1e';
+      ctx.fillRect(0, 0, 64, 256);
+
+      ctx.strokeStyle = '#2b313a';
+      ctx.lineWidth = 4;
+      for (let y = 0; y < 256; y += 16) {
+        ctx.beginPath();
+        ctx.moveTo(4, y);
+        ctx.lineTo(32, y + 8);
+        ctx.lineTo(60, y);
+        ctx.stroke();
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(1, 14);
+      return tex;
+    }
+
+    function createWoodTexture() {
+      const c = document.createElement('canvas');
+      c.width = 128;
+      c.height = 128;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#bda078';
+      ctx.fillRect(0, 0, 128, 128);
+      ctx.fillStyle = '#a88961';
+      for (let y = 0; y < 128; y += 32) {
+        ctx.fillRect(0, y, 128, 2);
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    const phoneBoxTexture = createPhoneBoxTexture();
+    const pcbTexture = createPCBTexture();
+    const crtTexture = createCRTTexture();
+    const conveyorTexture = createConveyorTexture();
+    const woodTexture = createWoodTexture();
+
+    // =========================================================================
+    // MATERIALS
+    // =========================================================================
+    const materials = {
+      terrain: new THREE.MeshStandardMaterial({
+        color: params.landfillColor,
+        roughness: 0.95,
+        metalness: 0.1,
+        flatShading: true
+      }),
+      scrapPrimary: new THREE.MeshStandardMaterial({
+        color: params.landfillColor,
+        roughness: 0.85,
+        metalness: 0.35,
+        flatShading: true
+      }),
+      scrapSecondary: new THREE.MeshStandardMaterial({
+        color: '#3e4854',
+        roughness: 0.75,
+        metalness: 0.45,
+        flatShading: true
+      }),
+      pcb: new THREE.MeshStandardMaterial({
+        color: params.pcbColor,
+        map: pcbTexture,
+        roughness: 0.5,
+        metalness: 0.3
+      }),
+      crtHousing: new THREE.MeshStandardMaterial({
+        color: '#9ca3af',
+        roughness: 0.7,
+        metalness: 0.15,
+        flatShading: true
+      }),
+      crtScreen: new THREE.MeshStandardMaterial({
+        color: params.crtColor,
+        map: crtTexture,
+        roughness: 0.2,
+        metalness: 0.7
+      }),
+      rampSteel: new THREE.MeshStandardMaterial({
+        color: params.rampSteelColor,
+        roughness: 0.55,
+        metalness: 0.65,
+        flatShading: true
+      }),
+      conveyorBelt: new THREE.MeshStandardMaterial({
+        color: '#181b1f',
+        map: conveyorTexture,
+        roughness: 0.9,
+        metalness: 0.1
+      }),
+      machinery: new THREE.MeshStandardMaterial({
+        color: params.machineryColor,
+        roughness: 0.4,
+        metalness: 0.3,
+        flatShading: true
+      }),
+      machineryTire: new THREE.MeshStandardMaterial({
+        color: '#111315',
+        roughness: 0.95,
+        metalness: 0.05
+      }),
+      machineryGlass: new THREE.MeshStandardMaterial({
+        color: '#1e293b',
+        roughness: 0.1,
+        metalness: 0.9,
+        transparent: true,
+        opacity: 0.85
+      }),
+      palletWood: new THREE.MeshStandardMaterial({
+        color: '#bda078',
+        map: woodTexture,
+        roughness: 0.85,
+        metalness: 0.05
+      }),
+      gadgetBox: new THREE.MeshStandardMaterial({
+        color: params.gadgetColor,
+        map: phoneBoxTexture,
+        roughness: 0.25,
+        metalness: 0.1
+      }),
+      shrinkWrap: new THREE.MeshPhysicalMaterial({
+        color: '#ffffff',
+        roughness: 0.05,
+        transmission: 0.9,
+        thickness: 0.3,
+        ior: 1.45,
+        transparent: true,
+        opacity: 0.45
+      }),
+      cloud: new THREE.MeshStandardMaterial({
+        color: params.cloudColor,
+        roughness: 0.95,
+        metalness: 0.0,
+        flatShading: true
+      }),
+      godRay: new THREE.MeshBasicMaterial({
+        color: new THREE.Color(params.sunColor),
+        transparent: true,
+        opacity: params.godRayIntensity,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      }),
+      steam: new THREE.MeshStandardMaterial({
+        color: params.steamColor,
+        roughness: 0.9,
+        flatShading: true,
+        side: THREE.DoubleSide
+      }),
+      workerVest: new THREE.MeshStandardMaterial({
+        color: '#d4ff00',
+        roughness: 0.5,
+        emissive: '#7fff00',
+        emissiveIntensity: 0.35
+      }),
+      workerHelmet: new THREE.MeshStandardMaterial({
+        color: '#ffcc00',
+        roughness: 0.4
+      }),
+      workerBody: new THREE.MeshStandardMaterial({
+        color: '#2b3945',
+        roughness: 0.8
+      })
+    };
+
+    // =========================================================================
+    // RAMP SPECIFICATIONS & COORDINATES (Globally available for all systems)
+    // =========================================================================
+    const RAMP_START = new THREE.Vector3(-4.0, 1.8, -6.0);
+    const RAMP_END = new THREE.Vector3(18.0, 38.0, -48.0);
+    const RAMP_VEC = new THREE.Vector3().subVectors(RAMP_END, RAMP_START);
+    const RAMP_LEN = RAMP_VEC.length();
+    const RAMP_DIR = RAMP_VEC.clone().normalize();
+    const RAMP_INCLINE = Math.asin(RAMP_VEC.y / RAMP_LEN);
+    const RAMP_CENTER = new THREE.Vector3().addVectors(RAMP_START, RAMP_END).multiplyScalar(0.5);
+
+    // =========================================================================
+    // 1. TERRAIN & E-WASTE HEAPS
+    // =========================================================================
+    const terrainGeo = new THREE.PlaneGeometry(160, 160, 48, 48);
+    terrainGeo.rotateX(-Math.PI / 2);
+    const posAttr = terrainGeo.attributes.position;
+    for (let i = 0; i < posAttr.count; i++) {
+      const x = posAttr.getX(i);
+      const z = posAttr.getZ(i);
+
+      let y = 0;
+      // Foreground left mountain
+      if (x < 1 && z > -12) {
+        const d = Math.hypot(x + 10, z - 8);
+        y += Math.max(0, 14 - d * 0.7);
+      }
+      // Left midground heap
+      if (x < -4) {
+        const d = Math.hypot(x + 22, z + 12);
+        y += Math.max(0, 16 - d * 0.55);
+      }
+      // Right heap behind feeder conveyor
+      if (x > 11) {
+        const d = Math.hypot(x - 22, z + 4);
+        y += Math.max(0, 13 - d * 0.5);
+      }
+      // Far background ridge
+      if (z < -32) {
+        y += Math.max(0, (-z - 32) * 0.45);
+      }
+
+      // Low-poly faceted displacement
+      y += Math.sin(x * 0.28) * Math.cos(z * 0.28) * 1.6;
+      y += Math.sin(x * 0.65 + z * 0.45) * 0.8;
+
+      // Keep conveyor valley flat
+      if (x >= -4 && x <= 9 && z >= -22 && z <= 18) {
+        y = Math.min(y, 0.3);
+      }
+
+      posAttr.setY(i, Math.max(-0.2, y));
+    }
+    terrainGeo.computeVertexNormals();
+    const terrainMesh = new THREE.Mesh(terrainGeo, materials.terrain);
+    terrainMesh.receiveShadow = true;
+    scene.add(terrainMesh);
+
+    // High Density Instanced Meshes for E-Waste (CRTs, PCBs, Towers, Blocks)
+    const crtCount = 320;
+    const crtHousingGeo = new THREE.BoxGeometry(1.2, 1.0, 1.1);
+    const crtScreenGeo = new THREE.PlaneGeometry(0.95, 0.78);
+    crtScreenGeo.translate(0, 0, 0.56);
+    const crtHousingMesh = new THREE.InstancedMesh(crtHousingGeo, materials.crtHousing, crtCount);
+    const crtScreenMesh = new THREE.InstancedMesh(crtScreenGeo, materials.crtScreen, crtCount);
+    crtHousingMesh.castShadow = true;
+    crtHousingMesh.receiveShadow = true;
+
+    const pcbCount = 380;
+    const pcbGeo = new THREE.BoxGeometry(1.4, 0.05, 1.1);
+    const pcbMesh = new THREE.InstancedMesh(pcbGeo, materials.pcb, pcbCount);
+    pcbMesh.castShadow = true;
+    pcbMesh.receiveShadow = true;
+
+    const towerCount = 240;
+    const towerGeo = new THREE.BoxGeometry(0.7, 1.4, 1.3);
+    const towerMesh = new THREE.InstancedMesh(towerGeo, materials.scrapSecondary, towerCount);
+    towerMesh.castShadow = true;
+    towerMesh.receiveShadow = true;
+
+    const chunkCount = 420;
+    const chunkGeo = new THREE.DodecahedronGeometry(0.55, 0);
+    const chunkMesh = new THREE.InstancedMesh(chunkGeo, materials.scrapPrimary, chunkCount);
+    chunkMesh.castShadow = true;
+    chunkMesh.receiveShadow = true;
+
+    const dummy = new THREE.Object3D();
+
+    function sampleHeight(x, z) {
+      let y = 0;
+      if (x < 1 && z > -12) {
+        const d = Math.hypot(x + 10, z - 8);
+        y += Math.max(0, 14 - d * 0.7);
+      }
+      if (x < -4) {
+        const d = Math.hypot(x + 22, z + 12);
+        y += Math.max(0, 16 - d * 0.55);
+      }
+      if (x > 11) {
+        const d = Math.hypot(x - 22, z + 4);
+        y += Math.max(0, 13 - d * 0.5);
+      }
+      if (z < -32) {
+        y += Math.max(0, (-z - 32) * 0.45);
+      }
+      y += Math.sin(x * 0.28) * Math.cos(z * 0.28) * 1.6;
+      return Math.max(0, y);
+    }
+
+    // Clearance helper to prevent any landfill debris from intersecting conveyor paths
+    function isInConveyorCorridor(x, z) {
+      // Main ramp corridor
+      const rampHoriz = new THREE.Vector2(RAMP_END.x - RAMP_START.x, RAMP_END.z - RAMP_START.z);
+      const rampHorizLen = rampHoriz.length();
+      const rampHorizNorm = rampHoriz.clone().normalize();
+      const v = new THREE.Vector2(x - RAMP_START.x, z - RAMP_START.z);
+      const proj = v.dot(rampHorizNorm);
+      if (proj > -3 && proj < rampHorizLen + 3) {
+        const perpDist = Math.abs(v.x * rampHorizNorm.y - v.y * rampHorizNorm.x);
+        if (perpDist < 3.4) return true;
+      }
+      // Feeder conveyor corridor
+      if (Math.abs(x - 6.8) < 2.5 && z > -16 && z < 18) return true;
+      return false;
+    }
+
+    function populateLandfill() {
+      // 1. CRT Monitors (Densely concentrated in foreground left matching Image 2!)
+      for (let i = 0; i < crtCount; i++) {
+        let x, z;
+        if (i < 130) {
+          // Foreground left pile in camera face
+          x = -14 + Math.random() * 14;
+          z = -2 + Math.random() * 18;
+        } else if (i < 230) {
+          // Left midground heap
+          x = -8 - Math.random() * 24;
+          z = -30 + Math.random() * 35;
+        } else {
+          // Right heap
+          x = 12 + Math.random() * 24;
+          z = -25 + Math.random() * 45;
+        }
+        if (isInConveyorCorridor(x, z)) {
+          x += (x < 1 ? -4.0 : 4.0);
+        }
+        const y = sampleHeight(x, z) + 0.45 + Math.random() * 0.4;
+        const s = 0.75 + Math.random() * 0.6;
+
+        dummy.position.set(x, y, z);
+        dummy.rotation.set(
+          (Math.random() - 0.5) * 1.2,
+          Math.random() * Math.PI * 2,
+          (Math.random() - 0.5) * 1.2
+        );
+        dummy.scale.set(s, s, s);
+        dummy.updateMatrix();
+
+        crtHousingMesh.setMatrixAt(i, dummy.matrix);
+        crtScreenMesh.setMatrixAt(i, dummy.matrix);
+      }
+      crtHousingMesh.instanceMatrix.needsUpdate = true;
+      crtScreenMesh.instanceMatrix.needsUpdate = true;
+
+      // 2. PCBs (Circuit boards sticking out)
+      for (let i = 0; i < pcbCount; i++) {
+        let x, z;
+        if (i < 160) {
+          x = -13 + Math.random() * 14;
+          z = -4 + Math.random() * 20;
+        } else {
+          x = (i % 2 === 0) ? -7 - Math.random() * 24 : 11 + Math.random() * 22;
+          z = -28 + Math.random() * 50;
+        }
+        if (isInConveyorCorridor(x, z)) {
+          x += (x < 1 ? -3.8 : 3.8);
+        }
+        const y = sampleHeight(x, z) + 0.2 + Math.random() * 0.3;
+        const s = 0.8 + Math.random() * 0.7;
+
+        dummy.position.set(x, y, z);
+        dummy.rotation.set(
+          (Math.random() - 0.5) * 2.0,
+          Math.random() * Math.PI * 2,
+          (Math.random() - 0.5) * 2.0
+        );
+        dummy.scale.set(s, s, s);
+        dummy.updateMatrix();
+
+        pcbMesh.setMatrixAt(i, dummy.matrix);
+      }
+      pcbMesh.instanceMatrix.needsUpdate = true;
+
+      // 3. PC Towers
+      for (let i = 0; i < towerCount; i++) {
+        const side = (i % 2 === 0) ? -1 : 1;
+        let x = side === -1 ? -6 - Math.random() * 22 : 11 + Math.random() * 22;
+        let z = -25 + Math.random() * 45;
+        if (isInConveyorCorridor(x, z)) {
+          x += (x < 1 ? -3.5 : 3.5);
+        }
+        const y = sampleHeight(x, z) + 0.6;
+        const s = 0.8 + Math.random() * 0.5;
+
+        dummy.position.set(x, y, z);
+        dummy.rotation.set((Math.random() - 0.5) * 1.6, Math.random() * Math.PI * 2, (Math.random() - 0.5) * 1.6);
+        dummy.scale.set(s, s, s);
+        dummy.updateMatrix();
+
+        towerMesh.setMatrixAt(i, dummy.matrix);
+      }
+      towerMesh.instanceMatrix.needsUpdate = true;
+
+      // 4. Scrap Chunks
+      for (let i = 0; i < chunkCount; i++) {
+        const side = (i % 2 === 0) ? -1 : 1;
+        let x = side === -1 ? -5 - Math.random() * 26 : 9 + Math.random() * 26;
+        let z = -32 + Math.random() * 55;
+        if (isInConveyorCorridor(x, z)) {
+          x += (x < 1 ? -3.5 : 3.5);
+        }
+        const y = sampleHeight(x, z) + 0.3;
+        const s = 0.5 + Math.random() * 1.1;
+
+        dummy.position.set(x, y, z);
+        dummy.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+        dummy.scale.set(s, s, s);
+        dummy.updateMatrix();
+
+        chunkMesh.setMatrixAt(i, dummy.matrix);
+      }
+      chunkMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    scene.add(crtHousingMesh);
+    scene.add(crtScreenMesh);
+    scene.add(pcbMesh);
+    scene.add(towerMesh);
+    scene.add(chunkMesh);
+    populateLandfill();
+
+    // Dumpster skips in the e-waste
+    function createDumpster(x, y, z, rotY, colorHex) {
+      const dumpster = new THREE.Group();
+      const b = new THREE.Mesh(new THREE.BoxGeometry(4.2, 2.2, 2.4), new THREE.MeshStandardMaterial({
+        color: colorHex,
+        roughness: 0.6,
+        metalness: 0.4
+      }));
+      b.position.y = 1.1;
+      b.castShadow = true;
+      dumpster.add(b);
+
+      const rim = new THREE.Mesh(new THREE.BoxGeometry(4.4, 0.2, 2.6), materials.scrapSecondary);
+      rim.position.y = 2.2;
+      dumpster.add(rim);
+
+      dumpster.position.set(x, y, z);
+      dumpster.rotation.y = rotY;
+      scene.add(dumpster);
+    }
+    createDumpster(-10, 1.0, 4, 0.4, '#7b2cbf');
+    createDumpster(-14, 1.2, -6, -0.3, '#4a5568');
+
+    // =========================================================================
+    // 2. THE COLOSSAL STRAIGHT TRUSS RAMP (Exact Image 2 Alignment!)
+    // =========================================================================
+    // Parent group positioned at center and cleanly oriented towards RAMP_END!
+    const rampGroup = new THREE.Group();
+    rampGroup.position.copy(RAMP_CENTER);
+    rampGroup.lookAt(RAMP_END); // Local Z axis points strictly along the ramp incline!
+    scene.add(rampGroup);
+
+    // Left and Right Longitudinal Steel Girders
+    const beamGeo = new THREE.BoxGeometry(0.35, 0.8, RAMP_LEN);
+    const beamLeft = new THREE.Mesh(beamGeo, materials.rampSteel);
+    beamLeft.position.set(-2.0, 0, 0);
+    beamLeft.castShadow = true;
+    rampGroup.add(beamLeft);
+
+    const beamRight = new THREE.Mesh(beamGeo, materials.rampSteel);
+    beamRight.position.set(2.0, 0, 0);
+    beamRight.castShadow = true;
+    rampGroup.add(beamRight);
+
+    // Bottom Warren Truss Lattice & Cross Struts
+    const numCross = 32;
+    const crossGeo = new THREE.BoxGeometry(4.2, 0.25, 0.35);
+    const strutGeo = new THREE.CylinderGeometry(0.08, 0.08, 2.6, 6);
+    strutGeo.rotateZ(Math.PI / 4);
+
+    for (let i = 0; i <= numCross; i++) {
+      const z = -RAMP_LEN / 2 + (i / numCross) * RAMP_LEN;
+      const cross = new THREE.Mesh(crossGeo, materials.rampSteel);
+      cross.position.set(0, -0.28, z);
+      cross.castShadow = true;
+      rampGroup.add(cross);
+
+      if (i < numCross) {
+        const sign = (i % 2 === 0) ? 1 : -1;
+        const midZ = z + (RAMP_LEN / numCross) * 0.5;
+
+        const sL = new THREE.Mesh(strutGeo, materials.rampSteel);
+        sL.position.set(-2.0, -0.65, midZ);
+        sL.rotation.y = sign * 0.28;
+        rampGroup.add(sL);
+
+        const sR = new THREE.Mesh(strutGeo, materials.rampSteel);
+        sR.position.set(2.0, -0.65, midZ);
+        sR.rotation.y = -sign * 0.28;
+        rampGroup.add(sR);
+      }
+    }
+
+    // Catwalk Deck & Dual Handrails
+    const handrailGeo = new THREE.CylinderGeometry(0.045, 0.045, RAMP_LEN, 8);
+    handrailGeo.rotateX(Math.PI / 2);
+    const postGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.2, 6);
+
+    const railL = new THREE.Mesh(handrailGeo, materials.rampSteel);
+    railL.position.set(-2.15, 0.75, 0);
+    rampGroup.add(railL);
+
+    const railR = new THREE.Mesh(handrailGeo, materials.rampSteel);
+    railR.position.set(2.15, 0.75, 0);
+    rampGroup.add(railR);
+
+    for (let i = 0; i <= 24; i++) {
+      const z = -RAMP_LEN / 2 + (i / 24) * RAMP_LEN;
+      const pL = new THREE.Mesh(postGeo, materials.rampSteel);
+      pL.position.set(-2.15, 0.38, z);
+      rampGroup.add(pL);
+
+      const pR = new THREE.Mesh(postGeo, materials.rampSteel);
+      pR.position.set(2.15, 0.38, z);
+      rampGroup.add(pR);
+    }
+
+    // Belt Side Rollers
+    const rollerGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.65, 8);
+    rollerGeo.rotateZ(Math.PI / 3);
+    for (let i = 0; i <= 36; i++) {
+      const z = -RAMP_LEN / 2 + (i / 36) * RAMP_LEN;
+      const rL = new THREE.Mesh(rollerGeo, materials.rampSteel);
+      rL.position.set(-1.6, 0.26, z);
+      rampGroup.add(rL);
+
+      const rR = new THREE.Mesh(rollerGeo, materials.rampSteel);
+      rR.position.set(1.6, 0.26, z);
+      rR.rotation.z = -Math.PI / 3 * 2;
+      rampGroup.add(rR);
+    }
+
+    // Continuous Moving Conveyor Belt Surface
+    const beltGeo = new THREE.PlaneGeometry(3.2, RAMP_LEN, 1, 32);
+    beltGeo.rotateX(-Math.PI / 2);
+    beltGeo.translate(0, 0.14, 0);
+    const conveyorMesh = new THREE.Mesh(beltGeo, materials.conveyorBelt);
+    conveyorMesh.receiveShadow = true;
+    rampGroup.add(conveyorMesh);
+
+    // Two Massive Vertical Support Lattice Towers (Underneath Ramp - Zero Penetration!)
+    function createSupportTower(progress) {
+      const tower = new THREE.Group();
+      const posOnRamp = new THREE.Vector3().lerpVectors(RAMP_START, RAMP_END, progress);
+
+      // Horizontal direction along ramp and perpendicular across ramp
+      const horizDir = new THREE.Vector3(RAMP_DIR.x, 0, RAMP_DIR.z).normalize();
+      const perpDir = new THREE.Vector3(-horizDir.z, 0, horizDir.x).normalize();
+
+      const halfWidth = 1.85; // Matches underside of main longitudinal steel girders
+      const halfDepth = 1.4;  // Along the ramp
+      const tanTheta = Math.tan(RAMP_INCLINE);
+
+      // Underside of ramp truss sits at posOnRamp.y - 1.25
+      // Downhill (front) columns terminate strictly under downhill underside
+      const heightDownhill = Math.max(1.5, posOnRamp.y - 1.25 - halfDepth * tanTheta);
+      // Uphill (back) columns terminate strictly under uphill underside
+      const heightUphill = Math.max(1.5, posOnRamp.y - 1.25 + halfDepth * tanTheta);
+
+      const colMat = materials.rampSteel;
+      const colSize = 0.38;
+      const colGeoDown = new THREE.BoxGeometry(colSize, heightDownhill, colSize);
+      const colGeoUp = new THREE.BoxGeometry(colSize, heightUphill, colSize);
+
+      // 4 Main Vertical Steel Corner Columns (Stopping strictly below ramp girders!)
+      // 1. Front-Left (downhill)
+      const cFL = new THREE.Mesh(colGeoDown, colMat);
+      cFL.position.copy(posOnRamp)
+        .addScaledVector(horizDir, -halfDepth)
+        .addScaledVector(perpDir, -halfWidth);
+      cFL.position.y = heightDownhill / 2;
+      cFL.castShadow = true;
+      tower.add(cFL);
+
+      // 2. Front-Right (downhill)
+      const cFR = new THREE.Mesh(colGeoDown, colMat);
+      cFR.position.copy(posOnRamp)
+        .addScaledVector(horizDir, -halfDepth)
+        .addScaledVector(perpDir, halfWidth);
+      cFR.position.y = heightDownhill / 2;
+      cFR.castShadow = true;
+      tower.add(cFR);
+
+      // 3. Back-Left (uphill)
+      const cBL = new THREE.Mesh(colGeoUp, colMat);
+      cBL.position.copy(posOnRamp)
+        .addScaledVector(horizDir, halfDepth)
+        .addScaledVector(perpDir, -halfWidth);
+      cBL.position.y = heightUphill / 2;
+      cBL.castShadow = true;
+      tower.add(cBL);
+
+      // 4. Back-Right (uphill)
+      const cBR = new THREE.Mesh(colGeoUp, colMat);
+      cBR.position.copy(posOnRamp)
+        .addScaledVector(horizDir, halfDepth)
+        .addScaledVector(perpDir, halfWidth);
+      cBR.position.y = heightUphill / 2;
+      cBR.castShadow = true;
+      tower.add(cBR);
+
+      // Open Industrial Lattice Framework (Hollow Perimeter Strut Rings - NO SOLID SLABS!)
+      const avgHeight = (heightDownhill + heightUphill) / 2;
+      const numTiers = Math.floor(avgHeight / 3.4);
+      const strutWidthGeo = new THREE.BoxGeometry(halfWidth * 2, 0.22, 0.22);
+      const strutDepthGeo = new THREE.BoxGeometry(0.22, 0.22, halfDepth * 2);
+
+      // Diagonal X-bracing struts
+      const diagLen = Math.hypot(halfWidth * 2, 3.4);
+      const diagGeo = new THREE.CylinderGeometry(0.065, 0.065, diagLen, 6);
+      diagGeo.rotateZ(Math.atan2(halfWidth * 2, 3.4));
+
+      for (let t = 1; t <= numTiers; t++) {
+        // Safe height below the ramp underside
+        const tierFrac = t / (numTiers + 0.5);
+        const y = tierFrac * (avgHeight - 0.8);
+
+        // Front horizontal strut
+        const sFront = new THREE.Mesh(strutWidthGeo, colMat);
+        sFront.position.copy(posOnRamp).addScaledVector(horizDir, -halfDepth);
+        sFront.position.y = y;
+        tower.add(sFront);
+
+        // Back horizontal strut
+        const sBack = new THREE.Mesh(strutWidthGeo, colMat);
+        sBack.position.copy(posOnRamp).addScaledVector(horizDir, halfDepth);
+        sBack.position.y = y;
+        tower.add(sBack);
+
+        // Left horizontal strut
+        const sLeft = new THREE.Mesh(strutDepthGeo, colMat);
+        sLeft.position.copy(posOnRamp).addScaledVector(perpDir, -halfWidth);
+        sLeft.position.y = y;
+        tower.add(sLeft);
+
+        // Right horizontal strut
+        const sRight = new THREE.Mesh(strutDepthGeo, colMat);
+        sRight.position.copy(posOnRamp).addScaledVector(perpDir, halfWidth);
+        sRight.position.y = y;
+        tower.add(sRight);
+
+        // Diagonal X-bracing in each bay
+        const d1 = new THREE.Mesh(diagGeo, colMat);
+        d1.position.copy(posOnRamp).addScaledVector(horizDir, -halfDepth);
+        d1.position.y = y - 1.7;
+        tower.add(d1);
+
+        const d2 = new THREE.Mesh(diagGeo, colMat);
+        d2.position.copy(posOnRamp).addScaledVector(horizDir, -halfDepth);
+        d2.position.y = y - 1.7;
+        d2.rotation.y = Math.PI;
+        tower.add(d2);
+      }
+
+      // Heavy Steel Bearing Mounting Shoes at the top of each column (Directly welded to bottom of ramp girders)
+      const shoeGeo = new THREE.BoxGeometry(0.7, 0.35, 0.7);
+      for (let [cx, cz, ch] of [
+        [-halfWidth, -halfDepth, heightDownhill],
+        [halfWidth, -halfDepth, heightDownhill],
+        [-halfWidth, halfDepth, heightUphill],
+        [halfWidth, halfDepth, heightUphill]
+      ]) {
+        const shoe = new THREE.Mesh(shoeGeo, materials.scrapSecondary);
+        shoe.position.copy(posOnRamp).addScaledVector(perpDir, cx).addScaledVector(horizDir, cz);
+        shoe.position.y = ch - 0.15;
+        shoe.castShadow = true;
+        tower.add(shoe);
+      }
+
+      // Concrete Pier Foundation Footing at ground
+      const footing = new THREE.Mesh(
+        new THREE.BoxGeometry(halfWidth * 2 + 1.6, 1.4, halfDepth * 2 + 1.6),
+        materials.scrapPrimary
+      );
+      footing.position.copy(posOnRamp);
+      footing.position.y = 0.7;
+      footing.receiveShadow = true;
+      tower.add(footing);
+
+      scene.add(tower);
+    }
+    createSupportTower(0.52);
+    createSupportTower(0.80);
+
+    // =========================================================================
+    // 3. SECONDARY FEEDER CONVEYOR (Foreground Right in Image 2!)
+    // =========================================================================
+    const feederGroup = new THREE.Group();
+    const FEEDER_LEN = 30;
+    const feederBeltGeo = new THREE.PlaneGeometry(2.4, FEEDER_LEN);
+    feederBeltGeo.rotateX(-Math.PI / 2);
+    const feederBeltMesh = new THREE.Mesh(feederBeltGeo, materials.conveyorBelt);
+    feederBeltMesh.receiveShadow = true;
+    feederGroup.add(feederBeltMesh);
+
+    const fBeamL = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.5, FEEDER_LEN), materials.rampSteel);
+    fBeamL.position.set(-1.3, -0.1, 0);
+    feederGroup.add(fBeamL);
+
+    const fBeamR = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.5, FEEDER_LEN), materials.rampSteel);
+    fBeamR.position.set(1.3, -0.1, 0);
+    feederGroup.add(fBeamR);
+
+    // Support Legs
+    for (let z = -FEEDER_LEN / 2; z <= FEEDER_LEN / 2; z += 5) {
+      const legGeo = new THREE.BoxGeometry(0.2, 1.8, 0.2);
+      const legL = new THREE.Mesh(legGeo, materials.rampSteel);
+      legL.position.set(-1.3, -1.0, z);
+      feederGroup.add(legL);
+
+      const legR = new THREE.Mesh(legGeo, materials.rampSteel);
+      legR.position.set(1.3, -1.0, z);
+      feederGroup.add(legR);
+    }
+
+    feederGroup.position.set(6.8, 1.6, 2.0);
+    feederGroup.rotation.y = -0.12; // Aligned with camera perspective
+    scene.add(feederGroup);
+
+    // =========================================================================
+    // 4. PRISTINE SHRINK-WRAPPED GADGET PALLETS
+    // =========================================================================
+    function buildPalletModel() {
+      const pallet = new THREE.Group();
+
+      // Wood Pallet Deck Slats
+      const slatGeo = new THREE.BoxGeometry(2.2, 0.08, 0.28);
+      for (let i = -2; i <= 2; i++) {
+        const slat = new THREE.Mesh(slatGeo, materials.palletWood);
+        slat.position.set(0, 0.22, i * 0.42);
+        slat.castShadow = true;
+        pallet.add(slat);
+      }
+
+      // Wooden Stringer Blocks
+      const runnerGeo = new THREE.BoxGeometry(0.18, 0.16, 2.0);
+      for (let x of [-0.95, 0, 0.95]) {
+        const runner = new THREE.Mesh(runnerGeo, materials.palletWood);
+        runner.position.set(x, 0.1, 0);
+        runner.castShadow = true;
+        pallet.add(runner);
+      }
+
+      // Grid of 6 Stacks of Smartphone Boxes (3x2 grid, 3-4 boxes tall)
+      const boxGeo = new THREE.BoxGeometry(0.64, 0.38, 0.88);
+      const boxGrid = [
+        [-0.64, -0.46], [0.0, -0.46], [0.64, -0.46],
+        [-0.64, 0.46],  [0.0, 0.46],  [0.64, 0.46]
+      ];
+
+      for (let [bx, bz] of boxGrid) {
+        const layers = 3 + Math.floor(Math.random() * 2);
+        for (let l = 0; l < layers; l++) {
+          const box = new THREE.Mesh(boxGeo, materials.gadgetBox);
+          box.position.set(bx, 0.45 + l * 0.4, bz);
+          box.castShadow = true;
+          box.receiveShadow = true;
+          pallet.add(box);
+        }
+      }
+
+      // Glossy Shrink-Wrap Transparent Outer Shell
+      const wrapGeo = new THREE.BoxGeometry(2.05, 1.85, 1.95);
+      const wrapMesh = new THREE.Mesh(wrapGeo, materials.shrinkWrap);
+      wrapMesh.position.y = 1.15;
+      pallet.add(wrapMesh);
+
+      return pallet;
+    }
+
+    // Pallets attached DIRECTLY to rampGroup (100% straight incline!)
+    const MAIN_PALLET_COUNT = 18;
+    const mainPallets = [];
+    for (let i = 0; i < MAIN_PALLET_COUNT; i++) {
+      const p = buildPalletModel();
+      rampGroup.add(p);
+      mainPallets.push({
+        mesh: p,
+        progress: i / MAIN_PALLET_COUNT
+      });
+    }
+
+    // Pallets on Feeder Conveyor
+    const FEEDER_PALLET_COUNT = 6;
+    const feederPallets = [];
+    for (let i = 0; i < FEEDER_PALLET_COUNT; i++) {
+      const p = buildPalletModel();
+      feederGroup.add(p);
+      feederPallets.push({
+        mesh: p,
+        progress: i / FEEDER_PALLET_COUNT
+      });
+    }
+
+    // =========================================================================
+    // 5. SUMMIT STEAM RIBBONS & CLOUDS (Exact Image 2 Vapor Trails)
+    // =========================================================================
+    // 3 Distinct Twisted Stream Ribbons streaming horizontally to the right across the sky
+    const ribbonCount = 3;
+    const ribbonMeshes = [];
+    const ribbonSegments = 40;
+
+    for (let r = 0; r < ribbonCount; r++) {
+      const rGeo = new THREE.PlaneGeometry(0.9, 28, 1, ribbonSegments);
+      const rMesh = new THREE.Mesh(rGeo, materials.steam);
+      rMesh.castShadow = true;
+      scene.add(rMesh);
+      ribbonMeshes.push({
+        mesh: rMesh,
+        geo: rGeo,
+        seed: r * 2.4,
+        yBase: 38 + r * 2.2,
+        zBase: -48 + r * 3.5,
+        driftRate: 0.8 + r * 0.3
+      });
+    }
+
+    // Cloud clusters horizontally across the upper summit
+    const cloudGroup = new THREE.Group();
+    function createCloudCluster(cx, cy, cz, scale) {
+      const cluster = new THREE.Group();
+      const numPuffs = 8 + Math.floor(Math.random() * 6);
+      for (let i = 0; i < numPuffs; i++) {
+        const puffGeo = new THREE.IcosahedronGeometry(2.2 + Math.random() * 2.2, 1);
+        const puff = new THREE.Mesh(puffGeo, materials.cloud);
+        puff.position.set(
+          (Math.random() - 0.5) * 10 * scale,
+          (Math.random() - 0.5) * 3.8 * scale,
+          (Math.random() - 0.5) * 6 * scale
+        );
+        puff.scale.set(1.15, 0.85, 1.0);
+        puff.castShadow = true;
+        cluster.add(puff);
+      }
+      cluster.position.set(cx, cy, cz);
+      return cluster;
+    }
+
+    cloudGroup.add(createCloudCluster(18, 42, -48, 1.4));
+    cloudGroup.add(createCloudCluster(6, 44, -44, 1.3));
+    cloudGroup.add(createCloudCluster(-6, 45, -40, 1.2));
+    cloudGroup.add(createCloudCluster(28, 43, -50, 1.2));
+    cloudGroup.add(createCloudCluster(38, 44, -46, 1.0));
+    scene.add(cloudGroup);
+
+    // Volumetric God Rays Streaming Downwards
+    const godRayGroup = new THREE.Group();
+    const rayCount = 8;
+    const godRayMeshes = [];
+
+    for (let i = 0; i < rayCount; i++) {
+      const h = 60 + Math.random() * 15;
+      const topR = 1.0 + Math.random() * 1.4;
+      const botR = 6.5 + Math.random() * 5.0;
+      const rayGeo = new THREE.CylinderGeometry(topR, botR, h, 12, 1, true);
+      rayGeo.translate(0, -h / 2, 0);
+
+      const rayMesh = new THREE.Mesh(rayGeo, materials.godRay);
+      rayMesh.position.set(
+        10 + (i - rayCount / 2) * 8.5,
+        48 + Math.random() * 4,
+        -44 + (Math.random() - 0.5) * 8
+      );
+      rayMesh.rotation.z = -0.16 + (Math.random() - 0.5) * 0.08;
+      rayMesh.rotation.x = 0.22 + (Math.random() - 0.5) * 0.08;
+      godRayGroup.add(rayMesh);
+      godRayMeshes.push({
+        mesh: rayMesh,
+        baseOpacity: params.godRayIntensity * (0.8 + Math.random() * 0.4),
+        phase: Math.random() * Math.PI * 2
+      });
+    }
+    scene.add(godRayGroup);
+
+    // =========================================================================
+    // 6. HEAVY MACHINERY & WORKERS (Exact Image 2 Placements!)
+    // =========================================================================
+    function createFrontLoader(x, y, z, rotY) {
+      const loader = new THREE.Group();
+
+      const body = new THREE.Mesh(new THREE.BoxGeometry(4.5, 1.8, 2.6), materials.machinery);
+      body.position.y = 1.6;
+      body.castShadow = true;
+      loader.add(body);
+
+      const cab = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.0, 2.2), materials.machinery);
+      cab.position.set(-0.6, 3.2, 0);
+      cab.castShadow = true;
+      loader.add(cab);
+
+      const glass = new THREE.Mesh(new THREE.BoxGeometry(2.25, 1.5, 2.25), materials.machineryGlass);
+      glass.position.set(-0.6, 3.2, 0);
+      loader.add(glass);
+
+      const tireGeo = new THREE.CylinderGeometry(1.0, 1.0, 0.75, 14);
+      tireGeo.rotateX(Math.PI / 2);
+      for (let [tx, ty, tz] of [[-1.6, 1.0, -1.6], [1.6, 1.0, -1.6], [-1.6, 1.0, 1.6], [1.6, 1.0, 1.6]]) {
+        const tire = new THREE.Mesh(tireGeo, materials.machineryTire);
+        tire.position.set(tx, ty, tz);
+        tire.castShadow = true;
+        loader.add(tire);
+      }
+
+      const armGeo = new THREE.BoxGeometry(2.8, 0.35, 0.35);
+      const armL = new THREE.Mesh(armGeo, materials.machinery);
+      armL.position.set(2.8, 1.8, -1.4);
+      armL.rotation.z = -0.3;
+      armL.castShadow = true;
+      loader.add(armL);
+
+      const armR = new THREE.Mesh(armGeo, materials.machinery);
+      armR.position.set(2.8, 1.8, 1.4);
+      armR.rotation.z = -0.3;
+      armR.castShadow = true;
+      loader.add(armR);
+
+      const bucket = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.8, 3.6), materials.rampSteel);
+      bucket.position.set(4.2, 1.2, 0);
+      bucket.rotation.z = 0.2;
+      bucket.castShadow = true;
+      loader.add(bucket);
+
+      loader.position.set(x, y, z);
+      loader.rotation.y = rotY;
+      loader.scale.set(0.9, 0.9, 0.9);
+      scene.add(loader);
+      return loader;
+    }
+
+    // Bulldozer 1: Left of ramp base digging in scrap pile
+    createFrontLoader(-7.5, 1.0, -7.0, -0.65);
+    // Bulldozer 2: Right side behind feeder conveyor (as seen in Image 2!)
+    createFrontLoader(13.5, 1.0, -10.0, -2.5);
+
+    function createWorker(x, y, z, rotY) {
+      const worker = new THREE.Group();
+      const torso = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.7, 0.3), materials.workerVest);
+      torso.position.y = 1.15;
+      torso.castShadow = true;
+      worker.add(torso);
+
+      const legs = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.8, 0.28), materials.workerBody);
+      legs.position.y = 0.4;
+      legs.castShadow = true;
+      worker.add(legs);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), materials.workerHelmet);
+      head.position.y = 1.65;
+      worker.add(head);
+
+      const hatBrim = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.05, 10), materials.workerHelmet);
+      hatBrim.position.y = 1.62;
+      worker.add(hatBrim);
+
+      worker.position.set(x, y, z);
+      worker.rotation.y = rotY;
+      scene.add(worker);
+    }
+
+    // Workers matching positions in Image 2
+    createWorker(-4.5, 1.0, -5.0, 0.5);
+    createWorker(10.0, 1.0, -25.0, -1.2);
+    createWorker(4.8, 1.0, 0.0, 1.8);
+
+    // Distant Industrial Smokestacks
+    function createSmokestack(x, z, h) {
+      const stack = new THREE.Group();
+      const stMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 1.2, h, 10), materials.scrapSecondary);
+      stMesh.position.y = h / 2;
+      stMesh.castShadow = true;
+      stack.add(stMesh);
+
+      const rim = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.3, 0.8, 10), materials.rampSteel);
+      rim.position.y = h;
+      stack.add(rim);
+
+      stack.position.set(x, 0, z);
+      scene.add(stack);
+    }
+    createSmokestack(-35, -42, 28);
+    createSmokestack(-42, -38, 22);
+    createSmokestack(45, -50, 32);
+
+    // =========================================================================
+    // COLOR SCHEME LOGIC
+    // =========================================================================
+    function applyColorScheme(schemeName) {
+      const scheme = COLOR_SCHEMES[schemeName] || COLOR_SCHEMES['Original'];
+      params.colorScheme = schemeName;
+
+      params.skyColor = scheme.sky;
+      params.fogColor = scheme.fog;
+      params.landfillColor = scheme.scrapPrimary;
+      params.pcbColor = scheme.pcb;
+      params.crtColor = scheme.crt;
+      params.rampSteelColor = scheme.ramp;
+      params.machineryColor = scheme.machinery;
+      params.gadgetColor = scheme.gadget;
+      params.cloudColor = scheme.cloud;
+      params.steamColor = scheme.steam;
+      params.sunColor = scheme.sun;
+      params.ambientSkyColor = scheme.ambientSky;
+      params.ambientGroundColor = scheme.ambientGround;
+      params.incineratorColor = scheme.incinerator;
+
+      if (!params.greenScreen) {
+        scene.background.set(scheme.sky);
+        scene.fog.color.set(scheme.fog);
+        scene.fog.density = 0.011;
+      } else {
+        scene.background.set('#00ff00');
+        scene.fog.color.set('#00ff00');
+        scene.fog.density = 0.0001;
+      }
+
+      ambientLight.color.set(scheme.ambientSky);
+      ambientLight.groundColor.set(scheme.ambientGround);
+      sunLight.color.set(scheme.sun);
+      incineratorLight.color.set(scheme.incinerator);
+
+      materials.terrain.color.set(scheme.ground);
+      materials.scrapPrimary.color.set(scheme.scrapPrimary);
+      materials.scrapSecondary.color.set(scheme.scrapSecondary);
+      materials.pcb.color.set(scheme.pcb);
+      materials.crtScreen.color.set(scheme.crt);
+      materials.rampSteel.color.set(scheme.ramp);
+      materials.conveyorBelt.color.set(scheme.conveyor);
+      materials.machinery.color.set(scheme.machinery);
+      materials.gadgetBox.color.set(scheme.gadget);
+      materials.cloud.color.set(scheme.cloud);
+      materials.godRay.color.set(scheme.godRay);
+      materials.steam.color.set(scheme.steam);
+
+      if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // =========================================================================
+    // RANDOMIZE SCENE (CRUCIAL: NEVER TOUCH POSTPROCESSOR SETTINGS!)
+    // =========================================================================
+    function randomizeScene() {
+      // 1. Pick a new color scheme from the 19+ presets
+      const schemeKeys = Object.keys(COLOR_SCHEMES);
+      const randomScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+      applyColorScheme(randomScheme);
+
+      // 2. Randomize geometric & motion parameters
+      params.animationSpeed = 0.6 + Math.random() * 1.5;
+      params.godRayIntensity = 0.2 + Math.random() * 0.45;
+      materials.godRay.opacity = params.godRayIntensity;
+
+      // 3. Re-roll procedural landfill layout
+      populateLandfill();
+
+      // 4. Randomize cloud orientation
+      cloudGroup.rotation.y = Math.random() * Math.PI * 2;
+
+      // NOTE: POSTPROCESSOR SETTINGS REMAIN 100% UNTOUCHED AND INTACT!
+
+      if (gui) gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+
+    // Pointer Events (Click vs Drag Detection)
+    let pointerDownTime = 0;
+    let pointerDownX = 0;
+    let pointerDownY = 0;
+
+    function attachPointerListeners(domEl) {
+      domEl.addEventListener('pointerdown', (e) => {
+        pointerDownTime = performance.now();
+        pointerDownX = e.clientX;
+        pointerDownY = e.clientY;
+      });
+
+      domEl.addEventListener('pointerup', (e) => {
+        const dt = performance.now() - pointerDownTime;
+        const dist = Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY);
+        if (dt < 300 && dist < 6 && params.clickToRandomize) {
+          randomizeScene();
+        }
+      });
+    }
+    attachPointerListeners(renderer.domElement);
+
+    // Hotkey 'H' to show/hide UI
+    let gui;
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        if (gui && gui.domElement) {
+          const isHidden = gui.domElement.style.display === 'none';
+          gui.domElement.style.display = isHidden ? '' : 'none';
+        }
+      }
+    });
+
+    // =========================================================================
+    // LIL-GUI SETUP
+    // =========================================================================
+    gui = new GUI({ title: 'The Landfill Conveyor to the Clouds' });
+
+    // 1. Color Schemes (19+)
+    gui.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES))
+      .name('Color Scheme')
+      .onChange((val) => applyColorScheme(val));
+
+    // 2. 8 Preconfigured Camera Animations
+    const animationModes = [
+      'Static Overview',
+      'Cinematic Orbit',
+      'Ascending Ramp Track',
+      'Landfill Ground Level',
+      'Celestial Incinerator',
+      'Industrial Drone Survey',
+      'Conveyor Belt POV',
+      'Dramatic Dutch Drift'
+    ];
+    gui.add(params, 'animation', animationModes).name('Animation Mode');
+
+    // 3. System & Performance
+    const sysFolder = gui.addFolder('System & Performance');
+    sysFolder.add(params, 'greenScreen').name('Green Screen (#00ff00)').onChange((val) => {
+      if (val) {
+        scene.background.set('#00ff00');
+        scene.fog.color.set('#00ff00');
+        scene.fog.density = 0.0001;
+      } else {
+        applyColorScheme(params.colorScheme);
+      }
+    });
+
+    sysFolder.add(params, 'clickToRandomize').name('Click Scene to Randomize');
+
+    sysFolder.add(params, 'antialias').name('MSAA Antialias').onChange((val) => {
+      params.antialias = val;
+      postProcessor.setAntialias(val);
+    });
+
+    sysFolder.add(params, 'dpr', 0.5, 3.0, 0.1).name('Pixel Ratio (DPR)').onChange((val) => {
+      renderer.setPixelRatio(val);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, val);
+    });
+
+    sysFolder.add(params, 'animationSpeed', 0.0, 3.0, 0.05).name('Animation Speed');
+
+    // 4. Lighting & Exposure
+    const lightFolder = gui.addFolder('Lighting & Atmosphere');
+    lightFolder.add(params, 'exposure', 0.2, 3.0, 0.05).name('Exposure').onChange((v) => {
+      renderer.toneMappingExposure = v;
+      postProcessor.settings.exposure = v;
+    });
+    lightFolder.add(params, 'sunIntensity', 0.0, 6.0, 0.1).name('Sun Intensity').onChange((v) => {
+      sunLight.intensity = v;
+    });
+    lightFolder.addColor(params, 'sunColor').name('Sun Color').onChange((v) => {
+      sunLight.color.set(v);
+    });
+    lightFolder.add(params, 'ambientIntensity', 0.0, 3.0, 0.1).name('Ambient Light').onChange((v) => {
+      ambientLight.intensity = v;
+    });
+    lightFolder.addColor(params, 'ambientSkyColor').name('Ambient Sky').onChange((v) => {
+      ambientLight.color.set(v);
+    });
+    lightFolder.addColor(params, 'ambientGroundColor').name('Ambient Ground').onChange((v) => {
+      ambientLight.groundColor.set(v);
+    });
+    lightFolder.add(params, 'godRayIntensity', 0.0, 1.0, 0.02).name('God Rays Opacity').onChange((v) => {
+      materials.godRay.opacity = v;
+    });
+    lightFolder.add(params, 'incineratorGlow', 0.0, 8.0, 0.1).name('Incinerator Glow').onChange((v) => {
+      incineratorLight.intensity = v;
+    });
+    lightFolder.addColor(params, 'incineratorColor').name('Incinerator Color').onChange((v) => {
+      incineratorLight.color.set(v);
+    });
+
+    // 5. Individual Material Color Tuning
+    const colorFolder = gui.addFolder('Custom Colors');
+    colorFolder.addColor(params, 'skyColor').name('Sky Color').onChange((v) => {
+      if (!params.greenScreen) scene.background.set(v);
+    });
+    colorFolder.addColor(params, 'fogColor').name('Fog Color').onChange((v) => {
+      if (!params.greenScreen) scene.fog.color.set(v);
+    });
+    colorFolder.addColor(params, 'landfillColor').name('Landfill Scrap').onChange((v) => {
+      materials.terrain.color.set(v);
+      materials.scrapPrimary.color.set(v);
+    });
+    colorFolder.addColor(params, 'pcbColor').name('Circuits (PCBs)').onChange((v) => {
+      materials.pcb.color.set(v);
+    });
+    colorFolder.addColor(params, 'crtColor').name('CRT Screens').onChange((v) => {
+      materials.crtScreen.color.set(v);
+    });
+    colorFolder.addColor(params, 'rampSteelColor').name('Ramp Steel').onChange((v) => {
+      materials.rampSteel.color.set(v);
+    });
+    colorFolder.addColor(params, 'machineryColor').name('Machinery Yellow').onChange((v) => {
+      materials.machinery.color.set(v);
+    });
+    colorFolder.addColor(params, 'gadgetColor').name('Gadget Box').onChange((v) => {
+      materials.gadgetBox.color.set(v);
+    });
+    colorFolder.addColor(params, 'cloudColor').name('Clouds').onChange((v) => {
+      materials.cloud.color.set(v);
+    });
+    colorFolder.addColor(params, 'steamColor').name('Steam Ribbons').onChange((v) => {
+      materials.steam.color.set(v);
+    });
+
+    // 6. ATTACH POSTPROCESSING PIPELINE CONTROLS (lil-gui integration)
+    postProcessor.attachGUI(gui, "Post-Processing Suite");
+
+    gui.add({ randomize: () => randomizeScene() }, 'randomize').name('Roll Random Variation');
+
+    // Resize Handling
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+    });
+
+    // =========================================================================
+    // MAIN ANIMATION LOOP
+    // =========================================================================
+    const clock = new THREE.Clock();
+    let prevAnimMode = params.animation;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const time = clock.getElapsedTime() * params.animationSpeed;
+
+      // 1. Rubber Conveyor Belts Movement
+      conveyorTexture.offset.y -= delta * 0.42 * params.animationSpeed;
+
+      // 2. Ascending Gadget Pallets on Main Ramp (100% Solid Straight Flow!)
+      for (let i = 0; i < MAIN_PALLET_COUNT; i++) {
+        const item = mainPallets[i];
+        item.progress = (item.progress + delta * 0.042 * params.animationSpeed) % 1.0;
+
+        // Position strictly along the local Z axis of rampGroup directly on the rubber belt surface!
+        const localZ = -RAMP_LEN / 2 + item.progress * RAMP_LEN;
+        item.mesh.position.set(0, 0.14, localZ);
+
+        // Vaporization & dissolution at the celestial cloud threshold
+        if (item.progress > 0.88) {
+          const dissolve = (item.progress - 0.88) / 0.12;
+          const s = Math.max(0.001, 1.0 - dissolve);
+          item.mesh.scale.set(s, s, s);
+        } else if (item.progress < 0.05) {
+          const fadeIn = item.progress / 0.05;
+          item.mesh.scale.set(fadeIn, fadeIn, fadeIn);
+        } else {
+          item.mesh.scale.set(1, 1, 1);
+        }
+      }
+
+      // 3. Feeder Conveyor Pallets
+      for (let i = 0; i < FEEDER_PALLET_COUNT; i++) {
+        const item = feederPallets[i];
+        item.progress = (item.progress + delta * 0.035 * params.animationSpeed) % 1.0;
+        const feedZ = -FEEDER_LEN / 2 + item.progress * FEEDER_LEN;
+        item.mesh.position.set(0, 0.02, feedZ);
+      }
+
+      // 4. Summit Steam Ribbons (Horizontal Twisting Ribbons Matching Image 2)
+      for (let r = 0; r < ribbonCount; r++) {
+        const rib = ribbonMeshes[r];
+        const posArr = rib.geo.attributes.position;
+        const segs = ribbonSegments;
+
+        for (let j = 0; j <= segs; j++) {
+          const u = j / segs;
+          const tRib = time * 1.5 * rib.driftRate + rib.seed;
+
+          // Extend horizontally to the right from the incinerator portal
+          const wx = 18.0 + u * 24.0;
+          const wy = rib.yBase + Math.sin(tRib + u * 5.0) * (1.2 + u * 3.0);
+          const wz = rib.zBase + Math.cos(tRib * 0.85 + u * 4.0) * (1.0 + u * 2.5);
+
+          // Rotate ribbon geometry to face camera diagonal
+          posArr.setXYZ(j * 2, -0.45, (u - 0.5) * 28, 0);
+          posArr.setXYZ(j * 2 + 1, 0.45, (u - 0.5) * 28, 0);
+        }
+        posArr.needsUpdate = true;
+        rib.mesh.position.set(28, rib.yBase + Math.sin(time * 0.5 + rib.seed) * 1.2, rib.zBase);
+        rib.mesh.rotation.set(-0.2, 1.2, 0.4 + Math.sin(time * 0.8 + rib.seed) * 0.1);
+      }
+
+      // 5. God Rays Shimmer
+      for (let i = 0; i < godRayMeshes.length; i++) {
+        const gr = godRayMeshes[i];
+        const pulse = Math.sin(time * 0.7 + gr.phase) * 0.08;
+        gr.mesh.material.opacity = Math.max(0, gr.baseOpacity + pulse);
+      }
+
+      // 6. Incinerator Glow Pulse & Cloud Drift
+      incineratorLight.intensity = params.incineratorGlow + Math.sin(time * 3.5) * 0.6;
+      cloudGroup.position.x = Math.sin(time * 0.04) * 1.5;
+
+      // 7. 8 Preconfigured Cinematic Animations
+      const anim = params.animation;
+      if (anim !== prevAnimMode) {
+        prevAnimMode = anim;
+        if (anim === 'Static Overview') {
+          // Exact framing of Image 2!
+          camera.position.set(8.2, 5.5, 15.5);
+          controls.target.set(4.0, 16.5, -17.0);
+        }
+      }
+
+      if (anim === 'Cinematic Orbit') {
+        const angle = time * 0.07;
+        camera.position.set(7.0 + Math.sin(angle) * 48.0, 18.0 + Math.cos(time * 0.05) * 6.0, -18.0 + Math.cos(angle) * 48.0);
+        controls.target.set(7.0, 16.0, -18.0);
+      } else if (anim === 'Ascending Ramp Track') {
+        const t = (time * 0.04) % 1.0;
+        const pt = new THREE.Vector3().lerpVectors(RAMP_START, RAMP_END, t);
+        camera.position.set(pt.x + 8.5, pt.y + 4.2, pt.z + 10.0);
+        controls.target.set(pt.x, pt.y + 1.5, pt.z);
+      } else if (anim === 'Landfill Ground Level') {
+        camera.position.set(-2.5 + Math.sin(time * 0.05) * 1.5, 3.2, 8.5 + Math.cos(time * 0.05) * 1.5);
+        controls.target.set(6.0, 20.0, -22.0);
+      } else if (anim === 'Celestial Incinerator') {
+        camera.position.set(24.0 + Math.sin(time * 0.06) * 3.0, 40.0 + Math.cos(time * 0.05) * 2.0, -36.0 + Math.cos(time * 0.06) * 3.0);
+        controls.target.set(18.0, 38.0, -48.0);
+      } else if (anim === 'Industrial Drone Survey') {
+        camera.position.set(7.0 + Math.sin(time * 0.08) * 32.0, 42.0 + Math.cos(time * 0.05) * 6.0, -16.0 + Math.sin(time * 0.16) * 24.0);
+        controls.target.set(7.0, 14.0, -18.0);
+      } else if (anim === 'Conveyor Belt POV') {
+        const t = (time * 0.045) % 1.0;
+        const pt = new THREE.Vector3().lerpVectors(RAMP_START, RAMP_END, t);
+        camera.position.set(pt.x - 1.2, pt.y + 1.6, pt.z + 2.2);
+        controls.target.set(pt.x + RAMP_DIR.x * 12.0, pt.y + RAMP_DIR.y * 12.0, pt.z + RAMP_DIR.z * 12.0);
+      } else if (anim === 'Dramatic Dutch Drift') {
+        const drift = Math.sin(time * 0.07) * 12.0;
+        camera.position.set(8.2 + drift, 5.5 + Math.cos(time * 0.05) * 1.5, 15.5);
+        controls.target.set(4.0, 16.5, -17.0);
+        camera.rotation.z = -0.12 + Math.sin(time * 0.05) * 0.04;
+      }
+
+      controls.update();
+
+      // 8. Update Sun Position & Render through PostProcessor Suite!
+      postProcessor.setSunScreenPosition(camera, sunLight.position);
+      postProcessor.renderScene(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>
