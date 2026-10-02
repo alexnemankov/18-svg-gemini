@@ -1,0 +1,2245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Global Supply Chain Logistics Globe</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      background-color: #080c14;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      cursor: grab;
+    }
+    #canvas-container:active {
+      cursor: grabbing;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (Inlined from postprocessing/PostProcessor.js)
+    // =========================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    vec3 sanitize(vec3 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      return clamp(v, vec3(0.0), vec3(65000.0));
+    }
+
+    void main() {
+      vec4 raw = texture(inputTexture, vUv);
+      vec3 color = sanitize(raw.rgb);
+      float luminance = max(0.0, dot(color, vec3(0.2126, 0.7152, 0.0722)));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.0001);
+      vec3 result = color * contribution;
+      fragColor = vec4(sanitize(result), clamp(raw.a, 0.0, 1.0));
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+
+    vec4 sanitize(vec4 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      return clamp(v, vec4(0.0), vec4(65000.0));
+    }
+
+    void main() {
+      color = sanitize(blur13(inputTexture, vUv, direction));
+    }
+    `;
+
+    const anamorphicBrightShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    uniform float smoothWidth;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+      fragColor = mix(vec4(0.0), color, alpha);
+    }
+    `;
+
+    const anamorphicBlurShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    uniform float samples;
+    uniform float intensity;
+    uniform vec3 tintColor;
+    uniform float bloomRadius;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      int halfSamples = max(1, int(samples) / 2);
+      float fHalfSamples = float(halfSamples);
+      vec2 invSize = 1.0 / resolution;
+      vec4 total = vec4(0.0);
+
+      for (int i = -64; i <= 64; i++) {
+        if (i < -halfSamples || i > halfSamples) continue;
+        float softness = 1.0 - abs(float(i)) / fHalfSamples;
+        softness = pow(softness, 2.0);
+        vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+        shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+        total += texture(inputTexture, shiftedUV) * softness;
+      }
+
+      fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform sampler2D anamorphicTexture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform bool anamorphicEnabled;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    vec3 sanitize(vec3 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      return clamp(v, vec3(0.0), vec3(65000.0));
+    }
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * (uint(timeVal) % 65536U));
+    }
+
+    void main() {
+      vec4 raw = texture(inputTexture, vUv);
+      vec3 color = sanitize(raw.rgb);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec3 b0 = sanitize(texture(blur0Texture, vUv).rgb);
+        vec3 b1 = sanitize(texture(blur1Texture, vUv).rgb);
+        vec3 b2 = sanitize(texture(blur2Texture, vUv).rgb);
+        vec3 b3 = sanitize(texture(blur3Texture, vUv).rgb);
+        vec3 b4 = sanitize(texture(blur4Texture, vUv).rgb);
+        vec3 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      if (anamorphicEnabled) {
+        vec3 a = sanitize(texture(anamorphicTexture, vUv).rgb);
+        color += a;
+      }
+
+      float vig = max(0.0, vignette(vUv, vignetteBoost, vignetteReduction));
+      color *= vig;
+      color += max(0.0, noiseIntensity) * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(sanitize(color), 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      color = max(vec3(0.0), color);
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      vec3 denom = max(color * (c * color + d) + e, vec3(0.0001));
+      return clamp((color * (a * color + b)) / denom, 0.0, 1.0);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / max(gamma, vec3(0.001)));
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+
+    void main() {
+      vec4 col = chromaticAberration(inputTexture, vUv, chromaticAberrationAmount, (vUv - 0.5));
+      vec3 finalCol = col.rgb;
+      if (isnan(finalCol.x) || isinf(finalCol.x)) finalCol.x = 0.0;
+      if (isnan(finalCol.y) || isinf(finalCol.y)) finalCol.y = 0.0;
+      if (isnan(finalCol.z) || isinf(finalCol.z)) finalCol.z = 0.0;
+      finalCol = clamp(finalCol, vec3(0.0), vec3(65000.0));
+
+      vec3 exposedColor = finalCol * exposure;
+      vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+      finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : false,
+        samples: options.samples || 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      render(renderer, sourceTexture) {
+        if (!this.enabled || this.strength <= 0.001) return;
+        this.brightShader.uniforms.inputTexture.value = sourceTexture;
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          antialias: params.antialias !== undefined ? params.antialias : true,
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 1.1,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.18,
+          anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false, // Default is OFF
+          anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+          anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.35,
+          anamorphicSamples: 64,
+          anamorphicRadius: 0.0,
+          anamorphicSmoothWidth: 0.05,
+          anamorphicColor: new THREE.Color(0x7a8aff),
+          anamorphicColorHex: '#7a8aff',
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.006,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.45,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.008,
+          gamma: 1.0,
+          minInputLevel: 0.0,
+          maxInputLevel: 1.0,
+          exposure: 1.0,
+        };
+
+        const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+        const targetSamples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples, depthBuffer: true });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.anamorphicThreshold },
+            smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBrightShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+            samples: { value: this.settings.anamorphicSamples },
+            intensity: { value: this.settings.anamorphicIntensity },
+            tintColor: { value: this.settings.anamorphicColor },
+            bloomRadius: { value: this.settings.anamorphicRadius },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBlurShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            inputTexture: { value: null },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            anamorphicTexture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.setSize(window.innerWidth, window.innerHeight);
+        this.updateSettings();
+      }
+
+      updateSettings() {
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+
+        this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+        this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+        this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+        this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+        this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+        this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+      }
+
+      setSize(w, h) {
+        this.sceneTarget.setSize(w, h);
+        this.bloomPass.setSize(w, h);
+        this.finalPass.setSize(w, h);
+        this.finalShader.uniforms.resolution.value.set(w, h);
+
+        const anW = Math.max(1, Math.round(w / 4));
+        const anH = Math.max(1, Math.round(h / 4));
+        this.anamorphicBrightPass.setSize(anW, anH);
+        this.anamorphicBlurPass.setSize(anW, anH);
+        this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+        this.rgbPass.setSize(w, h);
+      }
+
+      render(scene, camera) {
+        if (!this.settings.enabled) {
+          this.renderer.setRenderTarget(null);
+          this.renderer.render(scene, camera);
+          return;
+        }
+
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+
+        const sourceTexture = this.sceneTarget.texture;
+
+        if (this.settings.bloomEnabled) {
+          this.bloomPass.render(this.renderer, sourceTexture);
+          for (let i = 0; i < 5; i++) {
+            this.finalShader.uniforms[`blur${i}Texture`].value = this.bloomPass.blurPasses[i].current.texture;
+          }
+        }
+
+        if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+          this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+          this.anamorphicBrightPass.render(this.renderer);
+
+          this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+          this.anamorphicBlurPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+        }
+
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.finalPass.shader.uniforms.time.value = performance.now() * 0.001;
+        this.finalPass.render(this.renderer);
+
+        this.rgbShader.uniforms.inputTexture.value = this.finalPass.texture;
+        this.rgbPass.render(this.renderer, true);
+      }
+
+      attachGUI(gui, title = 'Post Processor (PostProcessor.js)') {
+        const root = gui.addFolder(title);
+        root.add(this.settings, 'enabled').name('Enable PostProcess');
+
+        const bloom = root.addFolder('Gaussian Bloom');
+        bloom.add(this.settings, 'bloomEnabled').name('Enable Bloom').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomStrength', 0, 4, 0.05).name('Strength').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomRadius', 0, 1.5, 0.05).name('Radius').onChange(() => this.updateSettings());
+        bloom.add(this.settings, 'bloomThreshold', 0, 1, 0.02).name('Threshold').onChange(() => this.updateSettings());
+
+        const anamorphic = root.addFolder('Anamorphic Flare');
+        anamorphic.add(this.settings, 'anamorphicEnabled').name('Enable Flare').onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, 'anamorphicIntensity', 0, 10, 0.1).name('Intensity').onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, 'anamorphicThreshold', 0, 1, 0.02).name('Threshold').onChange(() => this.updateSettings());
+        anamorphic.addColor(this.settings, 'anamorphicColorHex').name('Tint Color').onChange(v => {
+          this.settings.anamorphicColor.set(v);
+          this.updateSettings();
+        });
+
+        const lens = root.addFolder('Lens & Optics');
+        lens.add(this.settings, 'chromaticAberration', 0, 0.05, 0.001).name('Chromatic Aberration').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteBoost', 0.5, 2.0, 0.05).name('Vignette Boost').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'vignetteReduction', 0.0, 1.5, 0.05).name('Vignette Falloff').onChange(() => this.updateSettings());
+        lens.add(this.settings, 'noiseIntensity', 0.0, 0.05, 0.002).name('Film Grain').onChange(() => this.updateSettings());
+      }
+    }
+
+    // --- 21 PRECONFIGURED COLOR SCHEMES ---
+    const PALETTES = {
+      'Original': {
+        bg: '#080c14',
+        ocean: '#173c68',
+        landGreen: '#2e7a3a',
+        landDesert: '#cf9c63',
+        landSnow: '#eef4fb',
+        trackGold: '#d69e43',
+        trackSilver: '#829bb5',
+        baseMetal: '#1c222c',
+        baseRim: '#354050',
+        neonAmber: '#ff9d00',
+        neonCyan: '#00f0ff',
+        shipHull: '#8a2323',
+        planeBody: '#f0f4f8',
+        containers: ['#d93829', '#2f69b3', '#238636', '#e09819', '#ffffff']
+      },
+      'Monochromatic': {
+        bg: '#051224',
+        ocean: '#0d2b54',
+        landGreen: '#1b4b8a',
+        landDesert: '#3874c4',
+        landSnow: '#a8cdfc',
+        trackGold: '#58a6ff',
+        trackSilver: '#2b6cb0',
+        baseMetal: '#07152b',
+        baseRim: '#173663',
+        neonAmber: '#388bfd',
+        neonCyan: '#79c0ff',
+        shipHull: '#163b70',
+        planeBody: '#c8e1ff',
+        containers: ['#1f6feb', '#388bfd', '#58a6ff', '#79c0ff', '#a5d6ff']
+      },
+      'Analogous': {
+        bg: '#04171a',
+        ocean: '#09363d',
+        landGreen: '#0f6e56',
+        landDesert: '#1fa383',
+        landSnow: '#88e4d0',
+        trackGold: '#00d492',
+        trackSilver: '#20b2aa',
+        baseMetal: '#082124',
+        baseRim: '#14464c',
+        neonAmber: '#00f5b4',
+        neonCyan: '#00c3ff',
+        shipHull: '#0a4f48',
+        planeBody: '#d2faf0',
+        containers: ['#00e699', '#00bfa5', '#00acc1', '#26c6da', '#80deea']
+      },
+      'Complementary': {
+        bg: '#08111c',
+        ocean: '#112942',
+        landGreen: '#194973',
+        landDesert: '#cc6a14',
+        landSnow: '#ffbe76',
+        trackGold: '#ff7700',
+        trackSilver: '#3a78b5',
+        baseMetal: '#101c29',
+        baseRim: '#1f3852',
+        neonAmber: '#ff6600',
+        neonCyan: '#1e90ff',
+        shipHull: '#d35400',
+        planeBody: '#f0f3f6',
+        containers: ['#ff5722', '#1976d2', '#ff9800', '#2196f3', '#ffb74d']
+      },
+      'Split-complementary': {
+        bg: '#0a0d1b',
+        ocean: '#17203b',
+        landGreen: '#233966',
+        landDesert: '#d48817',
+        landSnow: '#d9435e',
+        trackGold: '#f59e0b',
+        trackSilver: '#ec4899',
+        baseMetal: '#12172b',
+        baseRim: '#252f52',
+        neonAmber: '#fbbf24',
+        neonCyan: '#f43f5e',
+        shipHull: '#be123c',
+        planeBody: '#ede9fe',
+        containers: ['#f59e0b', '#ec4899', '#8b5cf6', '#fb7185', '#fbbf24']
+      },
+      'Triadic': {
+        bg: '#120b15',
+        ocean: '#2b1b36',
+        landGreen: '#2a633a',
+        landDesert: '#b87c28',
+        landSnow: '#b83b5e',
+        trackGold: '#f08a18',
+        trackSilver: '#2cb67d',
+        baseMetal: '#1c1221',
+        baseRim: '#3b2545',
+        neonAmber: '#ff8906',
+        neonCyan: '#e53170',
+        shipHull: '#b83b5e',
+        planeBody: '#fffffe',
+        containers: ['#ff8906', '#e53170', '#2cb67d', '#f25f4c', '#f9bc60']
+      },
+      'Tetradic': {
+        bg: '#0d1317',
+        ocean: '#15313d',
+        landGreen: '#2e7d58',
+        landDesert: '#d97724',
+        landSnow: '#a44599',
+        trackGold: '#e67e22',
+        trackSilver: '#9b59b6',
+        baseMetal: '#152026',
+        baseRim: '#273c47',
+        neonAmber: '#f39c12',
+        neonCyan: '#16a085',
+        shipHull: '#c0392b',
+        planeBody: '#ecf0f1',
+        containers: ['#e67e22', '#9b59b6', '#1abc9c', '#e74c3c', '#3498db']
+      },
+      'Double split-complementary': {
+        bg: '#0b1318',
+        ocean: '#163342',
+        landGreen: '#237059',
+        landDesert: '#c97834',
+        landSnow: '#bf436c',
+        trackGold: '#e07a38',
+        trackSilver: '#3b9ea8',
+        baseMetal: '#122029',
+        baseRim: '#233d4d',
+        neonAmber: '#f48444',
+        neonCyan: '#2ec4b6',
+        shipHull: '#a62b51',
+        planeBody: '#eef6f7',
+        containers: ['#e07a38', '#d94178', '#3b9ea8', '#f39c12', '#9b59b6']
+      },
+      'Achromatic (black and white)': {
+        bg: '#000000',
+        ocean: '#121212',
+        landGreen: '#333333',
+        landDesert: '#666666',
+        landSnow: '#e0e0e0',
+        trackGold: '#ffffff',
+        trackSilver: '#888888',
+        baseMetal: '#0a0a0a',
+        baseRim: '#222222',
+        neonAmber: '#ffffff',
+        neonCyan: '#aaaaaa',
+        shipHull: '#444444',
+        planeBody: '#ffffff',
+        containers: ['#ffffff', '#888888', '#555555', '#cccccc', '#222222']
+      },
+      'Achromatic (white and black)': {
+        bg: '#f0f2f5',
+        ocean: '#dce1e8',
+        landGreen: '#b0b8c4',
+        landDesert: '#8b96a5',
+        landSnow: '#ffffff',
+        trackGold: '#111111',
+        trackSilver: '#444444',
+        baseMetal: '#d8dee8',
+        baseRim: '#a9b4c4',
+        neonAmber: '#000000',
+        neonCyan: '#333333',
+        shipHull: '#222222',
+        planeBody: '#111111',
+        containers: ['#000000', '#333333', '#666666', '#888888', '#aaaaaa']
+      },
+      'Achromatic + Accent (black and white + red)': {
+        bg: '#050505',
+        ocean: '#141414',
+        landGreen: '#2b2b2b',
+        landDesert: '#525252',
+        landSnow: '#d4d4d4',
+        trackGold: '#ff1744',
+        trackSilver: '#737373',
+        baseMetal: '#0f0f0f',
+        baseRim: '#262626',
+        neonAmber: '#ff1744',
+        neonCyan: '#ff5252',
+        shipHull: '#d50000',
+        planeBody: '#ffffff',
+        containers: ['#ff1744', '#ffffff', '#2b2b2b', '#ff5252', '#888888']
+      },
+      'Achromatic + Accent (white and black + red)': {
+        bg: '#f5f5f7',
+        ocean: '#e5e5ea',
+        landGreen: '#c7c7cc',
+        landDesert: '#8e8e93',
+        landSnow: '#ffffff',
+        trackGold: '#ff2d55',
+        trackSilver: '#2c2c2e',
+        baseMetal: '#d1d1d6',
+        baseRim: '#aeaeb2',
+        neonAmber: '#ff2d55',
+        neonCyan: '#ff375f',
+        shipHull: '#ff2d55',
+        planeBody: '#1c1c1e',
+        containers: ['#ff2d55', '#1c1c1e', '#8e8e93', '#d70015', '#ffffff']
+      },
+      'Neutral + accent': {
+        bg: '#141518',
+        ocean: '#1e2126',
+        landGreen: '#323740',
+        landDesert: '#505663',
+        landSnow: '#8891a0',
+        trackGold: '#d4af37',
+        trackSilver: '#687282',
+        baseMetal: '#181b20',
+        baseRim: '#2b303a',
+        neonAmber: '#e5b842',
+        neonCyan: '#f3d37e',
+        shipHull: '#b58e2a',
+        planeBody: '#e6e9ee',
+        containers: ['#d4af37', '#e6c86e', '#8891a0', '#323740', '#ffffff']
+      },
+      'Palette (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)': {
+        bg: '#220901',
+        ocean: '#3a1104',
+        landGreen: '#941b0c',
+        landDesert: '#bc3908',
+        landSnow: '#f6aa1c',
+        trackGold: '#f6aa1c',
+        trackSilver: '#bc3908',
+        baseMetal: '#2d0e04',
+        baseRim: '#521706',
+        neonAmber: '#f6aa1c',
+        neonCyan: '#ff9040',
+        shipHull: '#941b0c',
+        planeBody: '#ffedd4',
+        containers: ['#f6aa1c', '#bc3908', '#941b0c', '#e67300', '#ffd699']
+      },
+      'Palette (63D1CF, 5BC0BE, 4BAD9E, 4BAD9E, 0B132B, 000000)': {
+        bg: '#000000',
+        ocean: '#0b132b',
+        landGreen: '#23595b',
+        landDesert: '#4bad9e',
+        landSnow: '#63d1cf',
+        trackGold: '#5bc0be',
+        trackSilver: '#4bad9e',
+        baseMetal: '#080d1e',
+        baseRim: '#14234d',
+        neonAmber: '#5bc0be',
+        neonCyan: '#63d1cf',
+        shipHull: '#1c494f',
+        planeBody: '#e3faf9',
+        containers: ['#63d1cf', '#5bc0be', '#4bad9e', '#1c494f', '#a8f0ee']
+      },
+      'Palette (AA60C8, D69ADE, C9A3C6, CFB5C2, 0D001D, 120A12)': {
+        bg: '#0d001d',
+        ocean: '#1e0836',
+        landGreen: '#5b2875',
+        landDesert: '#aa60c8',
+        landSnow: '#d69ade',
+        trackGold: '#d69ade',
+        trackSilver: '#c9a3c6',
+        baseMetal: '#120a12',
+        baseRim: '#2d1430',
+        neonAmber: '#d69ade',
+        neonCyan: '#aa60c8',
+        shipHull: '#672a7d',
+        planeBody: '#faeffc',
+        containers: ['#aa60c8', '#d69ade', '#c9a3c6', '#cfb5c2', '#f0d6f5']
+      },
+      'Palette (FEF1BE, FFBA00, 008189, 00474D, 061210)': {
+        bg: '#061210',
+        ocean: '#00474d',
+        landGreen: '#00656b',
+        landDesert: '#008189',
+        landSnow: '#fef1be',
+        trackGold: '#ffba00',
+        trackSilver: '#008189',
+        baseMetal: '#0a1e1b',
+        baseRim: '#103632',
+        neonAmber: '#ffba00',
+        neonCyan: '#00b8c2',
+        shipHull: '#a67900',
+        planeBody: '#fef7dc',
+        containers: ['#fef1be', '#ffba00', '#008189', '#00474d', '#ffe082']
+      },
+      'Palette (D4FFB0, 7FFF00, 00B894, 0A3322, 05140A)': {
+        bg: '#05140a',
+        ocean: '#0a3322',
+        landGreen: '#0f5237',
+        landDesert: '#00b894',
+        landSnow: '#d4ffb0',
+        trackGold: '#7fff00',
+        trackSilver: '#00b894',
+        baseMetal: '#082114',
+        baseRim: '#14452d',
+        neonAmber: '#7fff00',
+        neonCyan: '#00e6b8',
+        shipHull: '#00876c',
+        planeBody: '#f1ffe5',
+        containers: ['#d4ffb0', '#7fff00', '#00b894', '#0a3322', '#99ff33']
+      },
+      'Palette (FFE8CC, FF8C00, C7501A, 3D1050, 0E0618)': {
+        bg: '#0e0618',
+        ocean: '#3d1050',
+        landGreen: '#6e1966',
+        landDesert: '#c7501a',
+        landSnow: '#ffe8cc',
+        trackGold: '#ff8c00',
+        trackSilver: '#c7501a',
+        baseMetal: '#1c0926',
+        baseRim: '#451859',
+        neonAmber: '#ff8c00',
+        neonCyan: '#e040fb',
+        shipHull: '#9e3407',
+        planeBody: '#fff2e0',
+        containers: ['#ffe8cc', '#ff8c00', '#c7501a', '#e040fb', '#ffb866']
+      },
+      'Palette (E8E0FF, B38FFF, 6A3DE8, 1A1250, 090612)': {
+        bg: '#090612',
+        ocean: '#1a1250',
+        landGreen: '#3b248a',
+        landDesert: '#6a3de8',
+        landSnow: '#e8e0ff',
+        trackGold: '#b38fff',
+        trackSilver: '#6a3de8',
+        baseMetal: '#130c26',
+        baseRim: '#271c54',
+        neonAmber: '#b38fff',
+        neonCyan: '#8a62ff',
+        shipHull: '#5127bf',
+        planeBody: '#f5f0ff',
+        containers: ['#e8e0ff', '#b38fff', '#6a3de8', '#9966ff', '#ffffff']
+      },
+      'Palette (E0FBFF, 00F0FF, D40078, 1E0A3D, 05020F)': {
+        bg: '#05020f',
+        ocean: '#1e0a3d',
+        landGreen: '#521066',
+        landDesert: '#d40078',
+        landSnow: '#e0fbff',
+        trackGold: '#00f0ff',
+        trackSilver: '#d40078',
+        baseMetal: '#100524',
+        baseRim: '#2b0e4d',
+        neonAmber: '#d40078',
+        neonCyan: '#00f0ff',
+        shipHull: '#a3005c',
+        planeBody: '#f0fdff',
+        containers: ['#e0fbff', '#00f0ff', '#d40078', '#ff3399', '#33f3ff']
+      }
+    };
+
+    // --- APPLICATION PARAMETERS ---
+    const params = {
+      theme: 'Original',
+      greenScreen: false,
+      bgColor: PALETTES['Original'].bg,
+      oceanColor: PALETTES['Original'].ocean,
+      landGreenColor: PALETTES['Original'].landGreen,
+      landDesertColor: PALETTES['Original'].landDesert,
+      landSnowColor: PALETTES['Original'].landSnow,
+      trackGoldColor: PALETTES['Original'].trackGold,
+      trackSilverColor: PALETTES['Original'].trackSilver,
+      baseMetalColor: PALETTES['Original'].baseMetal,
+      neonAmberColor: PALETTES['Original'].neonAmber,
+      neonCyanColor: PALETTES['Original'].neonCyan,
+
+      animationMode: 'Gentle Slow Orbit',
+      animSpeed: 1.0,
+      autoOrbitSpeed: 0.35,
+
+      toneMappingExposure: 1.15,
+      ambientIntensity: 0.7,
+      ambientColor: '#ffffff',
+      keyLightIntensity: 2.5,
+      keyLightColor: '#fff5e6',
+      fillLightIntensity: 1.2,
+      fillLightColor: '#8ec5fc',
+      rimLightIntensity: 1.8,
+      rimLightColor: '#00f0ff',
+      baseLightIntensity: 2.4,
+      baseLightColor: '#ff9800',
+
+      pixelRatio: Math.min(window.devicePixelRatio, 2.0),
+      antialias: true,
+      atmosphereDome: true,
+      starDensity: 1200,
+
+      clickToRandomize: true
+    };
+
+    const ANIMATION_OPTIONS = [
+      'Static View (No Camera Movement)',
+      'Gentle Slow Orbit',
+      'Cinematic Logistics Survey',
+      'Northern Shipping Arcs',
+      'Close-Up Route Inspection',
+      'Dynamic Figure-8 Drift',
+      'Ascending Orbital Spiral',
+      'Equatorial Cargo Highway'
+    ];
+
+    // --- SETUP SCENE, RENDERER, CAMERA ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(params.bgColor);
+
+    let renderer = new THREE.WebGLRenderer({
+      antialias: params.antialias,
+      powerPreference: 'high-performance',
+      alpha: true
+    });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(params.pixelRatio);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = params.toneMappingExposure;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    const GLOBE_RADIUS = 3.25;
+    const GLOBE_CENTER_Y = 1.35;
+    const globeCenter = new THREE.Vector3(0, GLOBE_CENTER_Y, 0);
+
+    const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 3.2, 12.6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controls.enableRotate = true;
+    controls.target.set(0, GLOBE_CENTER_Y, 0);
+    controls.minDistance = 4.5;
+    controls.maxDistance = 35.0;
+
+    // --- INITIALIZE POST PROCESSOR SUITE ---
+    let postProcessor = new PostProcessor(renderer, {
+      enabled: true,
+      antialias: params.antialias,
+      bloomEnabled: true,
+      bloomStrength: 1.15,
+      bloomRadius: 0.5,
+      bloomThreshold: 0.18,
+      anamorphicEnabled: false, // Default is OFF
+      chromaticAberration: 0.006,
+      vignetteBoost: 1.05,
+      vignetteReduction: 0.45,
+      noiseIntensity: 0.008,
+      exposure: 1.0,
+    });
+
+    // --- LIGHTING SETUP ---
+    const ambientLight = new THREE.AmbientLight(params.ambientColor, params.ambientIntensity);
+    scene.add(ambientLight);
+
+    const keyLight = new THREE.DirectionalLight(params.keyLightColor, params.keyLightIntensity);
+    keyLight.position.set(12, 15, 14);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.width = 2048;
+    keyLight.shadow.mapSize.height = 2048;
+    keyLight.shadow.camera.near = 2;
+    keyLight.shadow.camera.far = 40;
+    const d = 8;
+    keyLight.shadow.camera.left = -d;
+    keyLight.shadow.camera.right = d;
+    keyLight.shadow.camera.top = d;
+    keyLight.shadow.camera.bottom = -d;
+    keyLight.shadow.bias = -0.0005;
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(params.fillLightColor, params.fillLightIntensity);
+    fillLight.position.set(-14, 6, -10);
+    scene.add(fillLight);
+
+    const rimLight = new THREE.DirectionalLight(params.rimLightColor, params.rimLightIntensity);
+    rimLight.position.set(0, 10, -15);
+    scene.add(rimLight);
+
+    const basePointLight = new THREE.PointLight(params.baseLightColor, params.baseLightIntensity, 12);
+    basePointLight.position.set(0, 0.2, 0);
+    scene.add(basePointLight);
+
+    // --- ACCURATE CONTINENTS RASTERIZER ---
+    const mapCanvas = document.createElement('canvas');
+    mapCanvas.width = 720;
+    mapCanvas.height = 360;
+    const ctx = mapCanvas.getContext('2d', { willReadFrequently: true });
+
+    function drawWorldMap() {
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, mapCanvas.width, mapCanvas.height);
+      ctx.fillStyle = '#ffffff';
+
+      function poly(pts) {
+        ctx.beginPath();
+        for (let i = 0; i < pts.length; i += 2) {
+          const x = ((pts[i] + 180) / 360) * mapCanvas.width;
+          const y = ((90 - pts[i + 1]) / 180) * mapCanvas.height;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // North America
+      poly([
+        -168, 65, -162, 71, -140, 70, -130, 70, -95, 74, -80, 68, -60, 60,
+        -55, 50, -64, 45, -75, 38, -80, 26, -97, 18, -104, 22, -118, 33,
+        -125, 48, -138, 58, -162, 59, -168, 65
+      ]);
+      // Central America
+      poly([-97, 18, -88, 15, -83, 9, -77, 8, -84, 10, -92, 16]);
+
+      // Greenland
+      poly([-54, 60, -42, 60, -18, 76, -24, 83, -50, 83, -70, 77, -54, 60]);
+
+      // South America
+      poly([
+        -77, 12, -62, 10, -50, -1, -35, -5, -38, -18, -48, -28, -55, -38,
+        -68, -55, -75, -50, -72, -35, -80, -8, -77, 12
+      ]);
+
+      // Europe & Scandinavia
+      poly([
+        -9, 36, 0, 43, -4, 48, 4, 52, 12, 54, 16, 56, 12, 62, 18, 66,
+        28, 71, 16, 71, 8, 62, 4, 58, -5, 58, -5, 49, -9, 43, -9, 36
+      ]);
+      // British Isles
+      poly([-10, 50, -3, 50, 0, 58, -6, 58, -10, 50]);
+
+      // Africa
+      poly([
+        -17, 32, -9, 36, 11, 37, 26, 32, 34, 31, 41, 23, 51, 12, 45, 0,
+        40, -12, 35, -25, 27, -34, 18, -34, 12, -18, 8, 4, 1, 6, -14, 12,
+        -17, 21, -17, 32
+      ]);
+      // Madagascar
+      poly([44, -12, 50, -14, 48, -25, 44, -25]);
+
+      // Asia
+      poly([
+        34, 31, 40, 40, 50, 45, 60, 56, 70, 72, 100, 77, 132, 72, 170, 68,
+        180, 65, 170, 60, 142, 52, 130, 42, 122, 32, 110, 22, 105, 10,
+        98, 8, 90, 22, 80, 28, 72, 20, 68, 24, 60, 25, 54, 25, 45, 28, 34, 31
+      ]);
+      // India
+      poly([70, 22, 80, 28, 88, 22, 82, 8, 76, 8, 70, 22]);
+      // Japan
+      poly([130, 32, 142, 44, 145, 40, 135, 30]);
+
+      // Australia
+      poly([
+        114, -22, 125, -15, 136, -12, 142, -10, 152, -24, 150, -36, 140, -38,
+        130, -32, 116, -34, 114, -22
+      ]);
+      // New Zealand
+      poly([168, -46, 174, -40, 178, -37, 172, -44]);
+
+      // Antarctica
+      poly([-180, -72, 180, -72, 180, -90, -180, -90]);
+    }
+    drawWorldMap();
+    const mapImgData = ctx.getImageData(0, 0, mapCanvas.width, mapCanvas.height);
+
+    function isLandCoordinate(lat, lon) {
+      let x = Math.floor(((lon + 180) / 360) * mapCanvas.width);
+      let y = Math.floor(((90 - lat) / 180) * mapCanvas.height);
+      x = Math.max(0, Math.min(mapCanvas.width - 1, x));
+      y = Math.max(0, Math.min(mapCanvas.height - 1, y));
+      const idx = (y * mapCanvas.width + x) * 4;
+      return mapImgData.data[idx] > 120;
+    }
+
+    // --- SEAMLESS LOW-POLY GLOBE ---
+    const globeGroup = new THREE.Group();
+    globeGroup.position.copy(globeCenter);
+    scene.add(globeGroup);
+
+    let globeMesh;
+    let baseGlobeGeom;
+
+    function buildGlobe() {
+      if (globeMesh) {
+        globeGroup.remove(globeMesh);
+        globeMesh.geometry.dispose();
+      }
+
+      baseGlobeGeom = new THREE.IcosahedronGeometry(GLOBE_RADIUS, 4);
+      baseGlobeGeom = baseGlobeGeom.toNonIndexed();
+
+      const pos = baseGlobeGeom.attributes.position;
+      const count = pos.count;
+      const colors = new Float32Array(count * 3);
+
+      const vA = new THREE.Vector3();
+      const vB = new THREE.Vector3();
+      const vC = new THREE.Vector3();
+      const centroid = new THREE.Vector3();
+
+      const oceanCol = new THREE.Color(params.oceanColor);
+      const landGreenCol = new THREE.Color(params.landGreenColor);
+      const landDesertCol = new THREE.Color(params.landDesertColor);
+      const landSnowCol = new THREE.Color(params.landSnowColor);
+
+      for (let i = 0; i < count; i += 3) {
+        vA.fromBufferAttribute(pos, i);
+        vB.fromBufferAttribute(pos, i + 1);
+        vC.fromBufferAttribute(pos, i + 2);
+
+        centroid.copy(vA).add(vB).add(vC).divideScalar(3);
+        const r = centroid.length();
+
+        const lat = Math.asin(centroid.y / r) * (180 / Math.PI);
+        const lon = Math.atan2(centroid.x, centroid.z) * (180 / Math.PI);
+
+        const isLand = isLandCoordinate(lat, lon);
+        let faceColor = new THREE.Color();
+        const facetJitter = (Math.sin(i * 12.9898 + lat * 7.12) * 0.5 + 0.5) * 0.1 - 0.05;
+
+        if (isLand) {
+          if (lat > 62 || lat < -62 || (lat > 56 && lon < -20 && lon > -58)) {
+            faceColor.copy(landSnowCol);
+          } else if ((lat > 14 && lat < 33 && lon > -18 && lon < 56) ||
+                     (lat > -34 && lat < -18 && lon > 115 && lon < 142)) {
+            faceColor.copy(landDesertCol);
+          } else {
+            faceColor.copy(landGreenCol);
+          }
+        } else {
+          faceColor.copy(oceanCol);
+        }
+
+        faceColor.offsetHSL(0, 0, facetJitter);
+
+        for (let j = 0; j < 3; j++) {
+          colors[(i + j) * 3] = faceColor.r;
+          colors[(i + j) * 3 + 1] = faceColor.g;
+          colors[(i + j) * 3 + 2] = faceColor.b;
+        }
+      }
+
+      baseGlobeGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      baseGlobeGeom.computeVertexNormals();
+
+      const globeMat = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        flatShading: true,
+        roughness: 0.72,
+        metalness: 0.16
+      });
+
+      globeMesh = new THREE.Mesh(baseGlobeGeom, globeMat);
+      globeMesh.castShadow = true;
+      globeMesh.receiveShadow = true;
+      globeGroup.add(globeMesh);
+    }
+    buildGlobe();
+
+    // Atmosphere protective glass shell
+    const atmoGeom = new THREE.SphereGeometry(GLOBE_RADIUS * 1.15, 48, 36);
+    const atmoMat = new THREE.MeshPhysicalMaterial({
+      color: 0x8cd6ff,
+      transparent: true,
+      opacity: 0.09,
+      roughness: 0.1,
+      metalness: 0.9,
+      transmission: 0.65,
+      ior: 1.2,
+      depthWrite: false
+    });
+    const atmoMesh = new THREE.Mesh(atmoGeom, atmoMat);
+    globeGroup.add(atmoMesh);
+
+    // --- COMMAND PEDESTAL BASE ---
+    const baseGroup = new THREE.Group();
+    scene.add(baseGroup);
+
+    function buildPedestal() {
+      while (baseGroup.children.length > 0) {
+        const obj = baseGroup.children[0];
+        baseGroup.remove(obj);
+        if (obj.geometry) obj.geometry.dispose();
+      }
+
+      const metalMat = new THREE.MeshStandardMaterial({
+        color: params.baseMetalColor,
+        roughness: 0.32,
+        metalness: 0.88
+      });
+
+      const rimMat = new THREE.MeshStandardMaterial({
+        color: PALETTES[params.theme] ? PALETTES[params.theme].baseRim : '#354050',
+        roughness: 0.42,
+        metalness: 0.76
+      });
+
+      const neonAmberMat = new THREE.MeshBasicMaterial({ color: params.neonAmberColor });
+      const neonCyanMat = new THREE.MeshBasicMaterial({ color: params.neonCyanColor });
+
+      const plinthGeom = new THREE.CylinderGeometry(5.8, 6.2, 0.35, 64);
+      const plinth = new THREE.Mesh(plinthGeom, metalMat);
+      plinth.position.y = -1.2;
+      plinth.receiveShadow = true;
+      baseGroup.add(plinth);
+
+      const tier1Geom = new THREE.CylinderGeometry(5.2, 5.7, 0.3, 64);
+      const tier1 = new THREE.Mesh(tier1Geom, rimMat);
+      tier1.position.y = -0.92;
+      tier1.receiveShadow = true;
+      baseGroup.add(tier1);
+
+      const neonRingOuterGeom = new THREE.TorusGeometry(5.05, 0.042, 16, 100);
+      neonRingOuterGeom.rotateX(Math.PI / 2);
+      const neonOuter = new THREE.Mesh(neonRingOuterGeom, neonCyanMat);
+      neonOuter.position.y = -0.76;
+      baseGroup.add(neonOuter);
+
+      const midDeckGeom = new THREE.CylinderGeometry(4.6, 5.0, 0.28, 64);
+      const midDeck = new THREE.Mesh(midDeckGeom, metalMat);
+      midDeck.position.y = -0.66;
+      midDeck.receiveShadow = true;
+      baseGroup.add(midDeck);
+
+      const neonRingInnerGeom = new THREE.TorusGeometry(3.95, 0.048, 16, 100);
+      neonRingInnerGeom.rotateX(Math.PI / 2);
+      const neonInner = new THREE.Mesh(neonRingInnerGeom, neonAmberMat);
+      neonInner.position.y = -0.51;
+      baseGroup.add(neonInner);
+
+      const cradleGeom = new THREE.CylinderGeometry(3.35, 3.85, 0.35, 64, 1, true);
+      const cradle = new THREE.Mesh(cradleGeom, rimMat);
+      cradle.position.y = -0.32;
+      baseGroup.add(cradle);
+
+      const panelAngles = [-Math.PI * 0.34, -Math.PI * 0.12, Math.PI * 0.12, Math.PI * 0.34];
+      panelAngles.forEach((ang) => {
+        const panelGroup = new THREE.Group();
+        panelGroup.position.set(Math.sin(ang) * 5.4, -0.82, Math.cos(ang) * 5.4);
+        panelGroup.rotation.y = ang;
+
+        const mountGeom = new THREE.BoxGeometry(1.4, 0.18, 0.45);
+        const mount = new THREE.Mesh(mountGeom, rimMat);
+        mount.rotation.x = -Math.PI * 0.18;
+        panelGroup.add(mount);
+
+        const screenGeom = new THREE.PlaneGeometry(1.25, 0.3);
+        const screenMat = new THREE.MeshBasicMaterial({ color: 0x122538 });
+        const screen = new THREE.Mesh(screenGeom, screenMat);
+        screen.position.set(0, 0.04, 0.24);
+        screen.rotation.x = -Math.PI * 0.18;
+        panelGroup.add(screen);
+
+        baseGroup.add(panelGroup);
+      });
+    }
+    buildPedestal();
+
+    // --- REFINED 3D DUAL-RAIL TRUSS TRACKS (NO OVERHANGS, NO SAW-TEETH) ---
+    const tracksGroup = new THREE.Group();
+    scene.add(tracksGroup);
+
+    const trackGoldMat = new THREE.MeshStandardMaterial({
+      color: params.trackGoldColor,
+      roughness: 0.28,
+      metalness: 0.92
+    });
+    const trackSilverMat = new THREE.MeshStandardMaterial({
+      color: params.trackSilverColor,
+      roughness: 0.32,
+      metalness: 0.88
+    });
+
+    function createOrbitCurve(radius, euler, waveAmp = 0.18, waveFreq = 2) {
+      const pts = [];
+      const steps = 96;
+      const rotMat = new THREE.Matrix4().makeRotationFromEuler(euler);
+
+      for (let i = 0; i <= steps; i++) {
+        const theta = (i / steps) * Math.PI * 2;
+        let x = Math.cos(theta) * radius;
+        let z = Math.sin(theta) * radius;
+        let y = Math.sin(theta * waveFreq) * waveAmp;
+
+        const p = new THREE.Vector3(x, y, z);
+        p.applyMatrix4(rotMat);
+        p.add(globeCenter);
+        pts.push(p);
+      }
+      return new THREE.CatmullRomCurve3(pts, true);
+    }
+
+    // 2 Primary elevated sky-freight tracks looping cleanly around the globe
+    const curveGold = createOrbitCurve(4.25, new THREE.Euler(0.24, 0.36, 0.12), 0.2, 2);
+    const curveSilver = createOrbitCurve(4.58, new THREE.Euler(-0.28, -0.42, 0.16), 0.22, 2);
+
+    // Dedicated high-altitude aerial flight routes for airplanes
+    const curveFlight1 = createOrbitCurve(5.1, new THREE.Euler(0.55, 0.72, -0.2), 0.28, 3);
+    const curveFlight2 = createOrbitCurve(5.3, new THREE.Euler(-0.48, 0.85, 0.35), 0.24, 2);
+
+    function buildTrussTrack(curve, trackMat, railSpacing = 0.32, tubeRadius = 0.024) {
+      const group = new THREE.Group();
+      const samples = 180;
+      const leftPts = [];
+      const rightPts = [];
+
+      for (let i = 0; i <= samples; i++) {
+        const u = i / samples;
+        const pt = curve.getPointAt(u);
+        const tangent = curve.getTangentAt(u).normalize();
+        
+        const up = pt.clone().sub(globeCenter).normalize();
+        const right = new THREE.Vector3().crossVectors(up, tangent).normalize();
+
+        leftPts.push(pt.clone().addScaledVector(right, -railSpacing * 0.5));
+        rightPts.push(pt.clone().addScaledVector(right, railSpacing * 0.5));
+      }
+
+      const leftCurve = new THREE.CatmullRomCurve3(leftPts, true);
+      const rightCurve = new THREE.CatmullRomCurve3(rightPts, true);
+
+      // 1. Twin continuous tubular rails
+      const railGeomL = new THREE.TubeGeometry(leftCurve, 160, tubeRadius, 8, true);
+      const railGeomR = new THREE.TubeGeometry(rightCurve, 160, tubeRadius, 8, true);
+      const meshL = new THREE.Mesh(railGeomL, trackMat);
+      const meshR = new THREE.Mesh(railGeomR, trackMat);
+      meshL.castShadow = true;
+      meshR.castShadow = true;
+      group.add(meshL);
+      group.add(meshR);
+
+      // 2. Mathematically Exact Cross-Ties (Connecting Left to Right with ZERO overhang)
+      const tiesCount = 90;
+      const unitCylinder = new THREE.CylinderGeometry(0.014, 0.014, 1.0, 6);
+      const tiesInst = new THREE.InstancedMesh(unitCylinder, trackMat, tiesCount);
+      const diagInst = new THREE.InstancedMesh(unitCylinder, trackMat, tiesCount);
+
+      const dummy = new THREE.Object3D();
+      const yUp = new THREE.Vector3(0, 1, 0);
+
+      for (let i = 0; i < tiesCount; i++) {
+        const u = i / tiesCount;
+        const pL = leftCurve.getPointAt(u);
+        const pR = rightCurve.getPointAt(u);
+
+        // A. Cross tie bar
+        const mid = pL.clone().add(pR).multiplyScalar(0.5);
+        const dir = pR.clone().sub(pL);
+        const len = dir.length();
+        dir.normalize();
+
+        dummy.position.copy(mid);
+        dummy.quaternion.setFromUnitVectors(yUp, dir);
+        dummy.scale.set(1, len, 1);
+        dummy.updateMatrix();
+        tiesInst.setMatrixAt(i, dummy.matrix);
+
+        // B. Diagonal truss strut (clean zigzag lattice)
+        const nextU = ((i + 1) % tiesCount) / tiesCount;
+        const nextPR = rightCurve.getPointAt(nextU);
+        const diagMid = pL.clone().add(nextPR).multiplyScalar(0.5);
+        const diagDir = nextPR.clone().sub(pL);
+        const diagLen = diagDir.length();
+        diagDir.normalize();
+
+        dummy.position.copy(diagMid);
+        dummy.quaternion.setFromUnitVectors(yUp, diagDir);
+        dummy.scale.set(1, diagLen, 1);
+        dummy.updateMatrix();
+        diagInst.setMatrixAt(i, dummy.matrix);
+      }
+
+      tiesInst.instanceMatrix.needsUpdate = true;
+      diagInst.instanceMatrix.needsUpdate = true;
+      group.add(tiesInst);
+      group.add(diagInst);
+
+      return { group, curve, leftCurve, rightCurve };
+    }
+
+    const track1 = buildTrussTrack(curveGold, trackGoldMat, 0.32, 0.026);
+    const track2 = buildTrussTrack(curveSilver, trackSilverMat, 0.3, 0.024);
+
+    tracksGroup.add(track1.group);
+    tracksGroup.add(track2.group);
+
+    // Glowing parabolic trade route arcs
+    const arcsGroup = new THREE.Group();
+    scene.add(arcsGroup);
+
+    function createSurfaceArc(p1, p2, peakHeight = 1.3) {
+      const mid = p1.clone().add(p2).multiplyScalar(0.5);
+      const normal = mid.clone().sub(globeCenter).normalize();
+      mid.addScaledVector(normal, peakHeight);
+      const arcCurve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
+      const arcGeom = new THREE.TubeGeometry(arcCurve, 40, 0.016, 5, false);
+      const arcMat = new THREE.MeshBasicMaterial({
+        color: params.neonCyanColor,
+        transparent: true,
+        opacity: 0.75
+      });
+      return new THREE.Mesh(arcGeom, arcMat);
+    }
+
+    function latLonToVec3(lat, lon, r = GLOBE_RADIUS * 1.01) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      return new THREE.Vector3(
+        -r * Math.sin(phi) * Math.cos(theta),
+        r * Math.cos(phi) + GLOBE_CENTER_Y,
+        r * Math.sin(phi) * Math.sin(theta)
+      );
+    }
+
+    const hubs = [
+      latLonToVec3(40.7, -74.0), // New York
+      latLonToVec3(51.5, 0.0),   // Rotterdam / London
+      latLonToVec3(31.2, 121.5), // Shanghai
+      latLonToVec3(34.0, -118.2),// Los Angeles
+      latLonToVec3(25.2, 55.3),  // Dubai
+      latLonToVec3(1.3, 103.8),  // Singapore
+      latLonToVec3(35.6, 139.7), // Tokyo
+      latLonToVec3(-23.5, -46.6) // Santos / Brazil
+    ];
+
+    const hubArcs = [
+      createSurfaceArc(hubs[0], hubs[1], 1.15),
+      createSurfaceArc(hubs[2], hubs[3], 1.45),
+      createSurfaceArc(hubs[1], hubs[4], 1.05),
+      createSurfaceArc(hubs[4], hubs[5], 1.1),
+      createSurfaceArc(hubs[5], hubs[6], 0.95),
+      createSurfaceArc(hubs[0], hubs[7], 1.25)
+    ];
+    hubArcs.forEach(a => arcsGroup.add(a));
+
+    // --- REFINED VEHICLES: SHIPS, TRAINS & PLANES ---
+    const vehiclesGroup = new THREE.Group();
+    scene.add(vehiclesGroup);
+
+    // 1. Proportional Low-Poly Cargo Container Ship
+    function createContainerShip(colorTheme) {
+      const ship = new THREE.Group();
+
+      const hullBottomMat = new THREE.MeshStandardMaterial({
+        color: colorTheme.shipHull,
+        roughness: 0.35,
+        metalness: 0.4
+      });
+      const hullTopMat = new THREE.MeshStandardMaterial({
+        color: 0x22262e,
+        roughness: 0.4,
+        metalness: 0.6
+      });
+
+      // Lower Hull (boot-topping)
+      const hullBottom = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.08, 0.72), hullBottomMat);
+      hullBottom.position.y = 0.04;
+      hullBottom.castShadow = true;
+      ship.add(hullBottom);
+
+      // Upper Hull
+      const hullTop = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.08, 0.74), hullTopMat);
+      hullTop.position.y = 0.11;
+      hullTop.castShadow = true;
+      ship.add(hullTop);
+
+      // Pointed Bow
+      const bowGeom = new THREE.ConeGeometry(0.125, 0.22, 4);
+      bowGeom.rotateX(Math.PI / 2);
+      bowGeom.rotateZ(Math.PI / 4);
+      const bow = new THREE.Mesh(bowGeom, hullTopMat);
+      bow.position.set(0, 0.09, 0.44);
+      bow.scale.set(1, 0.8, 1);
+      ship.add(bow);
+
+      // Stern Superstructure / Navigation Bridge
+      const bridgeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
+      const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.19, 0.18, 0.14), bridgeMat);
+      bridge.position.set(0, 0.22, -0.24);
+      bridge.castShadow = true;
+      ship.add(bridge);
+
+      // Radar Mast
+      const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.12), bridgeMat);
+      mast.position.set(0, 0.34, -0.24);
+      ship.add(mast);
+
+      // Stacks of Shipping Containers
+      const cColors = colorTheme.containers;
+      const stackRows = 3;
+      const stackCols = 2;
+      for (let r = 0; r < stackRows; r++) {
+        for (let c = 0; c < stackCols; c++) {
+          const colHex = cColors[(r * stackCols + c) % cColors.length];
+          const cMat = new THREE.MeshStandardMaterial({ color: colHex, roughness: 0.5 });
+          const cBox = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.08, 0.16), cMat);
+          cBox.position.set(
+            (c - 0.5) * 0.1,
+            0.18 + (r % 2) * 0.075,
+            0.15 + (r - 1) * 0.17
+          );
+          cBox.castShadow = true;
+          ship.add(cBox);
+        }
+      }
+      return ship;
+    }
+
+    // 2. Articulated Cargo Freight Train (Locomotive + Connected Carriages)
+    function buildArticulatedTrain(colorTheme, carCount = 4) {
+      const trainCars = [];
+
+      // Locomotive
+      const loco = new THREE.Group();
+      const locoMat = new THREE.MeshStandardMaterial({
+        color: colorTheme.neonAmber,
+        roughness: 0.25,
+        metalness: 0.85
+      });
+      const windshieldMat = new THREE.MeshBasicMaterial({ color: 0x112233 });
+
+      const cab = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.13, 0.32), locoMat);
+      cab.position.y = 0.065;
+      cab.castShadow = true;
+      loco.add(cab);
+
+      // Slanted Aerodynamic Nose
+      const noseGeom = new THREE.BoxGeometry(0.17, 0.11, 0.12);
+      noseGeom.rotateX(-Math.PI * 0.12);
+      const nose = new THREE.Mesh(noseGeom, locoMat);
+      nose.position.set(0, 0.05, 0.18);
+      loco.add(nose);
+
+      // Headlight
+      const light = new THREE.Mesh(new THREE.SphereGeometry(0.02, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+      light.position.set(0, 0.06, 0.23);
+      loco.add(light);
+
+      vehiclesGroup.add(loco);
+      trainCars.push(loco);
+
+      // Connected Carriages
+      const cColors = colorTheme.containers;
+      for (let i = 0; i < carCount; i++) {
+        const car = new THREE.Group();
+        const chassisMat = new THREE.MeshStandardMaterial({ color: 0x22252a, roughness: 0.6, metalness: 0.8 });
+        const chassis = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.04, 0.28), chassisMat);
+        chassis.position.y = 0.02;
+        car.add(chassis);
+
+        const cMat = new THREE.MeshStandardMaterial({ color: cColors[i % cColors.length], roughness: 0.45 });
+        const cBox = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.11, 0.26), cMat);
+        cBox.position.y = 0.095;
+        cBox.castShadow = true;
+        car.add(cBox);
+
+        vehiclesGroup.add(car);
+        trainCars.push(car);
+      }
+      return trainCars;
+    }
+
+    // 3. Realistic Air-Freight Commercial Cargo Jet
+    function createCargoPlane(colorTheme) {
+      const plane = new THREE.Group();
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: colorTheme.planeBody,
+        roughness: 0.28,
+        metalness: 0.45
+      });
+      const wingMat = new THREE.MeshStandardMaterial({
+        color: colorTheme.trackSilver,
+        roughness: 0.35,
+        metalness: 0.65
+      });
+      const contrailMat = new THREE.MeshBasicMaterial({
+        color: 0x88e5ff,
+        transparent: true,
+        opacity: 0.6
+      });
+
+      // Streamlined Fuselage
+      const fuselageGeom = new THREE.CylinderGeometry(0.055, 0.04, 0.68, 12);
+      fuselageGeom.rotateX(Math.PI / 2);
+      const fuselage = new THREE.Mesh(fuselageGeom, bodyMat);
+      fuselage.castShadow = true;
+      plane.add(fuselage);
+
+      // Cockpit Window Visor
+      const visor = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.02, 0.06), new THREE.MeshBasicMaterial({ color: 0x111d2e }));
+      visor.position.set(0, 0.035, 0.22);
+      plane.add(visor);
+
+      // Swept Wings with Dihedral
+      const wingGeom = new THREE.BoxGeometry(0.82, 0.015, 0.16);
+      const wings = new THREE.Mesh(wingGeom, wingMat);
+      wings.position.set(0, 0.01, 0.04);
+      wings.castShadow = true;
+      plane.add(wings);
+
+      // Winglet Tips
+      const wL = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.06, 0.05), wingMat);
+      wL.position.set(-0.41, 0.03, 0.04);
+      const wR = wL.clone();
+      wR.position.x = 0.41;
+      plane.add(wL);
+      plane.add(wR);
+
+      // Vertical Tail Fin
+      const tailFin = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.16, 0.12), wingMat);
+      tailFin.position.set(0, 0.09, -0.28);
+      plane.add(tailFin);
+
+      // Horizontal Stabilizers
+      const hStab = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.012, 0.08), wingMat);
+      hStab.position.set(0, 0.03, -0.3);
+      plane.add(hStab);
+
+      // Under-Wing Twin Turbofan Jet Engines
+      const engineGeom = new THREE.CylinderGeometry(0.028, 0.028, 0.14, 8);
+      engineGeom.rotateX(Math.PI / 2);
+      const engL = new THREE.Mesh(engineGeom, wingMat);
+      engL.position.set(-0.16, -0.04, 0.06);
+      const engR = engL.clone();
+      engR.position.x = 0.16;
+      plane.add(engL);
+      plane.add(engR);
+
+      // Glowing Engine Contrails
+      const contrailGeom = new THREE.CylinderGeometry(0.008, 0.003, 0.45, 6);
+      contrailGeom.rotateX(Math.PI / 2);
+      const cL = new THREE.Mesh(contrailGeom, contrailMat);
+      cL.position.set(-0.16, -0.04, -0.24);
+      const cR = cL.clone();
+      cR.position.x = 0.16;
+      plane.add(cL);
+      plane.add(cR);
+
+      return plane;
+    }
+
+    // Dynamic fleets
+    const trains = [];
+    const singleVehicles = [];
+
+    function populateFleet() {
+      while (vehiclesGroup.children.length > 0) {
+        const v = vehiclesGroup.children[0];
+        vehiclesGroup.remove(v);
+      }
+      trains.length = 0;
+      singleVehicles.length = 0;
+
+      const activeTheme = PALETTES[params.theme] || PALETTES['Original'];
+
+      // Train 1 on Track 1 (Gold)
+      const trainCars1 = buildArticulatedTrain(activeTheme, 4);
+      trains.push({ cars: trainCars1, curve: track1.curve, progress: 0.12, speed: 0.038, carSpacing: 0.025 });
+
+      // Train 2 on Track 2 (Silver)
+      const trainCars2 = buildArticulatedTrain(activeTheme, 4);
+      trains.push({ cars: trainCars2, curve: track2.curve, progress: 0.58, speed: 0.034, carSpacing: 0.025 });
+
+      // Container Ship on Track 1 (Gold Skyway)
+      const ship1 = createContainerShip(activeTheme);
+      vehiclesGroup.add(ship1);
+      singleVehicles.push({ mesh: ship1, curve: track1.curve, progress: 0.68, speed: 0.03, lift: 0.06 });
+
+      // Container Ship on Track 2 (Silver Skyway)
+      const ship2 = createContainerShip(activeTheme);
+      vehiclesGroup.add(ship2);
+      singleVehicles.push({ mesh: ship2, curve: track2.curve, progress: 0.22, speed: 0.028, lift: 0.06 });
+
+      // High-Altitude Cargo Plane 1
+      const plane1 = createCargoPlane(activeTheme);
+      vehiclesGroup.add(plane1);
+      singleVehicles.push({ mesh: plane1, curve: curveFlight1, progress: 0.05, speed: 0.058, lift: 0.0 });
+
+      // High-Altitude Cargo Plane 2
+      const plane2 = createCargoPlane(activeTheme);
+      vehiclesGroup.add(plane2);
+      singleVehicles.push({ mesh: plane2, curve: curveFlight2, progress: 0.52, speed: 0.054, lift: 0.0 });
+    }
+    populateFleet();
+
+    // --- STARFIELD ---
+    let stars;
+    function buildStarfield() {
+      if (stars) {
+        scene.remove(stars);
+        stars.geometry.dispose();
+        stars.material.dispose();
+      }
+      const starCount = params.starDensity;
+      const starGeom = new THREE.BufferGeometry();
+      const starPos = new Float32Array(starCount * 3);
+      const starCols = new Float32Array(starCount * 3);
+
+      for (let i = 0; i < starCount; i++) {
+        const rad = 25 + Math.random() * 35;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(Math.random() * 2 - 1);
+
+        starPos[i * 3] = rad * Math.sin(phi) * Math.cos(theta);
+        starPos[i * 3 + 1] = rad * Math.cos(phi);
+        starPos[i * 3 + 2] = rad * Math.sin(phi) * Math.sin(theta);
+
+        const brightness = 0.5 + Math.random() * 0.5;
+        starCols[i * 3] = brightness * 0.85;
+        starCols[i * 3 + 1] = brightness * 0.95;
+        starCols[i * 3 + 2] = brightness;
+      }
+      starGeom.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+      starGeom.setAttribute('color', new THREE.BufferAttribute(starCols, 3));
+
+      const starMat = new THREE.PointsMaterial({
+        size: 0.12,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.85
+      });
+      stars = new THREE.Points(starGeom, starMat);
+      scene.add(stars);
+    }
+    buildStarfield();
+
+    // --- CAMERA ANIMATIONS ENGINE (RESPECTS USER ZOOM & ANGLES) ---
+    let animClock = 0;
+
+    function updateCamera(delta) {
+      if (params.animationMode === 'Static View (No Camera Movement)') {
+        return;
+      }
+
+      const speedFactor = params.animSpeed * params.autoOrbitSpeed;
+      const dt = delta * speedFactor;
+      animClock += dt;
+
+      const currentDist = camera.position.distanceTo(controls.target);
+      const offset = camera.position.clone().sub(controls.target);
+
+      if (params.animationMode === 'Gentle Slow Orbit') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.4);
+        camera.position.copy(controls.target).add(offset);
+      }
+      else if (params.animationMode === 'Cinematic Logistics Survey') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.35);
+        const pitchDelta = Math.sin(animClock * 0.8) * 0.003;
+        offset.y += pitchDelta * currentDist;
+        camera.position.copy(controls.target).add(offset);
+      }
+      else if (params.animationMode === 'Northern Shipping Arcs') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.3);
+        offset.y = THREE.MathUtils.lerp(offset.y, currentDist * 0.5, 0.015);
+        camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(currentDist));
+      }
+      else if (params.animationMode === 'Close-Up Route Inspection') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.25);
+        camera.position.copy(controls.target).add(offset);
+      }
+      else if (params.animationMode === 'Dynamic Figure-8 Drift') {
+        const thetaDelta = Math.sin(animClock * 0.6) * 0.005;
+        const phiDelta = Math.cos(animClock * 1.2) * 0.003;
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), thetaDelta);
+        offset.y += phiDelta * currentDist;
+        camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(currentDist));
+      }
+      else if (params.animationMode === 'Ascending Orbital Spiral') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.38);
+        const elev = Math.sin(animClock * 0.4) * (currentDist * 0.3);
+        offset.y = THREE.MathUtils.lerp(offset.y, elev, 0.01);
+        camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(currentDist));
+      }
+      else if (params.animationMode === 'Equatorial Cargo Highway') {
+        offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), dt * 0.42);
+        offset.y = THREE.MathUtils.lerp(offset.y, currentDist * 0.15, 0.02);
+        camera.position.copy(controls.target).add(offset.normalize().multiplyScalar(currentDist));
+      }
+    }
+
+    // --- APPLY COLOR SCHEME ---
+    function applyColorScheme(themeName) {
+      params.theme = themeName;
+      const theme = PALETTES[themeName];
+      if (!theme) return;
+
+      params.bgColor = theme.bg;
+      params.oceanColor = theme.ocean;
+      params.landGreenColor = theme.landGreen;
+      params.landDesertColor = theme.landDesert;
+      params.landSnowColor = theme.landSnow;
+      params.trackGoldColor = theme.trackGold;
+      params.trackSilverColor = theme.trackSilver;
+      params.baseMetalColor = theme.baseMetal;
+      params.neonAmberColor = theme.neonAmber;
+      params.neonCyanColor = theme.neonCyan;
+
+      if (!params.greenScreen) {
+        scene.background.set(params.bgColor);
+        if (stars) stars.visible = true;
+      }
+
+      buildGlobe();
+      trackGoldMat.color.set(params.trackGoldColor);
+      trackSilverMat.color.set(params.trackSilverColor);
+      buildPedestal();
+
+      arcsGroup.children.forEach(arc => {
+        arc.material.color.set(params.neonCyanColor);
+      });
+
+      populateFleet();
+
+      // Only update standard theme controllers, NEVER touch PostProcessor GUI
+      gui.controllersRecursive().forEach(c => {
+        if (!c.parent || !c.parent._title?.includes('Post Processor')) {
+          c.updateDisplay();
+        }
+      });
+    }
+
+    // --- GREENSCREEN TOGGLE ---
+    function setGreenScreen(enabled) {
+      params.greenScreen = enabled;
+      if (enabled) {
+        scene.background.set('#00ff00');
+        renderer.setClearColor('#00ff00', 1);
+        if (stars) stars.visible = false;
+      } else {
+        scene.background.set(params.bgColor);
+        renderer.setClearColor(params.bgColor, 1);
+        if (stars) stars.visible = true;
+      }
+      gui.controllersRecursive().forEach(c => {
+        if (!c.parent || !c.parent._title?.includes('Post Processor')) {
+          c.updateDisplay();
+        }
+      });
+    }
+
+    // --- ANTIALIAS TOGGLE ---
+    function updateAntialias(val) {
+      params.antialias = val;
+      const oldCanvas = renderer.domElement;
+      renderer.dispose();
+      container.removeChild(oldCanvas);
+
+      renderer = new THREE.WebGLRenderer({
+        antialias: params.antialias,
+        powerPreference: 'high-performance',
+        alpha: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(params.pixelRatio);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = params.toneMappingExposure;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      container.appendChild(renderer.domElement);
+
+      controls.domElement = renderer.domElement;
+      postProcessor.renderer = renderer;
+      postProcessor.settings.antialias = val;
+      postProcessor.setSize(window.innerWidth, window.innerHeight);
+
+      if (params.greenScreen) {
+        scene.background.set('#00ff00');
+        renderer.setClearColor('#00ff00', 1);
+      }
+    }
+
+    // --- PROCEDURAL RANDOMIZER (DO NOT SHUFFLE POSTPROCESSING SETTINGS) ---
+    function randomizeScene() {
+      const keys = Object.keys(PALETTES);
+      const randomKey = keys[Math.floor(Math.random() * keys.length)];
+      applyColorScheme(randomKey);
+
+      params.animSpeed = 0.6 + Math.random() * 1.2;
+      params.toneMappingExposure = 0.9 + Math.random() * 0.5;
+      renderer.toneMappingExposure = params.toneMappingExposure;
+
+      params.keyLightIntensity = 1.8 + Math.random() * 1.0;
+      keyLight.intensity = params.keyLightIntensity;
+
+      params.ambientIntensity = 0.5 + Math.random() * 0.4;
+      ambientLight.intensity = params.ambientIntensity;
+
+      // Notice: postProcessor.settings are STRICTLY preserved and never shuffled!
+      gui.controllersRecursive().forEach(c => {
+        if (!c.parent || !c.parent._title?.includes('Post Processor')) {
+          c.updateDisplay();
+        }
+      });
+    }
+
+    // Distinguish click from camera drag
+    let pointerDownPos = { x: 0, y: 0 };
+    window.addEventListener('pointerdown', (e) => {
+      pointerDownPos.x = e.clientX;
+      pointerDownPos.y = e.clientY;
+    });
+
+    window.addEventListener('pointerup', (e) => {
+      if (e.target.closest('.lil-gui')) return;
+      const dist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+      if (dist < 6 && params.clickToRandomize) {
+        randomizeScene();
+      }
+    });
+
+    // --- LIL-GUI SETUP ---
+    const gui = new GUI({ title: 'Global Supply Chain Logistics' });
+
+    // 1. Color Schemes & Theme
+    const fColor = gui.addFolder('🎨 Color & Theme');
+    fColor.add(params, 'theme', Object.keys(PALETTES)).name('Palette Preset').onChange(applyColorScheme);
+    fColor.add(params, 'greenScreen').name('Green Screen (#00ff00)').onChange(setGreenScreen);
+    fColor.addColor(params, 'bgColor').name('Background Color').onChange(c => {
+      if (!params.greenScreen) scene.background.set(c);
+    });
+    fColor.addColor(params, 'oceanColor').name('Ocean Facets').onChange(() => buildGlobe());
+    fColor.addColor(params, 'landGreenColor').name('Land (Forest)').onChange(() => buildGlobe());
+    fColor.addColor(params, 'landDesertColor').name('Land (Desert)').onChange(() => buildGlobe());
+    fColor.addColor(params, 'landSnowColor').name('Land (Polar/Ice)').onChange(() => buildGlobe());
+    fColor.addColor(params, 'trackGoldColor').name('Main Track (Gold)').onChange(c => trackGoldMat.color.set(c));
+    fColor.addColor(params, 'trackSilverColor').name('Cross Track (Silver)').onChange(c => trackSilverMat.color.set(c));
+    fColor.addColor(params, 'baseMetalColor').name('Pedestal Base').onChange(() => buildPedestal());
+    fColor.addColor(params, 'neonAmberColor').name('Neon Ring (Amber)').onChange(() => buildPedestal());
+    fColor.addColor(params, 'neonCyanColor').name('Neon Ring (Cyan)').onChange(() => buildPedestal());
+
+    // 2. Camera & Animation
+    const fAnim = gui.addFolder('🎬 Camera & Motion');
+    fAnim.add(params, 'animationMode', ANIMATION_OPTIONS).name('Camera Mode');
+    fAnim.add(params, 'animSpeed', 0.0, 3.0, 0.05).name('Global Speed');
+    fAnim.add(params, 'autoOrbitSpeed', 0.0, 2.0, 0.05).name('Orbit Rate');
+    fAnim.add({ resetCamera: () => {
+      camera.position.set(0, 3.2, 12.6);
+      controls.target.set(0, GLOBE_CENTER_Y, 0);
+      controls.update();
+    }}, 'resetCamera').name('Reset Camera View');
+
+    // 3. Lighting & Exposure
+    const fLight = gui.addFolder('💡 Lighting & Exposure');
+    fLight.add(params, 'toneMappingExposure', 0.2, 3.0, 0.05).name('Scene Exposure').onChange(v => {
+      renderer.toneMappingExposure = v;
+    });
+    fLight.add(params, 'ambientIntensity', 0.0, 2.5, 0.05).name('Ambient Light').onChange(v => ambientLight.intensity = v);
+    fLight.addColor(params, 'ambientColor').name('Ambient Color').onChange(c => ambientLight.color.set(c));
+
+    fLight.add(params, 'keyLightIntensity', 0.0, 5.0, 0.1).name('Key Directional').onChange(v => keyLight.intensity = v);
+    fLight.addColor(params, 'keyLightColor').name('Key Color').onChange(c => keyLight.color.set(c));
+
+    fLight.add(params, 'fillLightIntensity', 0.0, 3.0, 0.1).name('Fill Light').onChange(v => fillLight.intensity = v);
+    fLight.addColor(params, 'fillLightColor').name('Fill Color').onChange(c => fillLight.color.set(c));
+
+    fLight.add(params, 'baseLightIntensity', 0.0, 6.0, 0.1).name('Base Uplight').onChange(v => basePointLight.intensity = v);
+    fLight.addColor(params, 'baseLightColor').name('Base Light Color').onChange(c => basePointLight.color.set(c));
+
+    // 4. Quality & Display Settings
+    const fDisplay = gui.addFolder('⚙️ Quality & Graphics');
+    fDisplay.add(params, 'pixelRatio', 0.5, 3.0, 0.25).name('Pixel Ratio (DPR)').onChange(v => {
+      renderer.setPixelRatio(v);
+      postProcessor.setSize(window.innerWidth, window.innerHeight);
+    });
+    fDisplay.add(params, 'antialias').name('Antialiasing').onChange(updateAntialias);
+    fDisplay.add(params, 'atmosphereDome').name('Atmosphere Glass').onChange(v => atmoMesh.visible = v);
+    fDisplay.add(params, 'starDensity', 200, 3000, 100).name('Star Density').onChange(() => buildStarfield());
+
+    // 5. Procedural Variation on Click
+    const fRandom = gui.addFolder('🎲 Procedural Variation');
+    fRandom.add(params, 'clickToRandomize').name('Click Scene: Re-roll');
+    fRandom.add({ triggerRandom: randomizeScene }, 'triggerRandom').name('Randomize Now');
+
+    // 6. PostProcessor Controls
+    postProcessor.attachGUI(gui, 'Post Processor (PostProcessor.js)');
+
+    // Hide/Show GUI with 'H' Key
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'h' || e.key === 'H') {
+        gui._hidden ? gui.show() : gui.hide();
+      }
+    });
+
+    // Handle Window Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      postProcessor.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // --- MAIN ANIMATION LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const effectiveDt = delta * params.animSpeed;
+
+      // 1. Update Camera Position / Orbit
+      updateCamera(delta);
+      controls.update();
+
+      // 2. Slow Globe Self-Rotation
+      if (globeGroup) {
+        globeGroup.rotation.y += 0.02 * effectiveDt;
+      }
+
+      // 3. Move Articulated Freight Trains
+      trains.forEach(t => {
+        t.progress = (t.progress + t.speed * effectiveDt) % 1.0;
+        t.cars.forEach((car, k) => {
+          const carU = (t.progress - k * t.carSpacing + 1.0) % 1.0;
+          const pt = t.curve.getPointAt(carU);
+          const tangent = t.curve.getTangentAt(carU).normalize();
+
+          const up = pt.clone().sub(globeCenter).normalize();
+          const right = new THREE.Vector3().crossVectors(up, tangent).normalize();
+          const orthoUp = new THREE.Vector3().crossVectors(tangent, right).normalize();
+
+          const m = new THREE.Matrix4().makeBasis(right, orthoUp, tangent);
+          car.quaternion.setFromRotationMatrix(m);
+          car.position.copy(pt).addScaledVector(orthoUp, 0.05);
+        });
+      });
+
+      // 4. Move Container Ships & High-Altitude Airplanes
+      singleVehicles.forEach(item => {
+        item.progress = (item.progress + item.speed * effectiveDt) % 1.0;
+        const pt = item.curve.getPointAt(item.progress);
+        const tangent = item.curve.getTangentAt(item.progress).normalize();
+
+        const up = pt.clone().sub(globeCenter).normalize();
+        const right = new THREE.Vector3().crossVectors(up, tangent).normalize();
+        const orthoUp = new THREE.Vector3().crossVectors(tangent, right).normalize();
+
+        const m = new THREE.Matrix4().makeBasis(right, orthoUp, tangent);
+        item.mesh.quaternion.setFromRotationMatrix(m);
+        item.mesh.position.copy(pt).addScaledVector(orthoUp, item.lift);
+      });
+
+      // 5. Subtle Pedestal Neon Ring Shimmer
+      const shimmer = Math.sin(clock.getElapsedTime() * 2.5) * 0.12 + 0.95;
+      basePointLight.intensity = params.baseLightIntensity * shimmer;
+
+      // 6. PostProcessor Render Pipeline
+      if (postProcessor && postProcessor.settings.enabled) {
+        postProcessor.render(scene, camera);
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+
+    animate();
+  </script>
+</body>
+</html>

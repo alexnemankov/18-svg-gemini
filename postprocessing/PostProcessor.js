@@ -476,6 +476,104 @@ void main() {
 }
 `;
 
+const fxaaFragmentShader = `
+precision highp float;
+uniform sampler2D inputTexture;
+uniform vec2 resolution;
+in vec2 vUv;
+out vec4 fragColor;
+
+void main() {
+  vec2 inverseVP = 1.0 / resolution;
+  vec3 rgbNW = texture(inputTexture, vUv + vec2(-1.0, -1.0) * inverseVP).rgb;
+  vec3 rgbNE = texture(inputTexture, vUv + vec2(1.0, -1.0) * inverseVP).rgb;
+  vec3 rgbSW = texture(inputTexture, vUv + vec2(-1.0, 1.0) * inverseVP).rgb;
+  vec3 rgbSE = texture(inputTexture, vUv + vec2(1.0, 1.0) * inverseVP).rgb;
+  vec3 rgbM  = texture(inputTexture, vUv).rgb;
+
+  vec3 luma = vec3(0.299, 0.587, 0.114);
+  float lumaNW = dot(rgbNW, luma);
+  float lumaNE = dot(rgbNE, luma);
+  float lumaSW = dot(rgbSW, luma);
+  float lumaSE = dot(rgbSE, luma);
+  float lumaM  = dot(rgbM,  luma);
+
+  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+  vec2 dir;
+  dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+  dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+  float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * (1.0 / 8.0)), 1.0 / 128.0);
+  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+
+  dir = min(vec2(8.0, 8.0), max(vec2(-8.0, -8.0), dir * rcpDirMin)) * inverseVP;
+
+  vec3 rgbA = 0.5 * (
+      texture(inputTexture, vUv + dir * (1.0 / 3.0 - 0.5)).rgb +
+      texture(inputTexture, vUv + dir * (2.0 / 3.0 - 0.5)).rgb);
+  vec3 rgbB = rgbA * 0.5 + 0.25 * (
+      texture(inputTexture, vUv + dir * -0.5).rgb +
+      texture(inputTexture, vUv + dir * 0.5).rgb);
+
+  float lumaB = dot(rgbB, luma);
+  if ((lumaB < lumaMin) || (lumaB > lumaMax)) {
+      fragColor = vec4(rgbA, 1.0);
+  } else {
+      fragColor = vec4(rgbB, 1.0);
+  }
+}
+`;
+
+const smaaFragmentShader = `
+precision highp float;
+uniform sampler2D inputTexture;
+uniform vec2 resolution;
+in vec2 vUv;
+out vec4 fragColor;
+
+void main() {
+  vec2 invRes = 1.0 / resolution;
+  vec4 center = texture(inputTexture, vUv);
+  
+  vec3 cU = texture(inputTexture, vUv + vec2(0.0, -1.0) * invRes).rgb;
+  vec3 cD = texture(inputTexture, vUv + vec2(0.0, 1.0) * invRes).rgb;
+  vec3 cL = texture(inputTexture, vUv + vec2(-1.0, 0.0) * invRes).rgb;
+  vec3 cR = texture(inputTexture, vUv + vec2(1.0, 0.0) * invRes).rgb;
+  
+  vec3 cUL = texture(inputTexture, vUv + vec2(-1.0, -1.0) * invRes).rgb;
+  vec3 cUR = texture(inputTexture, vUv + vec2(1.0, -1.0) * invRes).rgb;
+  vec3 cDL = texture(inputTexture, vUv + vec2(-1.0, 1.0) * invRes).rgb;
+  vec3 cDR = texture(inputTexture, vUv + vec2(1.0, 1.0) * invRes).rgb;
+
+  vec3 lumaW = vec3(0.299, 0.587, 0.114);
+  float lM = dot(center.rgb, lumaW);
+  float lU = dot(cU, lumaW);
+  float lD = dot(cD, lumaW);
+  float lL = dot(cL, lumaW);
+  float lR = dot(cR, lumaW);
+
+  float gx = (lR - lL) * 2.0 + (dot(cUR, lumaW) - dot(cUL, lumaW)) + (dot(cDR, lumaW) - dot(cDL, lumaW));
+  float gy = (lD - lU) * 2.0 + (dot(cDL, lumaW) - dot(cUL, lumaW)) + (dot(cDR, lumaW) - dot(cUR, lumaW));
+  float edgeStrength = length(vec2(gx, gy));
+
+  if (edgeStrength < 0.04) {
+    fragColor = center;
+    return;
+  }
+
+  vec2 dir = normalize(vec2(-gy, gx)) * invRes * clamp(edgeStrength * 1.5, 0.5, 1.5);
+  vec4 sampleA = texture(inputTexture, vUv + dir * 0.5);
+  vec4 sampleB = texture(inputTexture, vUv - dir * 0.5);
+  vec4 sampleC = texture(inputTexture, vUv + dir * 1.0);
+  vec4 sampleD = texture(inputTexture, vUv - dir * 1.0);
+
+  vec4 blended = (center * 2.0 + sampleA + sampleB + (sampleC + sampleD) * 0.5) / 5.0;
+  fragColor = vec4(blended.rgb, center.a);
+}
+`;
+
 // -------------------------------------------------------------
 // Helper Classes (FBO & Passes)
 // -------------------------------------------------------------
@@ -489,7 +587,7 @@ function createFBO(w, h, options = {}) {
     type: options.type || THREE.HalfFloatType,
     stencilBuffer: options.stencilBuffer || false,
     depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : false,
-    samples: options.samples || 0,
+    samples: options.samples !== undefined ? options.samples : 0,
   });
 }
 
@@ -637,16 +735,112 @@ const VISION_MODE_MAP = {
 };
 
 // -------------------------------------------------------------
+// Antialiasing Suite Modes & Presets
+// -------------------------------------------------------------
+export const ANTIALIAS_MODES = [
+  "MSAA 4x (Standard)",
+  "MSAA 2x (Fast)",
+  "MSAA 8x (Ultra)",
+  "FXAA (Fast Approximate)",
+  "SMAA (Morphological)",
+  "SSAA 1.5x (Super-Sampling)",
+  "SSAA 2x (Ultra Super-Sampling)",
+  "Hybrid (MSAA 4x + FXAA)",
+  "Off (No Anti-Aliasing)"
+];
+
+function resolveAntialiasSettings(mode, antialias) {
+  if (antialias === false && (!mode || mode === 'MSAA 4x (Standard)')) {
+    mode = 'Off (No Anti-Aliasing)';
+  }
+  let msaaSamples = 0;
+  let fxaaEnabled = false;
+  let smaaEnabled = false;
+  let ssaaScale = 1.0;
+
+  switch (mode) {
+    case 'MSAA 2x (Fast)':
+    case 'MSAA 2x':
+      msaaSamples = 2;
+      break;
+    case 'MSAA 4x (Standard)':
+    case 'MSAA 4x':
+      msaaSamples = 4;
+      break;
+    case 'MSAA 8x (Ultra)':
+    case 'MSAA 8x (High Quality)':
+    case 'MSAA 8x':
+      msaaSamples = 8;
+      break;
+    case 'FXAA (Fast Approximate)':
+    case 'FXAA':
+      fxaaEnabled = true;
+      break;
+    case 'SMAA (Morphological)':
+    case 'SMAA':
+      smaaEnabled = true;
+      break;
+    case 'SSAA 1.5x (Super-Sampling)':
+    case 'SSAA 1.5x':
+      ssaaScale = 1.5;
+      break;
+    case 'SSAA 2x (Ultra Super-Sampling)':
+    case 'SSAA 2x':
+      ssaaScale = 2.0;
+      break;
+    case 'Hybrid (MSAA 4x + FXAA)':
+    case 'MSAA 4x + FXAA':
+      msaaSamples = 4;
+      fxaaEnabled = true;
+      break;
+    case 'Off (No Anti-Aliasing)':
+    case 'None (Off)':
+    case 'Off':
+    default:
+      msaaSamples = 0;
+      fxaaEnabled = false;
+      smaaEnabled = false;
+      ssaaScale = 1.0;
+      break;
+  }
+
+  return {
+    mode: mode || 'MSAA 4x (Standard)',
+    msaaSamples,
+    fxaaEnabled,
+    smaaEnabled,
+    ssaaScale,
+    antialias: mode !== 'Off (No Anti-Aliasing)' && mode !== 'None (Off)' && mode !== 'Off',
+    useFxaa: fxaaEnabled
+  };
+}
+
+// -------------------------------------------------------------
 // Main Export Class
 // -------------------------------------------------------------
 export class PostProcessor {
   constructor(renderer, params = {}) {
     this.renderer = renderer;
+    this.width = 1;
+    this.height = 1;
+    this.dpr = 1;
+
+    const initialAa = resolveAntialiasSettings(params.antialiasMode, params.antialias);
+    if (params.useFxaa !== undefined) initialAa.fxaaEnabled = !!params.useFxaa;
+    if (params.msaaSamples !== undefined) initialAa.msaaSamples = params.msaaSamples;
+    if (params.smaaEnabled !== undefined) initialAa.smaaEnabled = !!params.smaaEnabled;
+    if (params.ssaaScale !== undefined) initialAa.ssaaScale = params.ssaaScale;
 
     this.settings = {
-      // Global Switch
+      // Global Switch & Antialiasing Suite
       enabled: params.enabled !== undefined ? params.enabled : true,
-      antialias: params.antialias !== undefined ? params.antialias : true,
+      antialias: initialAa.antialias,
+      antialiasMode: initialAa.mode,
+      msaaSamples: initialAa.msaaSamples,
+      fxaaEnabled: initialAa.fxaaEnabled,
+      smaaEnabled: initialAa.smaaEnabled,
+      ssaaScale: initialAa.ssaaScale,
+      useFxaa: initialAa.fxaaEnabled,
 
       // 1. Universal 3-Param Bloom Engine
       bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
@@ -697,7 +891,7 @@ export class PostProcessor {
     };
 
     const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
-    const targetSamples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
+    const targetSamples = this.settings.antialias ? Math.min(this.settings.msaaSamples, maxSamples) : 0;
     this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples, depthBuffer: true });
 
     this.bloomPass = new BloomPass(
@@ -836,6 +1030,27 @@ export class PostProcessor {
       glslVersion: THREE.GLSL3,
     });
     this.copyPass = new ShaderPass(this.copyShader);
+    this.fxaaShader = new THREE.RawShaderMaterial({
+      uniforms: {
+        inputTexture: { value: null },
+        resolution: { value: new THREE.Vector2(1, 1) },
+      },
+      vertexShader: orthoVertexShader,
+      fragmentShader: fxaaFragmentShader,
+      glslVersion: THREE.GLSL3,
+    });
+    this.fxaaPass = new ShaderPass(this.fxaaShader);
+
+    this.smaaShader = new THREE.RawShaderMaterial({
+      uniforms: {
+        inputTexture: { value: null },
+        resolution: { value: new THREE.Vector2(1, 1) },
+      },
+      vertexShader: orthoVertexShader,
+      fragmentShader: smaaFragmentShader,
+      glslVersion: THREE.GLSL3,
+    });
+    this.smaaPass = new ShaderPass(this.smaaShader);
   }
 
   updateSettings() {
@@ -880,40 +1095,83 @@ export class PostProcessor {
   }
 
   setSize(w0, h0, dpr = 1) {
-    const w = Math.max(1, Math.floor(w0 * dpr));
-    const h = Math.max(1, Math.floor(h0 * dpr));
-    this.sceneTarget.setSize(w, h);
-    this.finalPass.setSize(w, h);
-    this.finalShader.uniforms.resolution.value.set(w, h);
-    this.bloomPass.setSize(w, h);
+    this.width = w0;
+    this.height = h0;
+    this.dpr = dpr;
 
-    const grW = Math.max(1, Math.round(w / 2));
-    const grH = Math.max(1, Math.round(h / 2));
+    const baseW = Math.max(1, Math.floor(w0 * dpr));
+    const baseH = Math.max(1, Math.floor(h0 * dpr));
+    const ssaa = this.settings.ssaaScale || 1.0;
+    const targetW = Math.max(1, Math.round(baseW * ssaa));
+    const targetH = Math.max(1, Math.round(baseH * ssaa));
+
+    this.sceneTarget.setSize(targetW, targetH);
+    this.finalPass.setSize(baseW, baseH);
+    this.finalShader.uniforms.resolution.value.set(baseW, baseH);
+    this.bloomPass.setSize(baseW, baseH);
+
+    const grW = Math.max(1, Math.round(baseW / 2));
+    const grH = Math.max(1, Math.round(baseH / 2));
     this.godRaysMaskPass.setSize(grW, grH);
     this.godRaysPingPong.setSize(grW, grH);
 
-    const anW = Math.max(1, Math.round(w / 4));
-    const anH = Math.max(1, Math.round(h / 4));
+    const anW = Math.max(1, Math.round(baseW / 4));
+    const anH = Math.max(1, Math.round(baseH / 4));
     this.anamorphicBrightPass.setSize(anW, anH);
     this.anamorphicBlurPass.setSize(anW, anH);
     this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
 
-    this.rgbPass.setSize(w, h);
-    this.copyPass.setSize(w, h);
+    this.rgbPass.setSize(baseW, baseH);
+    this.copyPass.setSize(baseW, baseH);
+    if (this.fxaaPass) {
+      this.fxaaPass.setSize(baseW, baseH);
+      this.fxaaShader.uniforms.resolution.value.set(baseW, baseH);
+    }
+    if (this.smaaPass) {
+      this.smaaPass.setSize(baseW, baseH);
+      this.smaaShader.uniforms.resolution.value.set(baseW, baseH);
+    }
   }
 
-  setAntialias(enabled) {
-    this.settings.antialias = !!enabled;
+  setAntialiasMode(mode) {
+    const resolved = resolveAntialiasSettings(mode, this.settings.antialias);
+    this.setAntialiasConfig(resolved);
+  }
+
+  setAntialiasConfig(cfg) {
+    if (!cfg) return;
+    if (cfg.mode) this.settings.antialiasMode = cfg.mode;
+    this.settings.msaaSamples = cfg.msaaSamples !== undefined ? cfg.msaaSamples : 0;
+    this.settings.fxaaEnabled = !!cfg.fxaaEnabled;
+    this.settings.smaaEnabled = !!cfg.smaaEnabled;
+    this.settings.ssaaScale = cfg.ssaaScale || 1.0;
+    this.settings.useFxaa = this.settings.fxaaEnabled;
+    this.settings.antialias = (this.settings.antialiasMode !== "Off (No Anti-Aliasing)" && this.settings.antialiasMode !== "None (Off)" && this.settings.antialiasMode !== "Off");
+
     const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
-    const samples = this.settings.antialias ? Math.min(4, maxSamples) : 0;
-    if (this.sceneTarget.samples !== samples) {
+    const reqSamples = Math.min(this.settings.msaaSamples, maxSamples);
+
+    const baseW = Math.max(1, Math.floor(this.width * this.dpr));
+    const baseH = Math.max(1, Math.floor(this.height * this.dpr));
+    const targetW = Math.max(1, Math.round(baseW * this.settings.ssaaScale));
+    const targetH = Math.max(1, Math.round(baseH * this.settings.ssaaScale));
+
+    if (this.sceneTarget.samples !== reqSamples || this.sceneTarget.width !== targetW || this.sceneTarget.height !== targetH) {
       const oldTarget = this.sceneTarget;
-      this.sceneTarget = createFBO(oldTarget.width, oldTarget.height, {
+      this.sceneTarget = createFBO(targetW, targetH, {
         type: THREE.HalfFloatType,
-        samples: samples,
+        samples: reqSamples,
         depthBuffer: true,
       });
       oldTarget.dispose();
+    }
+  }
+
+  setAntialias(enabled) {
+    if (typeof enabled === 'string') {
+      this.setAntialiasMode(enabled);
+    } else {
+      this.setAntialiasMode(enabled ? 'MSAA 4x (Standard)' : 'Off (No Anti-Aliasing)');
     }
   }
 
@@ -947,11 +1205,24 @@ export class PostProcessor {
 
   renderScene(scene, camera) {
     if (!this.settings.enabled) {
-      this.renderer.setRenderTarget(this.sceneTarget);
-      this.renderer.render(scene, camera);
-      this.renderer.setRenderTarget(null);
-      this.copyPass.shader.uniforms.inputTexture.value = this.sceneTarget.texture;
-      this.copyPass.render(this.renderer, true);
+      if (this.settings.fxaaEnabled || this.settings.smaaEnabled || (this.settings.msaaSamples && this.settings.msaaSamples > 0) || (this.settings.ssaaScale && this.settings.ssaaScale > 1.0)) {
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        if (this.settings.fxaaEnabled) {
+          this.fxaaShader.uniforms.inputTexture.value = this.sceneTarget.texture;
+          this.fxaaPass.render(this.renderer, true);
+        } else if (this.settings.smaaEnabled) {
+          this.smaaShader.uniforms.inputTexture.value = this.sceneTarget.texture;
+          this.smaaPass.render(this.renderer, true);
+        } else {
+          this.copyPass.shader.uniforms.inputTexture.value = this.sceneTarget.texture;
+          this.copyPass.render(this.renderer, true);
+        }
+      } else {
+        this.renderer.setRenderTarget(null);
+        this.renderer.render(scene, camera);
+      }
       return;
     }
     this.renderer.setRenderTarget(this.sceneTarget);
@@ -1035,13 +1306,23 @@ export class PostProcessor {
     this.rgbPass.shader.uniforms.time.value = randomTime;
 
     this.finalPass.render(this.renderer);
-    this.rgbPass.render(this.renderer, true);
+    if (this.settings.fxaaEnabled || this.settings.useFxaa) {
+      this.rgbPass.render(this.renderer, false);
+      this.fxaaShader.uniforms.inputTexture.value = this.rgbPass.texture;
+      this.fxaaPass.render(this.renderer, true);
+    } else if (this.settings.smaaEnabled) {
+      this.rgbPass.render(this.renderer, false);
+      this.smaaShader.uniforms.inputTexture.value = this.rgbPass.texture;
+      this.smaaPass.render(this.renderer, true);
+    } else {
+      this.rgbPass.render(this.renderer, true);
+    }
   }
 
   attachGUI(gui, title = "Post-Processing Suite") {
     const root = gui.addFolder(title);
     root.add(this.settings, "enabled").name("Enable Post-Process");
-    root.add(this.settings, "antialias").name("MSAA Antialias").onChange((v) => this.setAntialias(v));
+    root.add(this.settings, "antialiasMode", ANTIALIAS_MODES).name("Antialiasing Mode").onChange((v) => this.setAntialiasMode(v));
 
     // 1. Special Vision Modes (Night Vision & Thermal)
     const vision = root.addFolder("Thermal & Night Vision");

@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Botanical Foliage & Sun Study</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #E7DFCB;
+    }
+    canvas {
+      display: block;
+      width: 100vw !important;
+      height: 100vh !important;
+      cursor: pointer;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/p5@2.2/lib/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/p5.brush@latest"></script>
+</head>
+<body>
+<script>
+// Opacity of the flat fill under each band (0-1), and the opacity (0-255) and
+// darkening (0-1) of the brush pass painted over it.
+const BAND_ALPHA = 0.85;
+const BRUSH_ALPHA = 110;
+const BRUSH_SHADE = 0.6;
+
+// Highlights: a secondary (and sometimes tertiary) colour brushed over a few
+// bands, plus marker strokes run along some veins.
+const HIGHLIGHT_CHANCE = 0.55;
+const ACCENT_CHANCE = 0.3;
+const ACCENT_ALPHA = 175;
+const MARKER_CHANCE = 0.25;
+const MARKER_BRUSHES = ['marker', 'crayon', 'pastel', 'charcoal', '2B'];
+const MASS_BRUSHES = ['crayon', 'pastel', 'charcoal', 'cpencil', '2B'];
+
+// Share of stems that grow something other than a single leaf: veinless grass
+// blades, or a sprig hung with small leaflets or round berries.
+// Near-horizontal leaves along the bottom edge, generated apart from the fan.
+const GROUND_COUNT = [5, 8];
+const GROUND_TILT = [30, 60]; // degrees away from vertical
+const GROUND_MUTE = [0.45, 0.8];
+
+// Painted first: a denser, shorter band that fills the lower frame behind the fan
+// so the later layers don't have to cover every gap.
+const BACKDROP_COUNT = [10, 16];
+const BACKDROP_TILT = [10, 30];
+const BACKDROP_MUTE = [0.55, 0.85];
+
+const GRASS_CHANCE = 0.1;
+const FROND_CHANCE = 0.18;
+const BERRY_CHANCE = 0.08;
+const BASE_TONE = '#E7DFCB';
+const BG_DESATURATE = 0.35;
+const GRAIN_STRENGTH = 0.05;
+const SKY_ALPHA = 0.96;
+const SKY_BANDS = [8, 15];
+const SKY_BLOCKS = [3, 7];
+const SKY_ACCENT_CHANCE = 0.28;
+const SKY_MIX_CHANCE = 0.4;
+const SUN_SIZE = [0.22, 0.44];
+const SUN_RINGS = [5, 10];
+
+const SKY_PALETTES = [
+  ['#16324F', '#3E6E9E', '#B7D2E5'],
+  ['#6E1B14', '#C2452D', '#F0A05A'],
+  ['#2A2A48', '#6E5B7B', '#E0A85E'],
+  ['#1F4038', '#5E8C6A', '#D6CB94'],
+  ['#4A2340', '#A8506B', '#F2B27E'],
+];
+const SUN_RAMPS = [
+  ['#C2452D', '#EE9B3F', '#F6C56A', '#FFF8E7'],
+  ['#EE9B3F', '#F6C56A', '#FFE9B0', '#FFFDF2'],
+  ['#D4783A', '#F0A05A', '#FFE4A8', '#FFF8E7'],
+  ['#B85A2A', '#E08A3C', '#F3C56A', '#FFF4D6'],
+];
+
+const SPINE_STEPS = 140;
+const EDGE_SAMPLES = 110;
+const VEIN_STEPS = 18;
+
+const PALETTES = [
+  ['#14301F', '#2C5E45', '#7FA45C'],
+  ['#0F2A20', '#1E4535', '#4E7C50'],
+  ['#8A5A12', '#D79B1E', '#F2D36B'],
+  ['#8C3C16', '#E2762F', '#F3B168'],
+  ['#5E1A11', '#B5301F', '#DE7B4F'],
+  ['#2A4A3A', '#6E9A6A', '#CFDCA0'],
+];
+
+// Back to front: the nearest leaves read as muted silhouettes, the middle layer
+// carries the colour, and the far layer is slightly washed out.
+const LAYERS = [
+  { count: [10, 20], mute: 0.3, sizeScale: [0.65, 1.05], spread: 0.85, stem: [0.45, 0.72], root: 0.07 },
+  { count: [8, 16], mute: 0.0, sizeScale: [0.9, 1.45], spread: 0.6, stem: [0.4, 0.7], root: 0.09 },
+  { count: [4, 10], mute: 0.7, sizeScale: [1.05, 1.6], spread: 1.15, stem: [0.06, 0.35], root: 0.2 },
+];
+
+let scene;
+let painter;
+let desatFilter;
+let grainFilter;
+
+const DESAT_SHADER = `
+  precision highp float;
+  varying vec2 vTexCoord;
+  uniform sampler2D tex0;
+  uniform float amount;
+
+  void main() {
+    vec4 color = texture2D(tex0, vTexCoord);
+    float grey = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    gl_FragColor = vec4(mix(color.rgb, vec3(grey), amount), color.a);
+  }
+`;
+
+const GRAIN_SHADER = `
+  precision highp float;
+  varying vec2 vTexCoord;
+  uniform sampler2D tex0;
+  uniform float grainAmount;
+  uniform float grainStrength;
+
+  float rand(vec2 n) {
+    return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453);
+  }
+
+  void main() {
+    vec4 color = texture2D(tex0, vTexCoord);
+    float noise = rand(vTexCoord * 1234.5678) * 2.0 - 1.0;
+    vec3 grain = vec3(noise, noise, noise) * grainStrength * grainAmount;
+    gl_FragColor = vec4(clamp(color.rgb + grain, 0.0, 1.0), color.a);
+  }
+`;
+
+const REF_HEIGHT = 1200;
+
+function canvasSize() {
+  return [windowWidth, windowHeight];
+}
+
+function setup() {
+  const [w, h] = canvasSize();
+  createCanvas(w, h, WEBGL);
+  brush.scaleBrushes(2.5 * (h / REF_HEIGHT));
+  desatFilter = createFilterShader(DESAT_SHADER);
+  grainFilter = createFilterShader(GRAIN_SHADER);
+  newScene();
+}
+
+function windowResized() {
+  const [w, h] = canvasSize();
+  resizeCanvas(w, h);
+  brush.scaleBrushes(2.5 * (h / REF_HEIGHT));
+  newScene();
+}
+
+// p5.brush is slow, so the scene is painted a piece per frame.
+function draw() {
+  translate(-width / 2, -height / 2);
+  if (painter.next().done) noLoop();
+}
+
+function newScene() {
+  painter = paintScene();
+  loop();
+}
+
+// Sky first, then the plants on top of it so the brush grain has a colour to
+// blend with. One spare frame after the sky lets p5.brush flush before the
+// desaturate filter runs.
+function* paintScene() {
+  background(BASE_TONE);
+  yield* paintBackground(makeBackground());
+  yield;
+  desatFilter.setUniform('amount', BG_DESATURATE);
+  filter(desatFilter);
+  scene = makeArrangement();
+  yield* paintArrangement(scene);
+  yield;
+  grainFilter.setUniform('grainAmount', 1);
+  grainFilter.setUniform('grainStrength', GRAIN_STRENGTH);
+  filter(grainFilter);
+}
+
+function mousePressed() {
+  newScene();
+}
+
+// A sky of soft horizontal bands running through one palette, each mixed into the
+// neutral base so only a few stay saturated enough to read as an accent.
+function pickSkyStops() {
+  const first = random(SKY_PALETTES).map((swatch) => color(swatch));
+  if (random() > SKY_MIX_CHANCE) return first;
+  const _second = random(SKY_PALETTES).map((swatch) => color(swatch));
+  return [first[0], lerpColor(first[1], _second[1], 0.5), _second[2]];
+}
+
+function makeBackground() {
+  const stops = pickSkyStops();
+  const neutral = color(BASE_TONE);
+  const flip = random() < 0.5;
+  const count = floor(random(SKY_BANDS[0], SKY_BANDS[1] + 1));
+  const wobble = random(12, 50);
+  const origin = random(1000);
+
+  const edges = [];
+  for (let i = 0; i <= count; i++) {
+    const y = map(i, 0, count, -20, height + 20);
+    // the outer two edges stay flat so the band covers the canvas corners
+    edges.push(skyEdge(y, i === 0 || i === count ? 0 : wobble, origin + i * 7));
+  }
+
+  const bands = [];
+  for (let i = 0; i < count; i++) {
+    const t = count === 1 ? 0.5 : i / (count - 1);
+    const sky = rampColor(stops, flip ? 1 - t : t);
+    const mute = random() < SKY_ACCENT_CHANCE ? random(0.1, 0.35) : random(0.45, 0.8);
+    bands.push({
+      points: [...edges[i], ...[...edges[i + 1]].reverse()],
+      tone: lerpColor(sky, neutral, mute),
+    });
+  }
+
+  const blocks = [];
+  const blockCount = floor(random(SKY_BLOCKS[0], SKY_BLOCKS[1] + 1));
+  for (let i = 0; i < blockCount; i++) {
+    const sky = rampColor(stops, random());
+    blocks.push({
+      points: skyBlock(),
+      tone: lerpColor(sky, neutral, random() < SKY_ACCENT_CHANCE ? random(0.15, 0.4) : random(0.5, 0.82)),
+    });
+  }
+
+  const suns = [];
+  const sunCount = random([1, 1, 1, 1, 2, 2, 2, 3]); // Weighted random
+  for (let i = 0; i < sunCount; i++) {
+    const baseDimension = min(width, height * 1.25);
+    const radius = baseDimension * random(SUN_SIZE[0], SUN_SIZE[1]) * (sunCount >= 2 ? 0.8 : 1);
+    const ramp = random(SUN_RAMPS).map((swatch) => color(swatch));
+    if (random() < 0.2) ramp.reverse();
+    const ringCount = floor(random(SUN_RINGS[0], SUN_RINGS[1] + 1));
+    const rings = [];
+    for (let r = 0; r < ringCount; r++) {
+      const t = (r + 1) / ringCount;
+      rings.push({
+        points: makeBlob(radius * lerp(0.9, 0.16, t), random(0.03, 0.1)),
+        tone: rampColor(ramp, t),
+      });
+    }
+    suns.push({
+      x: width * random(0.12, 0.88),
+      y: height * random(-0.025, 0.25),
+      tone: rampColor(ramp, 0),
+      rings,
+      disc: makeBlob(radius, random(0.03, 0.08)),
+    });
+  }
+
+  return { bands, blocks, suns };
+}
+
+// A soft rectangle with the same noisy edges as the sky bands.
+function skyBlock() {
+  const x = width * random(-0.08, 0.72);
+  const y = height * random(-0.04, 0.7);
+  const w = width * random(0.2, 0.55);
+  const h = height * random(0.08, 0.28);
+  const wobble = random(8, 28);
+  const origin = random(1000);
+  const top = skyEdgeSpan(x, y, w, wobble, origin);
+  const bottom = skyEdgeSpan(x, y + h, w, wobble, origin + 9);
+  const left = [];
+  const right = [];
+  const steps = 10;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    left.push({
+      x: x + (noise(origin + 20 + t * 3) - 0.5) * wobble,
+      y: lerp(y, y + h, t),
+    });
+    right.push({
+      x: x + w + (noise(origin + 40 + t * 3) - 0.5) * wobble,
+      y: lerp(y, y + h, t),
+    });
+  }
+  return [...top, ...right, ...[...bottom].reverse(), ...[...left].reverse()];
+}
+
+function skyEdgeSpan(x, y, w, wobble, origin) {
+  const points = [];
+  const steps = 16;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    points.push({
+      x: x + w * t,
+      y: y + (noise(origin + t * 4) - 0.5) * wobble,
+    });
+  }
+  return points;
+}
+
+function skyEdge(y, wobble, origin) {
+  const points = [];
+  const steps = 26;
+  for (let i = 0; i <= steps; i++) {
+    const x = map(i, 0, steps, -width * 0.05, width * 1.05);
+    points.push({ x, y: y + (noise(origin + i * 0.18) - 0.5) * wobble });
+  }
+  return points;
+}
+
+function* paintBackground(sky) {
+  for (const band of sky.bands) {
+    paintPatch(band.points, band.tone, SKY_ALPHA, 0.25);
+    yield;
+  }
+
+  for (const block of sky.blocks) {
+    paintPatch(block.points, block.tone, SKY_ALPHA, 0.2);
+    yield;
+  }
+
+  for (const sun of sky.suns) {
+    push();
+    translate(sun.x, sun.y);
+    paintSunRing(sun.disc, sun.tone, 0.42);
+    pop();
+    yield;
+
+    for (const ring of sun.rings) {
+      push();
+      translate(sun.x, sun.y);
+      paintSunRing(ring.points, ring.tone, 0.5);
+      pop();
+      yield;
+    }
+  }
+}
+
+// No hard p5 fill here — that edge stays crisp no matter the bleed. The wash
+// sits on the sky (or the ring under it) and feathers out.
+function paintSunRing(points, tone, bleed) {
+  brush.noStroke();
+  brush.fill(tone, 225);
+  brush.fillBleed(bleed, 'out');
+  brush.fillTexture(0.45, 0.12);
+  brush.polygon(points.map((p) => [p.x, p.y]));
+  brush.noFill();
+}
+
+// Leaves fan out of a cluster of roots below the bottom edge, each riding a stem
+// that leaves the ground vertically and bends into the leaf's own direction.
+function makeArrangement() {
+  const rootX = width * 0.5;
+  const rootY = height * 1.03;
+  const plants = [];
+
+  plants.push(...makeBackdrop());
+
+  const widthScale = max(1, min(1.6, width / (height * 0.8)));
+
+  for (const layer of LAYERS) {
+    const count = floor(random(layer.count[0], layer.count[1] + 1) * widthScale);
+    for (let i = 0; i < count; i++) {
+      const fan = count === 1 ? 0 : map(i + random(-0.35, 0.35), 0, count - 1, -1, 1);
+      const sizeScale = random(layer.sizeScale[0], layer.sizeScale[1]);
+      const leafLength = height * random(0.3, 0.55) * sizeScale;
+      const bend = Math.sign(fan || random(-1, 1)) * random(0.2, 0.85);
+
+      // a third of the stems ignore the fan and strike out near-vertical, rooted
+      // further from the centre so they reach into the upper corners
+      const strays = random() < 0.32;
+
+      // central leaves ride higher than the ones sweeping out to the sides, and a
+      // near-vertical stem can afford to run taller without leaving the frame
+      const stemLength =
+        height *
+        random(layer.stem[0], layer.stem[1]) *
+        (1 - 0.35 * abs(fan)) *
+        (strays ? random(1, 1.4) : 1);
+      let tilt = strays
+        ? Math.sign(random(-1, 1)) * pow(random(), 1.8) * 0.6
+        : Math.sign(fan) * pow(abs(fan), 0.75) * layer.spread;
+
+      // roots sit at slightly different depths below the frame so the stems don't
+      // all converge on a single point
+      const root = {
+        x: rootX + fan * width * layer.root * (strays ? 2.4 : 1),
+        y: rootY * random(1, 1.1),
+      };
+
+      // tips may run past the frame, but a leaf whose body would sit outside it
+      // gets pulled back towards vertical
+      const bodyX = () => root.x + sin(tilt) * stemLength + sin(tilt + bend * 0.2) * leafLength * 0.5;
+      for (let k = 0; k < 4 && abs(bodyX() - rootX) > width * 0.42; k++) tilt *= 0.7;
+
+      const mute = constrain(layer.mute + random(-0.08, 0.08), 0, 1);
+      const stemWeight = max(1.5, 4.5 * sizeScale);
+      const kind = random();
+
+      if (kind < GRASS_CHANCE) {
+        plants.push(makeGrass(root, tilt, stemLength, leafLength, bend, mute, stemWeight));
+        continue;
+      }
+      if (kind < GRASS_CHANCE + FROND_CHANCE + BERRY_CHANCE) {
+        const sprig = kind < GRASS_CHANCE + FROND_CHANCE ? 'frond' : 'berry';
+        plants.push(...makeSprig(sprig, root, tilt, stemLength * 1.25, mute, stemWeight));
+        continue;
+      }
+
+      const stem = growStem(root, tilt, stemLength);
+      // curving away from the centre continues the line of the fan
+      const leaf = makeLeaf({ leafLength, bend });
+
+      // sprouts go in first so the stem they branch off stays in front of them
+      if (random() < 0.22) {
+        const sprouts = floor(random(1, 4));
+        for (let s = 0; s < sprouts; s++) {
+          plants.push(makeSprout(stem, stemLength, leafLength, leaf.stops, mute, stemWeight));
+        }
+      }
+
+      plants.push({
+        kind: 'leaf',
+        leaf,
+        base: stem.base,
+        stem: stem.points,
+        stemColor: leaf.stemColor,
+        rotation: stem.rotation,
+        stemWeight,
+        mute,
+      });
+    }
+  }
+
+  // painted last, so the ground cover closes the bottom of the frame
+  plants.push(...makeGroundCover());
+  return plants;
+}
+
+// A low, even row behind everything else. Shorter than the fan so it occupies
+// the empty lower half without climbing into the same space as the later layers.
+function makeBackdrop() {
+  const items = [];
+  const widthScale = max(1, min(1.6, width / (height * 0.8)));
+  const count = floor(random(BACKDROP_COUNT[0], BACKDROP_COUNT[1] + 1) * widthScale);
+
+  for (let i = 0; i < count; i++) {
+    const spread = count === 1 ? 0 : map(i + random(-0.2, 0.2), 0, count - 1, -1, 1);
+    const at = 0.5 + spread * 0.48;
+    const root = { x: width * at, y: height * random(1.0, 1.25) };
+    const inward = at < 0.5 ? 1 : -1;
+    const tilt =
+      (random() < 0.75 ? inward : -inward) * radians(random(BACKDROP_TILT[0], BACKDROP_TILT[1]));
+    const stem = growStem(root, tilt, height * random(0.02, 0.16));
+    const leaf = makeLeaf({
+      leafLength: height * random(0.25, 0.45),
+      bend: -Math.sign(tilt) * random(0.1, 0.5),
+      widthRatio: random(0.15, 0.3),
+    });
+
+    items.push({
+      kind: 'leaf',
+      leaf,
+      base: stem.base,
+      stem: stem.points,
+      stemColor: leaf.stemColor,
+      rotation: stem.rotation,
+      stemWeight: random(1.5, 3.5),
+      mute: random(BACKDROP_MUTE[0], BACKDROP_MUTE[1]),
+    });
+  }
+  return items;
+}
+
+// Leaves rooted along the whole bottom edge rather than in the central cluster,
+// sweeping in almost horizontally to fill the ground.
+function makeGroundCover() {
+  const items = [];
+  const widthScale = max(1, min(1.6, width / (height * 0.8)));
+  const count = floor(random(GROUND_COUNT[0], GROUND_COUNT[1] + 1) * widthScale);
+
+  for (let i = 0; i < count; i++) {
+    // an even spread pushed outwards, so the corners tend to get covered first
+    const spread = count === 1 ? 0 : map(i + random(-0.35, 0.35), 0, count - 1, -1, 1);
+    const at = 0.5 + Math.sign(spread) * pow(abs(spread), 0.65) * 0.62;
+    const root = { x: width * at, y: height * random(1.0, 1.16) };
+    // mostly leaning back towards the middle, so they cross the frame instead
+    // of immediately running off the side they grew from
+    const inward = at < 0.5 ? 1 : -1;
+    const tilt =
+      (random() < 0.65 ? inward : -inward) * radians(GROUND_TILT[0], GROUND_TILT[1]);
+    const stem = growStem(root, tilt, height * random(0.02, 0.14));
+    const leaf = makeLeaf({
+      leafLength: height * random(0.3, 0.6),
+      // arching up away from the bottom edge
+      bend: -Math.sign(tilt) * random(0.15, 0.6),
+    });
+
+    items.push({
+      kind: 'leaf',
+      leaf,
+      base: stem.base,
+      stem: stem.points,
+      stemColor: leaf.stemColor,
+      rotation: stem.rotation,
+      stemWeight: random(2, 5),
+      mute: random(GROUND_MUTE[0], GROUND_MUTE[1]),
+    });
+  }
+  return items;
+}
+
+// A tall veinless blade rising straight from the ground, split down the midrib
+// into just two tones.
+function makeGrass(root, tilt, stemLength, leafLength, bend, mute, stemWeight) {
+  const stem = growStem(root, tilt, stemLength * random(0.12, 0.3));
+  const leaf = makeLeaf({
+    leafLength: leafLength * random(1.1, 1.6),
+    bend: bend * random(0.8, 1.8),
+    widthRatio: random(0.022, 0.05),
+    tipExp: random(1.3, 1.9),
+    split: true,
+  });
+
+  return {
+    kind: 'leaf',
+    leaf,
+    base: stem.base,
+    stem: stem.points,
+    stemColor: leaf.stemColor,
+    rotation: stem.rotation,
+    stemWeight: stemWeight * 0.5,
+    mute,
+  };
+}
+
+// A long bare stem hung with many small sprouts, alternating down its length:
+// either little leaflets or round berries.
+function makeSprig(kind, root, tilt, stemLength, mute, stemWeight) {
+  const stem = growStem(root, tilt, stemLength);
+  const stops = random(PALETTES).map((swatch) => color(swatch));
+  const stemColor = rampColor(stops, random(0.1, 0.35));
+  const items = [{ kind: 'stem', stem: stem.points, stemColor, stemWeight: stemWeight * 0.5, mute }];
+
+  const count = floor(random(8, 16));
+  const first = random(0.12, 0.3);
+  const spread = random(0.5, 1.1);
+  const sproutSize = random(0.09, 0.2);
+  let side = random() < 0.5 ? -1 : 1;
+
+  for (let i = 0; i <= count; i++) {
+    const at = lerp(first, 1, i / count);
+    const anchor = quadPoint(stem.curve, at);
+    const heading = quadTilt(stem.curve, at);
+    // the last one caps the stem, pointing straight on rather than off to a side
+    const tip = i === count;
+    const stalk = growStem(
+      anchor,
+      tip ? heading : heading + side * spread,
+      stemLength * (tip ? 0.02 : random(0.03, 0.07))
+    );
+    const sizeScale = tip ? 0.7 : random(0.75, 1.15);
+
+    items.push(
+      kind === 'frond'
+        ? {
+            kind: 'leaf',
+            leaf: makeLeaf({
+              leafLength: stemLength * sproutSize * sizeScale,
+              bend: side * random(0.1, 0.5),
+              widthRatio: random(0.16, 0.32),
+              stops,
+              split: true,
+            }),
+            base: stalk.base,
+            rotation: stalk.rotation,
+            stem: stalk.points,
+            stemColor,
+            stemWeight: stemWeight * 0.3,
+            mute,
+          }
+        : {
+            kind: 'blob',
+            blob: makeBlob(stemLength * sproutSize * 0.1 * sizeScale),
+            tone: rampColor(stops, random(0.35, 0.95)),
+            base: stalk.base,
+            stem: stalk.points,
+            stemColor,
+            stemWeight: stemWeight * 0.25,
+            mute,
+          }
+    );
+    side *= -1;
+  }
+  return items;
+}
+
+// Noise sampled around a circle, so the wobble meets itself at the seam.
+function makeBlob(radius, wobble = random(0.2, 0.5)) {
+  const points = [];
+  const noiseScale = random(0.8, 1.8);
+  const noiseStrength = radius * wobble;
+  const origin = random(1000);
+
+  for (let a = 0; a < TWO_PI; a += radians(6)) {
+    const n = noise(origin + cos(a) * noiseScale, origin + sin(a) * noiseScale);
+    const r = radius + n * noiseStrength;
+    points.push({ x: cos(a) * r, y: sin(a) * r });
+  }
+  return points;
+}
+
+// A smaller leaf on a short stem branching off partway along a bigger one.
+function makeSprout(parent, stemLength, leafLength, stops, mute, stemWeight) {
+  const at = random(0.3, 0.8);
+  const root = quadPoint(parent.curve, at);
+  const side = Math.sign(random(-1, 1));
+  const tilt = constrain(quadTilt(parent.curve, at) + side * random(0.3, 0.9), -1.3, 1.3);
+  const stem = growStem(root, tilt, stemLength * random(0.18, 0.4));
+
+  const leaf = makeLeaf({
+    leafLength: leafLength * random(0.28, 0.5),
+    bend: side * random(0.2, 0.7),
+    stops,
+  });
+
+  return {
+    kind: 'leaf',
+    leaf,
+    base: stem.base,
+    stem: stem.points,
+    stemColor: leaf.stemColor,
+    rotation: stem.rotation,
+    stemWeight: stemWeight * 0.6,
+    mute,
+  };
+}
+
+// The stem leaves its root vertically, but the control point stays below the leaf
+// base so a strongly tilted stem arcs instead of looping over.
+function growStem(root, tilt, stemLength) {
+  const base = {
+    x: root.x + sin(tilt) * stemLength,
+    y: root.y - cos(tilt) * stemLength,
+  };
+  const ctrl = {
+    x: lerp(root.x, base.x, 0.15),
+    y: root.y - min(stemLength * 0.6, max(0, root.y - base.y) * 0.75),
+  };
+  const curve = [root, ctrl, base];
+  return {
+    curve,
+    base,
+    points: sampleQuad(curve, 24),
+    rotation: atan2(base.y - ctrl.y, base.x - ctrl.x),
+  };
+}
+
+function quadPoint([a, b, c], t) {
+  const u = 1 - t;
+  return {
+    x: u * u * a.x + 2 * u * t * b.x + t * t * c.x,
+    y: u * u * a.y + 2 * u * t * b.y + t * t * c.y,
+  };
+}
+
+// Heading of the curve at t, measured as a tilt away from vertical.
+function quadTilt([a, b, c], t) {
+  const u = 1 - t;
+  const dx = 2 * u * (b.x - a.x) + 2 * t * (c.x - b.x);
+  const dy = 2 * u * (b.y - a.y) + 2 * t * (c.y - b.y);
+  return atan2(dx, -dy);
+}
+
+function sampleQuad(curve, steps) {
+  const points = [];
+  for (let i = 0; i <= steps; i++) points.push(quadPoint(curve, i / steps));
+  return points;
+}
+
+// Builds a leaf in local space: base at (0, 0), growing towards +x.
+function makeLeaf(options = {}) {
+  const leafLength = options.leafLength ?? random(380, 620);
+  const maxHalf = leafLength * (options.widthRatio ?? random(0.11, 0.22));
+  const bend = options.bend ?? random(-0.85, 0.85);
+  const bendEase = random(1.0, 2.4);
+  const baseExp = random(0.5, 1.25);
+  const tipExp = options.tipExp ?? random(0.55, 1.9);
+  const skew = random(-0.16, 0.16);
+  const edgeAmount = random(0.03, 0.14);
+  const edgeScale = random(1.5, 4.5);
+  const lobeCount = random() < 0.35 ? floor(random(6, 16)) : 0;
+  const lobeDepth = random(0.02, 0.06);
+  const noiseOrigin = [random(1000), random(1000)];
+
+  const peak = baseExp / (baseExp + tipExp);
+  const peakValue = pow(peak, baseExp) * pow(1 - peak, tipExp);
+
+  const spine = buildSpine(leafLength, bend, bendEase);
+
+  const spineAt = (t) => {
+    const pos = constrain(t, 0, 1) * SPINE_STEPS;
+    const i = floor(pos);
+    const a = spine[i];
+    const b = spine[min(i + 1, SPINE_STEPS)];
+    const f = pos - i;
+    return {
+      x: lerp(a.x, b.x, f),
+      y: lerp(a.y, b.y, f),
+      heading: lerp(a.heading, b.heading, f),
+    };
+  };
+
+  const halfWidthAt = (t, side) => {
+    const tc = constrain(t, 0, 1);
+    let w = (pow(tc, baseExp) * pow(1 - tc, tipExp)) / peakValue;
+    w *= 1 + side * skew;
+    if (lobeCount > 0) w *= 1 + lobeDepth * sin(tc * TWO_PI * lobeCount);
+    const n = noise(noiseOrigin[side > 0 ? 1 : 0] + tc * edgeScale);
+    w *= 1 + edgeAmount * (n - 0.5) * 2;
+    return w * maxHalf;
+  };
+
+  // Leaf space: t runs base -> tip along the midrib, u runs midrib (0) -> margin (1).
+  const leafPoint = (t, u, side) => {
+    const p = spineAt(t);
+    const h = halfWidthAt(t, side) * u;
+    const outward = p.heading + HALF_PI * side;
+    return { x: p.x + cos(outward) * h, y: p.y + sin(outward) * h };
+  };
+
+  // A vein is the graph of t over u, and every vein on the leaf shares the same
+  // shape, differing only in where it starts. Since veinShape stays within [0, 1]
+  // and lean < 1, veinT is strictly increasing in `start` at every u: two veins of
+  // the same side keep their order for the whole crossing, so they never intersect
+  // and the blade is cleanly cut into bands.
+  const lean = random(0.26, 0.48);
+  const veinCurve = random(1.3, 2.4);
+  const veinStraight = random(0.15, 0.7);
+  const veinShape = (u) => lerp(pow(u, veinCurve), u, veinStraight);
+  const veinT = (start, u) => start + (1 - start) * lean * veinShape(u);
+
+  // The cut at start = 0 collapses onto the leaf base, which keeps the first band closed.
+  const veinPath = (start, side) => {
+    const points = [];
+    for (let i = 0; i <= VEIN_STEPS; i++) {
+      const u = i / VEIN_STEPS;
+      points.push(start > 0 ? leafPoint(veinT(start, u), u, side) : leafPoint(0, 0, side));
+    }
+    return points;
+  };
+
+  const bandPolygon = (side, from, to) => {
+    const points = [];
+    const alongSpine = max(2, ceil((to - from) * 50));
+    for (let i = 0; i <= alongSpine; i++) {
+      points.push(leafPoint(lerp(from, to, i / alongSpine), 0, side));
+    }
+    points.push(...veinPath(to, side));
+
+    const marginFrom = from > 0 ? veinT(from, 1) : 0;
+    const marginTo = veinT(to, 1);
+    const alongMargin = max(2, ceil((marginTo - marginFrom) * 80));
+    for (let i = alongMargin; i >= 0; i--) {
+      points.push(leafPoint(lerp(marginFrom, marginTo, i / alongMargin), 1, side));
+    }
+
+    const inner = veinPath(from, side);
+    for (let i = inner.length - 1; i >= 0; i--) points.push(inner[i]);
+    return points;
+  };
+
+  const stops = options.stops ?? random(PALETTES).map((swatch) => color(swatch));
+  const toneCenter = random(0.3, 0.62);
+  const toneDrift = random(-0.5, 0.5);
+  const sideStep = random(0.06, 0.18);
+
+  const bands = [];
+  for (const side of [-1, 1]) {
+    // a split leaf has no veins at all, so each half is a single band
+    const cuts = options.split ? [] : veinCuts();
+    const bounds = [0, ...cuts, 1];
+    for (let i = 0; i < bounds.length - 1; i++) {
+      const from = bounds[i];
+      const to = bounds[i + 1];
+      let tone = toneCenter + toneDrift * ((from + to) / 2 - 0.5) + side * sideStep;
+      tone += random(-0.07, 0.07);
+      if (random() < 0.12) tone += random() < 0.5 ? -0.3 : 0.3;
+      bands.push({
+        side,
+        from,
+        to,
+        points: bandPolygon(side, from, to),
+        fillColor: rampColor(stops, tone),
+      });
+    }
+  }
+
+  const highlights = options.split ? [] : addHighlights(bands, stops);
+
+  return {
+    spine,
+    bands,
+    stops,
+    veinPath,
+    markers: options.split ? [] : pickMarkers(bands, stops, highlights),
+    stemColor: rampColor(stops, toneCenter * 0.6),
+  };
+}
+
+// A leaf may carry a secondary and sometimes a tertiary colour. Bands that get one
+// are painted again in it, with a heavier, more bleeding brush pass on top.
+function addHighlights(bands, stops) {
+  const highlights = [];
+  if (random() < HIGHLIGHT_CHANCE) highlights.push(pickHighlight(stops));
+  if (highlights.length > 0 && random() < 0.45) highlights.push(pickHighlight(stops));
+  if (highlights.length === 0) return highlights;
+
+  for (const band of bands) {
+    if (random() > ACCENT_CHANCE) continue;
+    band.accent = {
+      tone: random(highlights),
+      bleed: random(0.15, 0.4),
+      direction: random() < 0.5 ? 'in' : 'out',
+      textureAmount: random(0.7, 1),
+      border: random(0.4, 1),
+      // a third of them are laid down as dry media instead of a wash, which is
+      // where the brush type actually varies
+      mass:
+        random() < 0.35
+          ? {
+              brushName: random(MASS_BRUSHES),
+              strength: random(0.5, 0.9),
+              gradient: random(0.2, 0.8),
+            }
+          : null,
+    };
+  }
+  return highlights;
+}
+
+// Most highlights come from another palette so they read as a distinct colour,
+// the rest are just the bright end of the leaf's own ramp.
+function pickHighlight(stops) {
+  const ramp = random() < 0.7 ? random(PALETTES).map((swatch) => color(swatch)) : stops;
+  return rampColor(ramp, random(0.45, 1));
+}
+
+// Marker strokes laid along some of the veins of some leaves.
+function pickMarkers(bands, stops, highlights) {
+  if (random() > MARKER_CHANCE) return [];
+  const brushName = random(MARKER_BRUSHES);
+  const tone = highlights.length > 0 ? random(highlights) : rampColor(stops, random(0.55, 1));
+  const weight = random(0.6, 1.6);
+
+  return bands
+    .filter((band) => band.from > 0 && random() < 0.5)
+    .map((band) => ({ cut: band.from, side: band.side, tone, brushName, weight }));
+}
+
+function buildSpine(leafLength, bend, bendEase) {
+  const spineStep = leafLength / SPINE_STEPS;
+  const points = [];
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i <= SPINE_STEPS; i++) {
+    const heading = bend * pow(i / SPINE_STEPS, bendEase);
+    points.push({ x, y, heading });
+    x += cos(heading) * spineStep;
+    y += sin(heading) * spineStep;
+  }
+  return points;
+}
+
+// Strictly increasing cut positions along the midrib, one per vein.
+function veinCuts() {
+  const count = floor(random(6, 13));
+  const first = random(0.05, 0.16);
+  const last = random(0.7, 0.88);
+  const gap = (last - first) / max(count - 1, 1);
+  const cuts = [];
+  for (let i = 0; i < count; i++) {
+    // jitter stays under half a gap, so the cuts keep their order
+    cuts.push(first + gap * (i + random(-0.25, 0.25)));
+  }
+  return cuts;
+}
+
+function rampColor(stops, amount) {
+  const pos = constrain(amount, 0, 1) * (stops.length - 1);
+  const i = floor(pos);
+  return lerpColor(stops[i], stops[min(i + 1, stops.length - 1)], pos - i);
+}
+
+// Pushes a colour towards grey and then towards a dark tone, so distant and very
+// near leaves drop out of focus instead of competing with the middle layer.
+function muteColor(c, amount) {
+  const grey = 0.3 * red(c) + 0.59 * green(c) + 0.11 * blue(c);
+  const flat = lerpColor(c, color(grey), amount * 0.8);
+  return lerpColor(flat, color('#1D2A24'), amount * 0.5);
+}
+
+// A plain p5 fill underneath keeps the shape opaque and stops the layers below
+// bleeding through; the brush pass on top, shaded a little so it reads against
+// that fill, only supplies the grain.
+function paintPatch(points, tone, fillAlpha = BAND_ALPHA, shade = BRUSH_SHADE, bleed = 0.04) {
+  noStroke();
+  fill(red(tone), green(tone), blue(tone), fillAlpha * 255);
+  beginShape();
+  for (const p of points) vertex(p.x, p.y);
+  endShape(CLOSE);
+
+  brush.noStroke();
+  brush.fill(lerpColor(tone, color(0), shade), BRUSH_ALPHA);
+  brush.fillBleed(bleed, bleed > 0.15 ? 'out' : undefined);
+  brush.fillTexture(0.9, 0.5);
+  brush.polygon(points.map((p) => [p.x, p.y]));
+}
+
+// Yields between pieces so a frame only ever paints one stem or one band, and
+// always at a point where no transform is left on the stack.
+function* paintArrangement(plants) {
+  for (const plant of plants) {
+    const stemTone = muteColor(lerpColor(plant.stemColor, color(0), 0.2), plant.mute);
+    brush.noFill();
+    brush.set('HB', stemTone, plant.stemWeight * 0.35);
+    brush.spline(plant.stem.map((p) => [p.x, p.y]), 0.4);
+    yield;
+
+    if (plant.kind === 'blob') {
+      push();
+      translate(plant.base.x, plant.base.y);
+      paintPatch(plant.blob, plant.mute > 0 ? muteColor(plant.tone, plant.mute) : plant.tone);
+      pop();
+      yield;
+      continue;
+    }
+    if (plant.kind !== 'leaf') continue;
+
+    for (const band of plant.leaf.bands) {
+      const tone = plant.mute > 0 ? muteColor(band.fillColor, plant.mute) : band.fillColor;
+      const outline = band.points.map((p) => [p.x, p.y]);
+      push();
+      translate(plant.base.x, plant.base.y);
+      rotate(plant.rotation);
+      paintPatch(band.points, tone);
+
+      // highlight: a second, stronger pass in the leaf's secondary colour, bleeding
+      // in or out from the band edge so it reads as a gradient across the segment
+      if (band.accent) {
+        const accent = plant.mute > 0 ? muteColor(band.accent.tone, plant.mute) : band.accent.tone;
+        if (band.accent.mass) {
+          const { brushName, strength, gradient } = band.accent.mass;
+          brush.noFill();
+          brush.mass(brushName, accent, { strength, gradient, outline: false });
+          brush.polygon(outline);
+          brush.noMass();
+        } else {
+          brush.fill(accent, ACCENT_ALPHA);
+          brush.fillBleed(band.accent.bleed, band.accent.direction);
+          brush.fillTexture(band.accent.textureAmount, band.accent.border);
+          brush.polygon(outline);
+        }
+      }
+      brush.noFill();
+
+      pop();
+      yield;
+    }
+
+    if (plant.leaf.markers.length > 0) {
+      push();
+      translate(plant.base.x, plant.base.y);
+      rotate(plant.rotation);
+      brush.noFill();
+      for (const mark of plant.leaf.markers) {
+        const tone = plant.mute > 0 ? muteColor(mark.tone, plant.mute) : mark.tone;
+        brush.set(mark.brushName, tone, mark.weight);
+        brush.spline(plant.leaf.veinPath(mark.cut, mark.side).map((p) => [p.x, p.y]), 0.3);
+      }
+      pop();
+      yield;
+    }
+  }
+}
+</script>
+</body>
+</html>
