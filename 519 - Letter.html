@@ -1,0 +1,2247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Конверт и письмо без текста</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a120c;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        canvas#webgl {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            outline: none;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js",
+            "gsap": "https://unpkg.com/gsap@3.12.5/index.js",
+            "postprocessing/PostProcessor.js": "./postprocessing/PostProcessor.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="webgl"></canvas>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import GUI from 'lil-gui';
+        import gsap from 'gsap';
+
+        // =========================================================================
+        // POST PROCESSOR SUITE (From postprocessing/PostProcessor.js)
+        // Inlined for complete standalone file:// protocol support & web servers
+        // =========================================================================
+        const orthoVertexShader = `
+        precision highp float;
+        in vec3 position;
+        out vec2 vUv;
+        void main() {
+          vUv = position.xy * 0.5 + 0.5;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+        `;
+
+        const brightFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float bloomThreshold;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        vec3 sanitize(vec3 v) {
+          if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+          if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+          if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+          return clamp(v, vec3(0.0), vec3(65000.0));
+        }
+
+        void main() {
+          vec4 raw = texture(inputTexture, vUv);
+          vec3 color = sanitize(raw.rgb);
+          float luminance = max(0.0, dot(color, vec3(0.2126, 0.7152, 0.0722)));
+          float knee = 0.1;
+          float soft = luminance - bloomThreshold + knee;
+          soft = clamp(soft, 0.0, 2.0 * knee);
+          soft = (soft * soft) / (4.0 * knee + 0.00001);
+          float contribution = max(soft, luminance - bloomThreshold);
+          contribution /= max(luminance, 0.0001);
+          vec3 result = color * contribution;
+          fragColor = vec4(sanitize(result), clamp(raw.a, 0.0, 1.0));
+        }
+        `;
+
+        const blur13ShaderChunk = `
+        vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+          vec2 resolution = vec2(textureSize(image, 0));
+          vec4 color = vec4(0.0);
+          vec2 off1 = vec2(1.411764705882353) * direction;
+          vec2 off2 = vec2(3.2941176470588234) * direction;
+          vec2 off3 = vec2(5.176470588235294) * direction;
+          color += texture(image, uv) * 0.1964825501511404;
+          color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+          color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+          color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+          color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+          return color;
+        }
+        `;
+
+        const blurFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 direction;
+        in vec2 vUv;
+        out vec4 color;
+        ${blur13ShaderChunk}
+
+        vec4 sanitize(vec4 v) {
+          if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+          if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+          if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+          if (isnan(v.w) || isinf(v.w)) v.w = 0.0;
+          return clamp(v, vec4(0.0), vec4(65000.0));
+        }
+
+        void main() {
+          color = sanitize(blur13(inputTexture, vUv, direction));
+        }
+        `;
+
+        const anamorphicBrightShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float threshold;
+        uniform float smoothWidth;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          vec4 color = texture(inputTexture, vUv);
+          float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+          fragColor = mix(vec4(0.0), color, alpha);
+        }
+        `;
+
+        const anamorphicBlurShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform vec2 resolution;
+        uniform float samples;
+        uniform float intensity;
+        uniform vec3 tintColor;
+        uniform float bloomRadius;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        void main() {
+          int halfSamples = max(1, int(samples) / 2);
+          float fHalfSamples = float(halfSamples);
+          vec2 invSize = 1.0 / resolution;
+          vec4 total = vec4(0.0);
+
+          for (int i = -64; i <= 64; i++) {
+            if (i < -halfSamples || i > halfSamples) continue;
+            float softness = 1.0 - abs(float(i)) / fHalfSamples;
+            softness = pow(softness, 2.0);
+            vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+            shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+            total += texture(inputTexture, shiftedUV) * softness;
+          }
+
+          fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+        }
+        `;
+
+        const finalFragmentShader = `
+        precision highp float;
+        uniform vec2 resolution;
+        uniform sampler2D inputTexture;
+        uniform sampler2D blur0Texture;
+        uniform sampler2D blur1Texture;
+        uniform sampler2D blur2Texture;
+        uniform sampler2D blur3Texture;
+        uniform sampler2D blur4Texture;
+        uniform sampler2D anamorphicTexture;
+        uniform bool bloomEnabled;
+        uniform bool anamorphicEnabled;
+        uniform float bloomStrength;
+        uniform float bloomRadius;
+        uniform float vignetteBoost;
+        uniform float vignetteReduction;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        vec3 sanitize(vec3 v) {
+          if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+          if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+          if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+          return clamp(v, vec3(0.0), vec3(65000.0));
+        }
+
+        void main() {
+          vec4 rawBase = texture(inputTexture, vUv);
+          vec3 color = sanitize(rawBase.rgb);
+
+          if (bloomEnabled) {
+            vec3 b0 = sanitize(texture(blur0Texture, vUv).rgb);
+            vec3 b1 = sanitize(texture(blur1Texture, vUv).rgb);
+            vec3 b2 = sanitize(texture(blur2Texture, vUv).rgb);
+            vec3 b3 = sanitize(texture(blur3Texture, vUv).rgb);
+            vec3 b4 = sanitize(texture(blur4Texture, vUv).rgb);
+            float r = clamp(bloomRadius, 0.0, 1.0);
+            float w0 = 1.0 - 0.7 * r;
+            float w1 = 0.8;
+            float w2 = 0.6 + 0.4 * r;
+            float w3 = 0.4 + 0.6 * r;
+            float w4 = 0.2 + 0.8 * r;
+            vec3 bloom = (b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4);
+            color += bloom * bloomStrength;
+          }
+
+          if (anamorphicEnabled) {
+            vec3 a = sanitize(texture(anamorphicTexture, vUv).rgb);
+            color += a;
+          }
+
+          vec2 center = vUv - 0.5;
+          float dist = length(center);
+          float vig = 1.0 - smoothstep(vignetteBoost * 0.5, vignetteBoost * 0.5 + vignetteReduction * 0.5, dist);
+          color *= clamp(vig, 0.0, 1.0);
+
+          fragColor = vec4(sanitize(color), clamp(rawBase.a, 0.0, 1.0));
+        }
+        `;
+
+        const rgbSplitFragmentShader = `
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform float chromaticAberration;
+        uniform float noiseIntensity;
+        uniform float fisheyeStrength;
+        uniform float fisheyeRadius;
+        uniform float gamma;
+        uniform float minInputLevel;
+        uniform float maxInputLevel;
+        uniform float exposure;
+        uniform float time;
+        in vec2 vUv;
+        out vec4 fragColor;
+
+        vec3 ACESFilmicToneMapping(vec3 x) {
+          float a = 2.51;
+          float b = 0.03;
+          float c = 2.43;
+          float d = 0.59;
+          float e = 0.14;
+          return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+        }
+
+        vec3 finalLevels(vec3 color, vec3 minIn, vec3 gammaIn, vec3 maxIn) {
+          return pow(clamp((color - minIn) / max(maxIn - minIn, vec3(0.0001)), 0.0, 1.0), 1.0 / max(gammaIn, vec3(0.0001)));
+        }
+
+        float hash(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.x + p3.y) * p3.z);
+        }
+
+        void main() {
+          vec2 uv = vUv;
+          if (abs(fisheyeStrength) > 0.001) {
+            vec2 d = uv - 0.5;
+            float r = length(d) / max(fisheyeRadius, 0.001);
+            float bind = (fisheyeStrength > 0.0) ? 0.7071 : 0.5;
+            if (r < bind) {
+              float factor = 1.0 + fisheyeStrength * (r * r);
+              uv = 0.5 + d * factor;
+            }
+          }
+
+          vec2 offset = (uv - 0.5) * chromaticAberration;
+          float r = texture(inputTexture, uv - offset).r;
+          float g = texture(inputTexture, uv).g;
+          float b = texture(inputTexture, uv + offset).b;
+          vec3 col = vec3(r, g, b);
+
+          if (noiseIntensity > 0.0001) {
+            float n = (hash(uv * 1234.5 + time) - 0.5) * noiseIntensity;
+            col += n;
+          }
+
+          vec3 exposedColor = col * exposure;
+          vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+          vec3 finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gamma), vec3(maxInputLevel));
+
+          fragColor = vec4(finalCol, 1.0);
+        }
+        `;
+
+        function createFBO(w, h, options = {}) {
+          return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+            wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+            wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+            minFilter: options.minFilter || THREE.LinearFilter,
+            magFilter: options.magFilter || THREE.LinearFilter,
+            format: options.format || THREE.RGBAFormat,
+            type: options.type || THREE.HalfFloatType,
+            stencilBuffer: options.stencilBuffer || false,
+            depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : true,
+            samples: options.samples || 0,
+          });
+        }
+
+        class ShaderPass {
+          constructor(shader, options = {}) {
+            this.shader = shader;
+            this.orthoScene = new THREE.Scene();
+            this.fbo = createFBO(1, 1, options);
+            this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+            this.orthoScene.add(this.orthoQuad);
+            this.texture = this.fbo.texture;
+          }
+          render(renderer, toScreen = false) {
+            if (!toScreen) renderer.setRenderTarget(this.fbo);
+            renderer.render(this.orthoScene, this.orthoCamera);
+            if (!toScreen) renderer.setRenderTarget(null);
+          }
+          setSize(width, height) {
+            this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+            this.orthoQuad.scale.set(width, height, 1);
+          }
+        }
+
+        class BloomPass {
+          constructor(strength = 1.0, radius = 0.5, threshold = 0.2, levels = 5) {
+            this.strength = strength;
+            this.radius = radius;
+            this.threshold = threshold;
+            this.levels = levels;
+
+            this.brightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                bloomThreshold: { value: this.threshold },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: brightFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.brightPass = new ShaderPass(this.brightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.blurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                direction: { value: new THREE.Vector2(1, 0) },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: blurFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+
+            this.blurPasses = [];
+            for (let i = 0; i < this.levels; i++) {
+              this.blurPasses.push(
+                new ShaderPass(this.blurShader, {
+                  format: THREE.RGBAFormat,
+                  type: THREE.HalfFloatType,
+                })
+              );
+            }
+          }
+
+          setSize(width, height) {
+            this.brightPass.setSize(width, height);
+            let w = width;
+            let h = height;
+            for (let i = 0; i < this.levels; i++) {
+              w = Math.max(1, Math.floor(w / 2));
+              h = Math.max(1, Math.floor(h / 2));
+              this.blurPasses[i].setSize(w, h);
+            }
+          }
+
+          render(renderer) {
+            this.brightShader.uniforms.inputTexture.value = this.source;
+            this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+            this.brightPass.render(renderer);
+
+            let input = this.brightPass.texture;
+            for (let i = 0; i < this.levels; i++) {
+              const pass = this.blurPasses[i];
+              this.blurShader.uniforms.inputTexture.value = input;
+              this.blurShader.uniforms.direction.value.set(1, 0);
+              pass.render(renderer);
+
+              this.blurShader.uniforms.inputTexture.value = pass.texture;
+              this.blurShader.uniforms.direction.value.set(0, 1);
+              pass.render(renderer);
+
+              input = pass.texture;
+            }
+          }
+        }
+
+        class PostProcessor {
+          constructor(renderer, params = {}) {
+            this.renderer = renderer;
+
+            this.settings = {
+              enabled: params.enabled !== undefined ? params.enabled : true,
+
+              // 1. Universal Bloom
+              bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+              bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.85,
+              bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.5,
+              bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.25,
+
+              // 2. Anamorphic Flare (STRICTLY DEFAULT OFF as requested)
+              anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+              anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 3.5,
+              anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.4,
+              anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 64,
+              anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+              anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+              anamorphicColor: params.anamorphicColor ? (params.anamorphicColor.isColor ? params.anamorphicColor.clone() : new THREE.Color(params.anamorphicColor)) : new THREE.Color(0xffb050),
+              anamorphicColorHex: params.anamorphicColorHex || '#ffb050',
+
+              // 3. Lens & Camera Optics
+              fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+              fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+              chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.003,
+              vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.05,
+              vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.55,
+              noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.008,
+
+              // 4. Color Grading, Exposure & Tone
+              gamma: params.gamma !== undefined ? params.gamma : 1.0,
+              minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+              maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+              exposure: params.exposure !== undefined ? params.exposure : 1.0,
+            };
+
+            const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+            this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: maxSamples, depthBuffer: true });
+
+            this.bloomPass = new BloomPass(
+              this.settings.bloomStrength,
+              this.settings.bloomRadius,
+              this.settings.bloomThreshold,
+              5
+            );
+
+            // Anamorphic Passes
+            this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                threshold: { value: this.settings.anamorphicThreshold },
+                smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: anamorphicBrightShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                resolution: { value: new THREE.Vector2(1, 1) },
+                samples: { value: this.settings.anamorphicSamples },
+                intensity: { value: this.settings.anamorphicIntensity },
+                tintColor: { value: this.settings.anamorphicColor },
+                bloomRadius: { value: this.settings.anamorphicRadius },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: anamorphicBlurShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            // Final Composite Pass
+            this.finalShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                resolution: { value: new THREE.Vector2(1, 1) },
+                inputTexture: { value: null },
+                blur0Texture: { value: null },
+                blur1Texture: { value: null },
+                blur2Texture: { value: null },
+                blur3Texture: { value: null },
+                blur4Texture: { value: null },
+                anamorphicTexture: { value: null },
+                bloomEnabled: { value: this.settings.bloomEnabled },
+                anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+                bloomStrength: { value: this.settings.bloomStrength },
+                bloomRadius: { value: this.settings.bloomRadius },
+                vignetteBoost: { value: this.settings.vignetteBoost },
+                vignetteReduction: { value: this.settings.vignetteReduction },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: finalFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.finalPass = new ShaderPass(this.finalShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+
+            // RGB Split, Film Grain & Tone Curve Pass
+            this.rgbShader = new THREE.RawShaderMaterial({
+              uniforms: {
+                inputTexture: { value: null },
+                chromaticAberration: { value: this.settings.chromaticAberration },
+                noiseIntensity: { value: this.settings.noiseIntensity },
+                fisheyeStrength: { value: this.settings.fisheyeStrength },
+                fisheyeRadius: { value: this.settings.fisheyeRadius },
+                gamma: { value: this.settings.gamma },
+                minInputLevel: { value: this.settings.minInputLevel },
+                maxInputLevel: { value: this.settings.maxInputLevel },
+                exposure: { value: this.settings.exposure },
+                time: { value: 0 },
+              },
+              vertexShader: orthoVertexShader,
+              fragmentShader: rgbSplitFragmentShader,
+              glslVersion: THREE.GLSL3,
+            });
+            this.rgbPass = new ShaderPass(this.rgbShader, {
+              format: THREE.RGBAFormat,
+              type: THREE.HalfFloatType,
+            });
+          }
+
+          updateSettings() {
+            this.bloomPass.strength = this.settings.bloomStrength;
+            this.bloomPass.radius = this.settings.bloomRadius;
+            this.bloomPass.threshold = this.settings.bloomThreshold;
+
+            this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+            this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+            this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+            this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+            this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+            this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+            this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+            this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+            this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+            this.finalShader.uniforms.bloomRadius.value = this.settings.bloomRadius;
+            this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+            this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+
+            this.rgbShader.uniforms.chromaticAberration.value = this.settings.chromaticAberration;
+            this.rgbShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+            this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+            this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+            this.rgbShader.uniforms.gamma.value = this.settings.gamma;
+            this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+            this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+            this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+          }
+
+          setSize(width, height) {
+            const w = Math.max(1, width);
+            const h = Math.max(1, height);
+            this.sceneTarget.setSize(w, h);
+            this.bloomPass.setSize(w, h);
+            this.finalPass.setSize(w, h);
+            this.finalShader.uniforms.resolution.value.set(w, h);
+
+            const anW = Math.max(1, Math.floor(w / 2));
+            const anH = Math.max(1, Math.floor(h / 4));
+            this.anamorphicBrightPass.setSize(anW, anH);
+            this.anamorphicBlurPass.setSize(anW, anH);
+            this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+            this.rgbPass.setSize(w, h);
+          }
+
+          renderScene(scene, camera) {
+            if (!this.settings.enabled) {
+              this.renderer.render(scene, camera);
+              return;
+            }
+
+            this.renderer.setRenderTarget(this.sceneTarget);
+            this.renderer.render(scene, camera);
+            this.renderer.setRenderTarget(null);
+
+            this.render(this.sceneTarget.texture);
+          }
+
+          render(sourceTexture) {
+            if (this.settings.bloomEnabled) {
+              this.bloomPass.source = sourceTexture;
+              this.bloomPass.render(this.renderer);
+              this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+              this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+              this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+              this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+              this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+            }
+
+            if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+              this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+              this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+              this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+              this.anamorphicBrightPass.render(this.renderer);
+
+              this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+              this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+              this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+              this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+              this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+              this.anamorphicBlurPass.render(this.renderer);
+
+              this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+              this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+            } else {
+              this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+            }
+
+            const rTime = Math.random() * 10000;
+            this.finalPass.shader.uniforms.time.value = rTime;
+            this.rgbPass.shader.uniforms.time.value = rTime;
+
+            this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+            this.finalPass.render(this.renderer);
+
+            this.rgbPass.shader.uniforms.inputTexture.value = this.finalPass.texture;
+            this.rgbPass.render(this.renderer, true);
+          }
+
+          attachGUI(gui, title = "Post-Processing (PostProcessor.js)") {
+            const root = gui.addFolder(title);
+            root.add(this.settings, "enabled").name("Enable Post-Process");
+
+            // Atmospheric Bloom
+            const bloom = root.addFolder("Atmospheric Bloom");
+            bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Bloom Strength").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Bloom Radius").onChange(() => this.updateSettings());
+            bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Bloom Threshold").onChange(() => this.updateSettings());
+
+            // Three.js Anamorphic Flare (STRICTLY DEFAULT OFF)
+            const anamorphic = root.addFolder("Three.js Anamorphic Flare");
+            anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Anamorphic").onChange(() => this.updateSettings());
+            anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+            anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+            anamorphic.add(this.settings, "anamorphicSamples", 2, 128, 1).name("Samples").onChange(() => this.updateSettings());
+            anamorphic.addColor(this.settings, "anamorphicColorHex").name("Tint Color").onChange((v) => {
+              this.settings.anamorphicColor.set(v);
+              this.updateSettings();
+            });
+
+            // Lens, Optics & Film Grain
+            const lens = root.addFolder("Lens & Film Grain");
+            lens.add(this.settings, "chromaticAberration", 0, 0.05, 0.001).name("Chromatic Aberr.").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+            lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+            lens.add(this.settings, "noiseIntensity", 0, 0.06, 0.002).name("Film Grain").onChange(() => this.updateSettings());
+
+            root.close();
+            return root;
+          }
+        }
+
+        // --- 19 Preconfigured Color Schemes (+ Extended Palettes) ---
+        const COLOR_SCHEMES = {
+            'Original': {
+                name: 'Original',
+                envelopeColor: '#F5ECE1',
+                letterColor: '#FFFDF9',
+                woodColor: '#4A2E1E',
+                roseColor: '#781A24',
+                roseStemColor: '#362417',
+                waxSealColor: '#84121A',
+                windowLightColor: '#FFE7C7',
+                innerGlowColor: '#FFD38A',
+                fillLightColor: '#52637A',
+                bgColor: '#18100A'
+            },
+            'Monochromatic': {
+                name: 'Monochromatic',
+                envelopeColor: '#D8C7B8',
+                letterColor: '#EFE6DE',
+                woodColor: '#3D2A1F',
+                roseColor: '#634233',
+                roseStemColor: '#3D281E',
+                waxSealColor: '#704B38',
+                windowLightColor: '#F2D7BF',
+                innerGlowColor: '#DEB887',
+                fillLightColor: '#524339',
+                bgColor: '#1C120C'
+            },
+            'Analogous': {
+                name: 'Analogous',
+                envelopeColor: '#F4D275',
+                letterColor: '#FFF4D9',
+                woodColor: '#421E14',
+                roseColor: '#B51A1D',
+                roseStemColor: '#421C11',
+                waxSealColor: '#961B0C',
+                windowLightColor: '#FFB805',
+                innerGlowColor: '#F78104',
+                fillLightColor: '#5E2215',
+                bgColor: '#1F0C06'
+            },
+            'Complementary': {
+                name: 'Complementary',
+                envelopeColor: '#E8C5A2',
+                letterColor: '#FAF2EA',
+                woodColor: '#123238',
+                roseColor: '#C45A40',
+                roseStemColor: '#1B3B40',
+                waxSealColor: '#A13922',
+                windowLightColor: '#FFDF9E',
+                innerGlowColor: '#FFA04D',
+                fillLightColor: '#194B54',
+                bgColor: '#0A1E21'
+            },
+            'Split-complementary': {
+                name: 'Split-complementary',
+                envelopeColor: '#E5BD7C',
+                letterColor: '#FDF6E7',
+                woodColor: '#17223D',
+                roseColor: '#AA4333',
+                roseStemColor: '#232542',
+                waxSealColor: '#802F23',
+                windowLightColor: '#FFDE91',
+                innerGlowColor: '#F5A464',
+                fillLightColor: '#23376B',
+                bgColor: '#0C1221'
+            },
+            'Triadic': {
+                name: 'Triadic',
+                envelopeColor: '#D9D1AD',
+                letterColor: '#F6F4E8',
+                woodColor: '#272C24',
+                roseColor: '#B04858',
+                roseStemColor: '#2E382A',
+                waxSealColor: '#8A2E3D',
+                windowLightColor: '#FFE399',
+                innerGlowColor: '#E37C62',
+                fillLightColor: '#334A42',
+                bgColor: '#141712'
+            },
+            'Tetradic': {
+                name: 'Tetradic',
+                envelopeColor: '#D6B4DA',
+                letterColor: '#F7EFF9',
+                woodColor: '#251A30',
+                roseColor: '#C75C38',
+                roseStemColor: '#332042',
+                waxSealColor: '#993B22',
+                windowLightColor: '#F5A464',
+                innerGlowColor: '#E87153',
+                fillLightColor: '#3E2554',
+                bgColor: '#150E1C'
+            },
+            'Double split-complementary': {
+                name: 'Double split-complementary',
+                envelopeColor: '#DFBBA5',
+                letterColor: '#F9F1E9',
+                woodColor: '#14252E',
+                roseColor: '#BA4C3B',
+                roseStemColor: '#1C3845',
+                waxSealColor: '#8C3022',
+                windowLightColor: '#EBC770',
+                innerGlowColor: '#2FA394',
+                fillLightColor: '#1E4759',
+                bgColor: '#0A161C'
+            },
+            'Achromatic (black and white)': {
+                name: 'Achromatic (black and white)',
+                envelopeColor: '#EBEBEB',
+                letterColor: '#FFFFFF',
+                woodColor: '#262626',
+                roseColor: '#4A4A4A',
+                roseStemColor: '#242424',
+                waxSealColor: '#363636',
+                windowLightColor: '#FFFFFF',
+                innerGlowColor: '#EAEAEA',
+                fillLightColor: '#424242',
+                bgColor: '#121212'
+            },
+            'Achromatic (white and black)': {
+                name: 'Achromatic (white and black)',
+                envelopeColor: '#303030',
+                letterColor: '#F8F8F8',
+                woodColor: '#424242',
+                roseColor: '#6E6E6E',
+                roseStemColor: '#3D3D3D',
+                waxSealColor: '#242424',
+                windowLightColor: '#EDEDED',
+                innerGlowColor: '#FFFFFF',
+                fillLightColor: '#5C5C5C',
+                bgColor: '#1E1E1E'
+            },
+            'Achromatic + Accent (black and white + red)': {
+                name: 'Achromatic + Accent (black and white + red)',
+                envelopeColor: '#E6E6E6',
+                letterColor: '#FAFAFA',
+                woodColor: '#2B2B2B',
+                roseColor: '#BD0E26',
+                roseStemColor: '#291F21',
+                waxSealColor: '#960618',
+                windowLightColor: '#FFFFFF',
+                innerGlowColor: '#FF2E4F',
+                fillLightColor: '#454545',
+                bgColor: '#141414'
+            },
+            'Achromatic + Accent (white and black + red)': {
+                name: 'Achromatic + Accent (white and black + red)',
+                envelopeColor: '#333333',
+                letterColor: '#F2F2F2',
+                woodColor: '#474747',
+                roseColor: '#E83C49',
+                roseStemColor: '#381C1E',
+                waxSealColor: '#DC062D',
+                windowLightColor: '#FFFFFF',
+                innerGlowColor: '#FF5070',
+                fillLightColor: '#5E5E5E',
+                bgColor: '#1F1F1F'
+            },
+            'Neutral + accent': {
+                name: 'Neutral + accent',
+                envelopeColor: '#E6DCCE',
+                letterColor: '#FAF7F0',
+                woodColor: '#3D281D',
+                roseColor: '#C7222E',
+                roseStemColor: '#38271E',
+                waxSealColor: '#A31520',
+                windowLightColor: '#FFECCC',
+                innerGlowColor: '#FF473B',
+                fillLightColor: '#4F3E33',
+                bgColor: '#1C120C'
+            },
+            'Palette (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)': {
+                name: 'Palette (F6AA1C, BC3908, 941B0C, F6AA1C, 220901)',
+                envelopeColor: '#F6AA1C',
+                letterColor: '#FFF6DE',
+                woodColor: '#421B10',
+                roseColor: '#941B0C',
+                roseStemColor: '#4A190C',
+                waxSealColor: '#BC3908',
+                windowLightColor: '#F6AA1C',
+                innerGlowColor: '#FFA500',
+                fillLightColor: '#632512',
+                bgColor: '#1F0C05'
+            },
+            'Palette (63D1CF, 5BC0BE, 4BAD9E, 4BAD9E, 0B132B, 000000)': {
+                name: 'Palette (63D1CF, 5BC0BE, 4BAD9E, 4BAD9E, 0B132B, 000000)',
+                envelopeColor: '#63D1CF',
+                letterColor: '#E2F9F8',
+                woodColor: '#172745',
+                roseColor: '#4BAD9E',
+                roseStemColor: '#1A3F4F',
+                waxSealColor: '#5BC0BE',
+                windowLightColor: '#63D1CF',
+                innerGlowColor: '#4BAD9E',
+                fillLightColor: '#204066',
+                bgColor: '#09101C'
+            },
+            'Palette (AA60C8, D69ADE, C9A3C6, CFB5C2, 0D001D, 120A12)': {
+                name: 'Palette (AA60C8, D69ADE, C9A3C6, CFB5C2, 0D001D, 120A12)',
+                envelopeColor: '#D69ADE',
+                letterColor: '#F7E7F9',
+                woodColor: '#26103B',
+                roseColor: '#AA60C8',
+                roseStemColor: '#36154A',
+                waxSealColor: '#C9A3C6',
+                windowLightColor: '#CFB5C2',
+                innerGlowColor: '#D69ADE',
+                fillLightColor: '#3E1C59',
+                bgColor: '#160824'
+            },
+            'Palette (FEF1BE, FFBA00, 008189, 00474D, 061210)': {
+                name: 'Palette (FEF1BE, FFBA00, 008189, 00474D, 061210)',
+                envelopeColor: '#FEF1BE',
+                letterColor: '#FFFFF0',
+                woodColor: '#112925',
+                roseColor: '#008189',
+                roseStemColor: '#123D36',
+                waxSealColor: '#00474D',
+                windowLightColor: '#FFBA00',
+                innerGlowColor: '#FEF1BE',
+                fillLightColor: '#1A4D45',
+                bgColor: '#0A1A17'
+            },
+            'Palette (D4FFB0, 7FFF00, 00B894, 0A3322, 05140A)': {
+                name: 'Palette (D4FFB0, 7FFF00, 00B894, 0A3322, 05140A)',
+                envelopeColor: '#D4FFB0',
+                letterColor: '#F7FFE8',
+                woodColor: '#163828',
+                roseColor: '#00B894',
+                roseStemColor: '#194A32',
+                waxSealColor: '#7FFF00',
+                windowLightColor: '#D4FFB0',
+                innerGlowColor: '#7FFF00',
+                fillLightColor: '#1D543B',
+                bgColor: '#0C2117'
+            },
+            'Palette (FFE8CC, FF8C00, C7501A, 3D1050, 0E0618)': {
+                name: 'Palette (FFE8CC, FF8C00, C7501A, 3D1050, 0E0618)',
+                envelopeColor: '#FFE8CC',
+                letterColor: '#FFF8F0',
+                woodColor: '#2B1438',
+                roseColor: '#C7501A',
+                roseStemColor: '#3D1D3A',
+                waxSealColor: '#FF8C00',
+                windowLightColor: '#FFE8CC',
+                innerGlowColor: '#FF8C00',
+                fillLightColor: '#4D1A61',
+                bgColor: '#170921'
+            },
+            'Palette (E8E0FF, B38FFF, 6A3DE8, 1A1250, 090612)': {
+                name: 'Palette (E8E0FF, B38FFF, 6A3DE8, 1A1250, 090612)',
+                envelopeColor: '#E8E0FF',
+                letterColor: '#F8F6FF',
+                woodColor: '#241B4A',
+                roseColor: '#6A3DE8',
+                roseStemColor: '#2E2259',
+                waxSealColor: '#B38FFF',
+                windowLightColor: '#E8E0FF',
+                innerGlowColor: '#B38FFF',
+                fillLightColor: '#322569',
+                bgColor: '#120C26'
+            },
+            'Palette (E0FBFF, 00F0FF, D40078, 1E0A3D, 05020F)': {
+                name: 'Palette (E0FBFF, 00F0FF, D40078, 1E0A3D, 05020F)',
+                envelopeColor: '#E0FBFF',
+                letterColor: '#F5FEFF',
+                woodColor: '#26123D',
+                roseColor: '#D40078',
+                roseStemColor: '#381647',
+                waxSealColor: '#00F0FF',
+                windowLightColor: '#E0FBFF',
+                innerGlowColor: '#00F0FF',
+                fillLightColor: '#3D175E',
+                bgColor: '#140724'
+            }
+        };
+
+        // --- 8 Preconfigured Smooth Slow Animations ---
+        const ANIMATION_PRESETS = [
+            'Gentle Romantic Drift',
+            'Static (No Camera Motion)',
+            'Slow Cinematic Orbit',
+            'Top-Down Overhead Study',
+            'Window Light & Long Shadows',
+            'Macro Detail: Rose & Seal',
+            'Ethereal Petal Ascent',
+            'Poetic Still-Life Infinity'
+        ];
+
+        // --- Core Settings State ---
+        const settings = {
+            scheme: 'Original',
+            greenScreen: false,
+            bgColor: COLOR_SCHEMES['Original'].bgColor,
+            envelopeColor: COLOR_SCHEMES['Original'].envelopeColor,
+            letterColor: COLOR_SCHEMES['Original'].letterColor,
+            woodColor: COLOR_SCHEMES['Original'].woodColor,
+            roseColor: COLOR_SCHEMES['Original'].roseColor,
+            roseStemColor: COLOR_SCHEMES['Original'].roseStemColor,
+            waxSealColor: COLOR_SCHEMES['Original'].waxSealColor,
+            innerGlowColor: COLOR_SCHEMES['Original'].innerGlowColor,
+            windowLightColor: COLOR_SCHEMES['Original'].windowLightColor,
+            fillLightColor: COLOR_SCHEMES['Original'].fillLightColor,
+
+            animationPreset: ANIMATION_PRESETS[0],
+            animSpeed: 1.0,
+            flapProgress: 0.0,
+            autoAnimateFlap: true,
+            petalFlowSpeed: 1.0,
+
+            // Camera & Interactions
+            userZoomDistance: 7.2,
+            userOrbitYaw: 0.0,
+            userOrbitPitch: 0.0,
+            userPanX: 0.0,
+            userPanY: 0.0,
+            clickToRandomize: true,
+
+            // Lighting & Renderer
+            exposure: 1.10,
+            keyLightIntensity: 2.4,
+            ambientLightIntensity: 0.85,
+            fillLightIntensity: 0.55,
+            innerGlowIntensity: 1.2,
+            dpr: Math.min(window.devicePixelRatio || 1.0, 2.0),
+            antialias: true
+        };
+
+        // --- Application Globals ---
+        let scene, camera, renderer, postProcessor;
+        let windowLight, ambientLight, fillLight, envelopeInnerLight, envelopeGlowMesh;
+        let deskMesh, envelopeGroup, flapPivot, letterMesh, roseGroup, waxSealGroup;
+        let woodMaterial, envelopeMaterial, letterMaterial, roseMaterial, stemMaterial, waxMaterial;
+        let petalParticles = [];
+        let petalGroup;
+        let gui;
+
+        // Interaction State
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let isPointerDown = false;
+        const pointerDownPos = new THREE.Vector2();
+        const lastPointerPos = new THREE.Vector2();
+        let isDraggingObject = false;
+        let draggedObject = null;
+        const dragPlane = new THREE.Plane();
+        const dragOffset = new THREE.Vector3();
+        const planeIntersect = new THREE.Vector3();
+
+        // Default transforms: clearly separated, completely free of overlaps
+        const defaultTransforms = {
+            envelope: { pos: new THREE.Vector3(0, 0.02, 0), rot: new THREE.Euler(0, -0.04, 0) },
+            rose: { pos: new THREE.Vector3(2.55, 0.03, 0.1), rot: new THREE.Euler(0, -0.22, 0.02) },
+            waxSeal: { pos: new THREE.Vector3(-2.6, 0.02, 0.55), rot: new THREE.Euler(0, 0.15, 0) }
+        };
+
+        // Procedural Textures
+        let woodTexture, woodRoughnessTexture;
+        let paperTexture, paperBumpTexture, softGlowTexture;
+
+        // --- Procedural Texture Generators ---
+        function generateProceduralTextures() {
+            // 1. Warm Rich Walnut Wood Texture
+            const woodCanvas = document.createElement('canvas');
+            woodCanvas.width = 2048;
+            woodCanvas.height = 2048;
+            const wCtx = woodCanvas.getContext('2d');
+
+            wCtx.fillStyle = '#482D1D';
+            wCtx.fillRect(0, 0, 2048, 2048);
+
+            for (let y = 0; y < 2048; y += 2) {
+                const s1 = Math.sin(y * 0.012 + Math.sin(y * 0.003) * 6.0);
+                const s2 = Math.sin(y * 0.045 + Math.cos(y * 0.01) * 4.0);
+                const v = 0.5 + 0.35 * s1 + 0.15 * s2;
+                const r = Math.floor(62 + v * 32);
+                const g = Math.floor(38 + v * 22);
+                const b = Math.floor(22 + v * 15);
+                wCtx.fillStyle = `rgb(${r},${g},${b})`;
+                wCtx.fillRect(0, y, 2048, 2);
+            }
+
+            wCtx.strokeStyle = 'rgba(25, 12, 6, 0.55)';
+            wCtx.lineWidth = 4;
+            for (let x = 512; x < 2048; x += 512) {
+                wCtx.beginPath();
+                wCtx.moveTo(x, 0);
+                wCtx.lineTo(x, 2048);
+                wCtx.stroke();
+
+                wCtx.strokeStyle = 'rgba(110, 75, 48, 0.25)';
+                wCtx.lineWidth = 2;
+                wCtx.beginPath();
+                wCtx.moveTo(x + 3, 0);
+                wCtx.lineTo(x + 3, 2048);
+                wCtx.stroke();
+                wCtx.strokeStyle = 'rgba(25, 12, 6, 0.55)';
+                wCtx.lineWidth = 4;
+            }
+
+            const imgData = wCtx.getImageData(0, 0, 2048, 2048);
+            const d = imgData.data;
+            for (let i = 0; i < d.length; i += 4) {
+                const n = (Math.random() - 0.5) * 14;
+                d[i] = Math.min(255, Math.max(0, d[i] + n));
+                d[i + 1] = Math.min(255, Math.max(0, d[i + 1] + n));
+                d[i + 2] = Math.min(255, Math.max(0, d[i + 2] + n));
+            }
+            wCtx.putImageData(imgData, 0, 0);
+
+            woodTexture = new THREE.CanvasTexture(woodCanvas);
+            woodTexture.wrapS = THREE.RepeatWrapping;
+            woodTexture.wrapT = THREE.RepeatWrapping;
+            woodTexture.repeat.set(1.5, 1.5);
+
+            const rCanvas = document.createElement('canvas');
+            rCanvas.width = 1024;
+            rCanvas.height = 1024;
+            const rCtx = rCanvas.getContext('2d');
+            rCtx.fillStyle = '#6E6E6E';
+            rCtx.fillRect(0, 0, 1024, 1024);
+            for (let i = 0; i < 400; i++) {
+                rCtx.fillStyle = Math.random() > 0.5 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)';
+                const y = Math.random() * 1024;
+                rCtx.fillRect(0, y, 1024, 2 + Math.random() * 4);
+            }
+            woodRoughnessTexture = new THREE.CanvasTexture(rCanvas);
+            woodRoughnessTexture.wrapS = THREE.RepeatWrapping;
+            woodRoughnessTexture.wrapT = THREE.RepeatWrapping;
+            woodRoughnessTexture.repeat.set(2, 2);
+
+            // 2. High-grade tactile paper texture (Smooth, no moiré)
+            const pCanvas = document.createElement('canvas');
+            pCanvas.width = 1024;
+            pCanvas.height = 1024;
+            const pCtx = pCanvas.getContext('2d');
+            pCtx.fillStyle = '#FFFFFF';
+            pCtx.fillRect(0, 0, 1024, 1024);
+
+            const pData = pCtx.getImageData(0, 0, 1024, 1024);
+            const pd = pData.data;
+            for (let i = 0; i < pd.length; i += 4) {
+                const n = (Math.random() - 0.5) * 12;
+                pd[i] = Math.min(255, Math.max(0, pd[i] + n));
+                pd[i + 1] = Math.min(255, Math.max(0, pd[i + 1] + n));
+                pd[i + 2] = Math.min(255, Math.max(0, pd[i + 2] + n));
+            }
+            pCtx.putImageData(pData, 0, 0);
+
+            pCtx.strokeStyle = 'rgba(180, 160, 140, 0.05)';
+            pCtx.lineWidth = 1;
+            for (let i = 0; i < 200; i++) {
+                pCtx.beginPath();
+                const sx = Math.random() * 1024;
+                const sy = Math.random() * 1024;
+                pCtx.moveTo(sx, sy);
+                pCtx.lineTo(sx + (Math.random() - 0.5) * 12, sy + (Math.random() - 0.5) * 12);
+                pCtx.stroke();
+            }
+
+            paperTexture = new THREE.CanvasTexture(pCanvas);
+            paperTexture.wrapS = THREE.RepeatWrapping;
+            paperTexture.wrapT = THREE.RepeatWrapping;
+            paperTexture.generateMipmaps = true;
+            paperTexture.minFilter = THREE.LinearMipmapLinearFilter;
+            paperTexture.repeat.set(2, 2);
+
+            paperBumpTexture = paperTexture;
+
+            // 3. Soft Radial Glow Texture for Delicate Inner Light
+            const gCanvas = document.createElement('canvas');
+            gCanvas.width = 512;
+            gCanvas.height = 512;
+            const gCtx = gCanvas.getContext('2d');
+            const grad = gCtx.createRadialGradient(256, 256, 0, 256, 256, 256);
+            grad.addColorStop(0, 'rgba(255, 240, 200, 1)');
+            grad.addColorStop(0.35, 'rgba(255, 210, 140, 0.6)');
+            grad.addColorStop(0.7, 'rgba(255, 180, 100, 0.15)');
+            grad.addColorStop(1, 'rgba(255, 160, 80, 0)');
+            gCtx.fillStyle = grad;
+            gCtx.fillRect(0, 0, 512, 512);
+
+            softGlowTexture = new THREE.CanvasTexture(gCanvas);
+        }
+
+        // --- Create 3D Desk Surface ---
+        function createDesk() {
+            const deskGeo = new THREE.PlaneGeometry(36, 36, 2, 2);
+            woodMaterial = new THREE.MeshStandardMaterial({
+                color: new THREE.Color(settings.woodColor),
+                map: woodTexture,
+                roughnessMap: woodRoughnessTexture,
+                roughness: 0.44,
+                metalness: 0.04
+            });
+
+            deskMesh = new THREE.Mesh(deskGeo, woodMaterial);
+            deskMesh.rotation.x = -Math.PI / 2;
+            deskMesh.position.y = 0;
+            deskMesh.receiveShadow = true;
+            deskMesh.name = 'DeskSurface';
+            scene.add(deskMesh);
+        }
+
+        // --- Create Realistic 3D Envelope & Enclosed Letter (No Leaks / No Model Outside) ---
+        function createEnvelope() {
+            envelopeGroup = new THREE.Group();
+            envelopeGroup.position.copy(defaultTransforms.envelope.pos);
+            envelopeGroup.rotation.copy(defaultTransforms.envelope.rot);
+            envelopeGroup.userData = { isInteractable: true, id: 'envelope' };
+
+            const w = 3.8;
+            const h = 2.4;
+
+            envelopeMaterial = new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(settings.envelopeColor),
+                map: paperTexture,
+                bumpMap: paperBumpTexture,
+                bumpScale: 0.003,
+                roughness: 0.76,
+                metalness: 0.01,
+                sheen: 0.22,
+                sheenColor: new THREE.Color(0xFFFFFF),
+                side: THREE.DoubleSide
+            });
+
+            // 1. Front Face of Envelope (Bottom plate resting on desk)
+            // Completely solid, no cutouts or seams
+            const frontPlateGeo = new THREE.PlaneGeometry(w, h);
+            const frontPlate = new THREE.Mesh(frontPlateGeo, envelopeMaterial);
+            frontPlate.rotation.x = -Math.PI / 2;
+            frontPlate.position.set(0, 0.005, 0);
+            frontPlate.receiveShadow = true;
+            frontPlate.castShadow = true;
+            envelopeGroup.add(frontPlate);
+
+            // 2. Back Face: Authentic 3-Flap Folded Sleeve Pocket
+            // The bottom flap folds UP from bottom (+h/2) to z = -0.45, completely enclosing the letter!
+            // Left & Right flaps fold inwards from edges
+            const leftFlapShape = new THREE.Shape();
+            leftFlapShape.moveTo(-w * 0.5, h * 0.5);
+            leftFlapShape.lineTo(-w * 0.5, -h * 0.5);
+            leftFlapShape.lineTo(-0.15, 0.0);
+            leftFlapShape.closePath();
+            const leftFlapGeo = new THREE.ShapeGeometry(leftFlapShape);
+            const leftFlap = new THREE.Mesh(leftFlapGeo, envelopeMaterial);
+            leftFlap.rotation.x = -Math.PI / 2;
+            leftFlap.position.set(0, 0.032, 0);
+            leftFlap.receiveShadow = true;
+            leftFlap.castShadow = true;
+            envelopeGroup.add(leftFlap);
+
+            const rightFlapShape = new THREE.Shape();
+            rightFlapShape.moveTo(w * 0.5, h * 0.5);
+            rightFlapShape.lineTo(w * 0.5, -h * 0.5);
+            rightFlapShape.lineTo(0.15, 0.0);
+            rightFlapShape.closePath();
+            const rightFlapGeo = new THREE.ShapeGeometry(rightFlapShape);
+            const rightFlap = new THREE.Mesh(rightFlapGeo, envelopeMaterial);
+            rightFlap.rotation.x = -Math.PI / 2;
+            rightFlap.position.set(0, 0.032, 0);
+            rightFlap.receiveShadow = true;
+            rightFlap.castShadow = true;
+            envelopeGroup.add(rightFlap);
+
+            // Bottom Flap: Folds UP from +h/2 all the way to -0.45, covering 85% of the envelope height!
+            const bottomFlapShape = new THREE.Shape();
+            bottomFlapShape.moveTo(-w * 0.5, h * 0.5);
+            bottomFlapShape.lineTo(w * 0.5, h * 0.5);
+            bottomFlapShape.lineTo(0.0, -0.45);
+            bottomFlapShape.closePath();
+            const bottomFlapGeo = new THREE.ShapeGeometry(bottomFlapShape);
+            const bottomFlap = new THREE.Mesh(bottomFlapGeo, envelopeMaterial);
+            bottomFlap.rotation.x = -Math.PI / 2;
+            bottomFlap.position.set(0, 0.036, 0);
+            bottomFlap.receiveShadow = true;
+            bottomFlap.castShadow = true;
+            envelopeGroup.add(bottomFlap);
+
+            // 3. Pristine Letter Inside (100% Contained, Never Outside the Envelope)
+            // Letter dimensions: comfortably smaller than envelope (w=2.8 vs 3.8, h=1.7 vs 2.4)
+            const letterW = 2.8;
+            const letterH = 1.7;
+            const letterGeo = new THREE.PlaneGeometry(letterW, letterH, 12, 12);
+            const lPos = letterGeo.attributes.position;
+            for (let i = 0; i < lPos.count; i++) {
+                const lx = lPos.getX(i);
+                const lz = 0.008 * Math.sin((lx / (letterW * 0.5)) * Math.PI);
+                lPos.setZ(i, lz);
+            }
+            letterGeo.computeVertexNormals();
+
+            letterMaterial = new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(settings.letterColor),
+                map: paperTexture,
+                bumpMap: paperBumpTexture,
+                bumpScale: 0.003,
+                roughness: 0.68,
+                metalness: 0.01,
+                sheen: 0.35,
+                sheenColor: new THREE.Color(0xFFFFFF),
+                side: THREE.DoubleSide
+            });
+
+            letterMesh = new THREE.Mesh(letterGeo, letterMaterial);
+            letterMesh.rotation.x = -Math.PI / 2;
+            // Nestled inside sleeve: y=0.018 (strictly between front 0.005 and back flaps 0.032)
+            // Base Z=0.35 (when closed, letter is completely deep inside the sleeve, top edge at -0.50)
+            letterMesh.position.set(0, 0.018, 0.35);
+            letterMesh.receiveShadow = true;
+            letterMesh.castShadow = true;
+            envelopeGroup.add(letterMesh);
+
+            // 4. Smooth Opening Flap (Top triangular flap hinged at top crease z = -h/2 = -1.2)
+            flapPivot = new THREE.Group();
+            flapPivot.position.set(0, 0.038, -h * 0.5);
+
+            // Flap triangle: reaches down to +1.44 when closed (overlapping bottom flap)
+            const flapShape = new THREE.Shape();
+            flapShape.moveTo(-w * 0.5, 0);
+            flapShape.lineTo(w * 0.5, 0);
+            flapShape.lineTo(0.06, h * 0.60);
+            flapShape.bezierCurveTo(0.03, h * 0.62, -0.03, h * 0.62, -0.06, h * 0.60);
+            flapShape.closePath();
+
+            const flapGeo = new THREE.ShapeGeometry(flapShape, 24);
+            const flapMesh = new THREE.Mesh(flapGeo, envelopeMaterial);
+            flapMesh.rotation.x = -Math.PI / 2; // Flat on top pointing towards bottom when flapPivot.rotation.x = 0
+            flapMesh.receiveShadow = true;
+            flapMesh.castShadow = true;
+            flapPivot.add(flapMesh);
+
+            envelopeGroup.add(flapPivot);
+
+            // 5. Subtle, Ethereal Warm Light Emerging from Throat ("тонкий свет")
+            envelopeInnerLight = new THREE.PointLight(new THREE.Color(settings.innerGlowColor), 0, 3.2, 1.8);
+            envelopeInnerLight.position.set(0, 0.08, -0.45);
+            envelopeGroup.add(envelopeInnerLight);
+
+            // Soft radial glow disc
+            const glowGeo = new THREE.PlaneGeometry(2.0, 2.0);
+            const glowMat = new THREE.MeshBasicMaterial({
+                map: softGlowTexture,
+                transparent: true,
+                opacity: 0,
+                blending: THREE.AdditiveBlending,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            envelopeGlowMesh = new THREE.Mesh(glowGeo, glowMat);
+            envelopeGlowMesh.rotation.x = -Math.PI / 2;
+            envelopeGlowMesh.position.set(0, 0.04, -0.45);
+            envelopeGroup.add(envelopeGlowMesh);
+
+            scene.add(envelopeGroup);
+        }
+
+        // --- Realistic Dried Rose Lying Naturally on Table ---
+        function createDriedRose() {
+            roseGroup = new THREE.Group();
+            roseGroup.position.copy(defaultTransforms.rose.pos);
+            roseGroup.rotation.copy(defaultTransforms.rose.rot);
+            roseGroup.userData = { isInteractable: true, id: 'rose' };
+
+            // 1. Organic Curved Stem Lying on Wood
+            const stemPoints = [
+                new THREE.Vector3(0, 0.02, 1.3),
+                new THREE.Vector3(0.14, 0.025, 0.65),
+                new THREE.Vector3(-0.08, 0.03, 0.0),
+                new THREE.Vector3(0.06, 0.038, -0.65),
+                new THREE.Vector3(0, 0.05, -1.15)
+            ];
+            const stemCurve = new THREE.CatmullRomCurve3(stemPoints);
+            const stemGeo = new THREE.TubeGeometry(stemCurve, 36, 0.026, 8, false);
+
+            stemMaterial = new THREE.MeshStandardMaterial({
+                color: new THREE.Color(settings.roseStemColor),
+                roughness: 0.88,
+                metalness: 0.04
+            });
+
+            const stemMesh = new THREE.Mesh(stemGeo, stemMaterial);
+            stemMesh.castShadow = true;
+            stemMesh.receiveShadow = true;
+            roseGroup.add(stemMesh);
+
+            // Tiny thorns on stem
+            const thornGeo = new THREE.ConeGeometry(0.018, 0.055, 6);
+            thornGeo.rotateX(Math.PI * 0.5);
+            [0.26, 0.52, 0.78].forEach((t, i) => {
+                const pt = stemCurve.getPointAt(t);
+                const thornMesh = new THREE.Mesh(thornGeo, stemMaterial);
+                thornMesh.position.copy(pt);
+                thornMesh.rotation.y = (i % 2 === 0 ? 1.2 : -1.2);
+                thornMesh.castShadow = true;
+                roseGroup.add(thornMesh);
+            });
+
+            // 2. Dried Curled Leaves Resting on Desk
+            const leafShape = new THREE.Shape();
+            leafShape.moveTo(0, 0);
+            leafShape.bezierCurveTo(0.12, 0.1, 0.18, 0.28, 0.03, 0.44);
+            leafShape.bezierCurveTo(-0.14, 0.3, -0.1, 0.12, 0, 0);
+
+            const leafGeo = new THREE.ShapeGeometry(leafShape, 12);
+            const leafPos = leafGeo.attributes.position;
+            for (let i = 0; i < leafPos.count; i++) {
+                const lx = leafPos.getX(i);
+                const ly = leafPos.getY(i);
+                leafPos.setZ(i, Math.sin(lx * 6.0) * 0.03 - ly * 0.03);
+            }
+            leafGeo.computeVertexNormals();
+
+            const leaf1 = new THREE.Mesh(leafGeo, stemMaterial);
+            leaf1.position.set(0.12, 0.022, 0.5);
+            leaf1.rotation.set(-1.52, 0.4, 0.2);
+            leaf1.scale.set(0.65, 0.65, 0.65);
+            leaf1.castShadow = true;
+            leaf1.receiveShadow = true;
+            roseGroup.add(leaf1);
+
+            const leaf2 = new THREE.Mesh(leafGeo, stemMaterial);
+            leaf2.position.set(-0.08, 0.025, -0.15);
+            leaf2.rotation.set(-1.48, -0.5, -0.3);
+            leaf2.scale.set(0.6, 0.6, 0.6);
+            leaf2.castShadow = true;
+            leaf2.receiveShadow = true;
+            roseGroup.add(leaf2);
+
+            // 3. Flower Blossom (Smooth, Curved Dried Petals Resting Gently)
+            const flowerHead = new THREE.Group();
+            flowerHead.position.set(0, 0.09, -1.2);
+            flowerHead.rotation.set(-0.25, 0.35, -0.15);
+
+            roseMaterial = new THREE.MeshStandardMaterial({
+                color: new THREE.Color(settings.roseColor),
+                roughness: 0.76,
+                metalness: 0.02,
+                side: THREE.DoubleSide
+            });
+
+            function createRosePetalGeometry(width, length, curl) {
+                const geom = new THREE.PlaneGeometry(width, length, 12, 12);
+                const pos = geom.attributes.position;
+                for (let i = 0; i < pos.count; i++) {
+                    const u = (pos.getX(i) / (width * 0.5));
+                    const v = (pos.getY(i) / length);
+                    let z = -Math.sin(v * Math.PI) * curl;
+                    z += (Math.sin(u * 4.0) + Math.cos(v * 5.0)) * 0.012;
+                    pos.setZ(i, z);
+                }
+                geom.computeVertexNormals();
+                return geom;
+            }
+
+            const layers = [
+                { count: 4, radius: 0.04, w: 0.16, l: 0.20, curl: 0.07, tilt: 0.18 },
+                { count: 6, radius: 0.09, w: 0.22, l: 0.28, curl: 0.10, tilt: 0.38 },
+                { count: 7, radius: 0.15, w: 0.30, l: 0.36, curl: 0.13, tilt: 0.62 },
+                { count: 9, radius: 0.22, w: 0.38, l: 0.44, curl: 0.16, tilt: 0.88 }
+            ];
+
+            layers.forEach((layer, layerIdx) => {
+                for (let p = 0; p < layer.count; p++) {
+                    const angle = (p / layer.count) * Math.PI * 2 + (layerIdx * 0.55);
+                    const petalGeo = createRosePetalGeometry(layer.w, layer.l, layer.curl);
+                    const petalMesh = new THREE.Mesh(petalGeo, roseMaterial);
+
+                    petalMesh.position.set(
+                        Math.cos(angle) * layer.radius,
+                        0.04 + layerIdx * 0.025,
+                        Math.sin(angle) * layer.radius
+                    );
+                    petalMesh.rotation.y = -angle + Math.PI * 0.5;
+                    petalMesh.rotation.x = layer.tilt + (Math.random() - 0.5) * 0.08;
+                    petalMesh.rotation.z = (Math.random() - 0.5) * 0.12;
+
+                    petalMesh.castShadow = true;
+                    petalMesh.receiveShadow = true;
+                    flowerHead.add(petalMesh);
+                }
+            });
+
+            // Dried sepals
+            for (let s = 0; s < 5; s++) {
+                const sAngle = (s / 5) * Math.PI * 2;
+                const sepalShape = new THREE.Shape();
+                sepalShape.moveTo(0, 0);
+                sepalShape.lineTo(0.035, 0.22);
+                sepalShape.lineTo(-0.035, 0.22);
+                sepalShape.closePath();
+                const sepalGeo = new THREE.ShapeGeometry(sepalShape);
+                const sepalMesh = new THREE.Mesh(sepalGeo, stemMaterial);
+                sepalMesh.position.set(Math.cos(sAngle) * 0.11, -0.015, Math.sin(sAngle) * 0.11);
+                sepalMesh.rotation.y = -sAngle + Math.PI * 0.5;
+                sepalMesh.rotation.x = 1.35;
+                sepalMesh.castShadow = true;
+                flowerHead.add(sepalMesh);
+            }
+
+            roseGroup.add(flowerHead);
+
+            // 4. Loose dried petals fallen on desk (completely separate from envelope)
+            const fallenPetalGeo = createRosePetalGeometry(0.24, 0.32, 0.08);
+            const fallenOffsets = [
+                { x: 0.15, y: 0.012, z: 0.45, rotY: 0.6, rotZ: 0.08 },
+                { x: -0.28, y: 0.012, z: 0.85, rotY: 2.0, rotZ: -0.1 },
+                { x: 0.35, y: 0.012, z: -0.5, rotY: -1.1, rotZ: 0.06 }
+            ];
+            fallenOffsets.forEach(fo => {
+                const fp = new THREE.Mesh(fallenPetalGeo, roseMaterial);
+                fp.position.set(fo.x, fo.y, fo.z);
+                fp.rotation.set(-Math.PI * 0.5 + fo.rotZ, fo.rotY, 0);
+                fp.castShadow = true;
+                fp.receiveShadow = true;
+                roseGroup.add(fp);
+            });
+
+            scene.add(roseGroup);
+        }
+
+        // --- Elegant Wax Seal (Placed neatly beside envelope, no clipping) ---
+        function createWaxSeal() {
+            waxSealGroup = new THREE.Group();
+            waxSealGroup.position.copy(defaultTransforms.waxSeal.pos);
+            waxSealGroup.rotation.copy(defaultTransforms.waxSeal.rot);
+            waxSealGroup.userData = { isInteractable: true, id: 'waxSeal' };
+
+            waxMaterial = new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(settings.waxSealColor),
+                roughness: 0.25,
+                metalness: 0.04,
+                clearcoat: 0.6,
+                clearcoatRoughness: 0.18
+            });
+
+            // 1. Organic Melted Wax Puddle Shape (Smooth Bevel, No Sharp Teeth)
+            const outerShape = new THREE.Shape();
+            const segments = 64;
+            const baseR = 0.52;
+            for (let i = 0; i <= segments; i++) {
+                const theta = (i / segments) * Math.PI * 2;
+                const r = baseR * (1.0 + 0.05 * Math.sin(5 * theta) + 0.03 * Math.cos(8 * theta));
+                const x = Math.cos(theta) * r;
+                const y = Math.sin(theta) * r;
+                if (i === 0) outerShape.moveTo(x, y);
+                else outerShape.lineTo(x, y);
+            }
+
+            const extrudeSettings = {
+                depth: 0.035,
+                bevelEnabled: true,
+                bevelSegments: 5,
+                steps: 1,
+                bevelSize: 0.04,
+                bevelThickness: 0.04
+            };
+            const puddleGeo = new THREE.ExtrudeGeometry(outerShape, extrudeSettings);
+            const puddleMesh = new THREE.Mesh(puddleGeo, waxMaterial);
+            puddleMesh.rotation.x = -Math.PI / 2;
+            puddleMesh.position.y = 0.005;
+            puddleMesh.castShadow = true;
+            puddleMesh.receiveShadow = true;
+            waxSealGroup.add(puddleMesh);
+
+            // 2. Smooth Raised Inner Rim
+            const rimGeo = new THREE.TorusGeometry(0.38, 0.03, 16, 64);
+            const rimMesh = new THREE.Mesh(rimGeo, waxMaterial);
+            rimMesh.rotation.x = -Math.PI / 2;
+            rimMesh.position.y = 0.075;
+            rimMesh.castShadow = true;
+            rimMesh.receiveShadow = true;
+            waxSealGroup.add(rimMesh);
+
+            // 3. Smooth Central Seal Medallion (Без символов)
+            const centerGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.02, 48);
+            const centerMesh = new THREE.Mesh(centerGeo, waxMaterial);
+            centerMesh.position.y = 0.065;
+            centerMesh.castShadow = true;
+            centerMesh.receiveShadow = true;
+            waxSealGroup.add(centerMesh);
+
+            // 4. Two tiny cooled wax droplet drops nearby
+            const dropGeo = new THREE.SphereGeometry(0.04, 16, 16);
+            dropGeo.scale(1.2, 0.35, 1.2);
+            [
+                { x: 0.48, z: 0.25 },
+                { x: -0.42, z: -0.28 }
+            ].forEach(dp => {
+                const dropMesh = new THREE.Mesh(dropGeo, waxMaterial);
+                dropMesh.position.set(dp.x, 0.012, dp.z);
+                dropMesh.castShadow = true;
+                dropMesh.receiveShadow = true;
+                waxSealGroup.add(dropMesh);
+            });
+
+            scene.add(waxSealGroup);
+        }
+
+        // --- Miniature Delicate Floating Rose Petals (Curved Organic Shapes, Not Confetti) ---
+        function createFloatingPetals() {
+            petalGroup = new THREE.Group();
+            scene.add(petalGroup);
+
+            const count = 42;
+
+            // Organic teardrop curved rose petal shape
+            const petalShape = new THREE.Shape();
+            petalShape.moveTo(0, -0.05);
+            petalShape.bezierCurveTo(0.06, -0.03, 0.09, 0.06, 0.05, 0.12);
+            petalShape.bezierCurveTo(0.02, 0.15, -0.02, 0.15, -0.05, 0.12);
+            petalShape.bezierCurveTo(-0.09, 0.06, -0.06, -0.03, 0, -0.05);
+
+            const pGeo = new THREE.ShapeGeometry(petalShape, 12);
+            const pPos = pGeo.attributes.position;
+            for (let i = 0; i < pPos.count; i++) {
+                const u = pPos.getX(i);
+                const v = pPos.getY(i);
+                pPos.setZ(i, -Math.sin((v + 0.05) * 8.0) * 0.02 + Math.cos(u * 12.0) * 0.01);
+            }
+            pGeo.computeVertexNormals();
+
+            for (let i = 0; i < count; i++) {
+                const pMat = new THREE.MeshStandardMaterial({
+                    color: new THREE.Color(settings.roseColor),
+                    roughness: 0.72,
+                    metalness: 0.02,
+                    side: THREE.DoubleSide,
+                    transparent: true,
+                    opacity: 0.0
+                });
+
+                const mesh = new THREE.Mesh(pGeo, pMat);
+                mesh.castShadow = true;
+
+                const petalData = {
+                    mesh: mesh,
+                    originX: (Math.random() - 0.5) * 1.5,
+                    originZ: -0.45 + (Math.random() - 0.5) * 0.3,
+                    progress: Math.random(),
+                    speed: 0.07 + Math.random() * 0.06,
+                    swirlRadius: 0.35 + Math.random() * 0.6,
+                    swirlFreq: 1.2 + Math.random() * 2.0,
+                    phase: Math.random() * Math.PI * 2,
+                    rotSpeedX: (Math.random() - 0.5) * 2.5,
+                    rotSpeedY: (Math.random() - 0.5) * 3.0,
+                    rotSpeedZ: (Math.random() - 0.5) * 2.0
+                };
+
+                petalParticles.push(petalData);
+                petalGroup.add(mesh);
+            }
+        }
+
+        // --- Cinematic Lighting & Soft Shadows Setup ---
+        function setupLights() {
+            windowLight = new THREE.DirectionalLight(
+                new THREE.Color(settings.windowLightColor),
+                settings.keyLightIntensity
+            );
+            windowLight.position.set(-8.0, 7.5, 3.5);
+            windowLight.castShadow = true;
+
+            windowLight.shadow.mapSize.width = 2048;
+            windowLight.shadow.mapSize.height = 2048;
+            windowLight.shadow.camera.near = 1.0;
+            windowLight.shadow.camera.far = 24.0;
+            windowLight.shadow.camera.left = -5.8;
+            windowLight.shadow.camera.right = 5.8;
+            windowLight.shadow.camera.top = 5.8;
+            windowLight.shadow.camera.bottom = -5.8;
+            windowLight.shadow.bias = -0.00015;
+            windowLight.shadow.radius = 2.5;
+
+            scene.add(windowLight);
+
+            ambientLight = new THREE.AmbientLight(
+                new THREE.Color(0xFFEADB),
+                settings.ambientLightIntensity
+            );
+            scene.add(ambientLight);
+
+            fillLight = new THREE.DirectionalLight(
+                new THREE.Color(settings.fillLightColor),
+                settings.fillLightIntensity
+            );
+            fillLight.position.set(6.5, 4.0, -2.5);
+            scene.add(fillLight);
+        }
+
+        // --- Apply Color Scheme with Smooth GSAP Transitions ---
+        function applyColorScheme(schemeKey, animate = true) {
+            const scheme = COLOR_SCHEMES[schemeKey];
+            if (!scheme) return;
+
+            settings.scheme = schemeKey;
+            settings.bgColor = scheme.bgColor;
+            settings.envelopeColor = scheme.envelopeColor;
+            settings.letterColor = scheme.letterColor;
+            settings.woodColor = scheme.woodColor;
+            settings.roseColor = scheme.roseColor;
+            settings.roseStemColor = scheme.roseStemColor;
+            settings.waxSealColor = scheme.waxSealColor;
+            settings.innerGlowColor = scheme.innerGlowColor;
+            settings.windowLightColor = scheme.windowLightColor;
+            settings.fillLightColor = scheme.fillLightColor;
+
+            if (settings.greenScreen) {
+                scene.background = new THREE.Color(0x00FF00);
+            } else {
+                if (animate) {
+                    gsap.to(scene.background, {
+                        r: new THREE.Color(scheme.bgColor).r,
+                        g: new THREE.Color(scheme.bgColor).g,
+                        b: new THREE.Color(scheme.bgColor).b,
+                        duration: 0.9,
+                        ease: 'power2.out'
+                    });
+                } else {
+                    scene.background.set(scheme.bgColor);
+                }
+            }
+
+            if (animate) {
+                const targetEnv = new THREE.Color(scheme.envelopeColor);
+                const targetLet = new THREE.Color(scheme.letterColor);
+                const targetWood = new THREE.Color(scheme.woodColor);
+                const targetRose = new THREE.Color(scheme.roseColor);
+                const targetStem = new THREE.Color(scheme.roseStemColor);
+                const targetWax = new THREE.Color(scheme.waxSealColor);
+                const targetGlow = new THREE.Color(scheme.innerGlowColor);
+                const targetWin = new THREE.Color(scheme.windowLightColor);
+                const targetFill = new THREE.Color(scheme.fillLightColor);
+
+                gsap.to(envelopeMaterial.color, { r: targetEnv.r, g: targetEnv.g, b: targetEnv.b, duration: 0.9 });
+                gsap.to(letterMaterial.color, { r: targetLet.r, g: targetLet.g, b: targetLet.b, duration: 0.9 });
+                gsap.to(woodMaterial.color, { r: targetWood.r, g: targetWood.g, b: targetWood.b, duration: 0.9 });
+                gsap.to(roseMaterial.color, { r: targetRose.r, g: targetRose.g, b: targetRose.b, duration: 0.9 });
+                gsap.to(stemMaterial.color, { r: targetStem.r, g: targetStem.g, b: targetStem.b, duration: 0.9 });
+                gsap.to(waxMaterial.color, { r: targetWax.r, g: targetWax.g, b: targetWax.b, duration: 0.9 });
+                gsap.to(windowLight.color, { r: targetWin.r, g: targetWin.g, b: targetWin.b, duration: 0.9 });
+                gsap.to(fillLight.color, { r: targetFill.r, g: targetFill.g, b: targetFill.b, duration: 0.9 });
+                gsap.to(envelopeInnerLight.color, { r: targetGlow.r, g: targetGlow.g, b: targetGlow.b, duration: 0.9 });
+
+                petalParticles.forEach(p => {
+                    gsap.to(p.mesh.material.color, { r: targetRose.r, g: targetRose.g, b: targetRose.b, duration: 0.9 });
+                });
+            } else {
+                envelopeMaterial.color.set(scheme.envelopeColor);
+                letterMaterial.color.set(scheme.letterColor);
+                woodMaterial.color.set(scheme.woodColor);
+                roseMaterial.color.set(scheme.roseColor);
+                stemMaterial.color.set(scheme.roseStemColor);
+                waxMaterial.color.set(scheme.waxSealColor);
+                windowLight.color.set(scheme.windowLightColor);
+                fillLight.color.set(scheme.fillLightColor);
+                envelopeInnerLight.color.set(scheme.innerGlowColor);
+
+                petalParticles.forEach(p => {
+                    p.mesh.material.color.set(scheme.roseColor);
+                });
+            }
+
+            if (gui) {
+                gui.controllersRecursive().forEach(c => {
+                    // Do NOT update or touch post-processing folder controllers
+                    if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                    c.updateDisplay();
+                });
+            }
+        }
+
+        // --- Update Greenscreen Mode ---
+        function updateGreenScreen(enabled) {
+            settings.greenScreen = enabled;
+            if (enabled) {
+                scene.background = new THREE.Color(0x00FF00);
+            } else {
+                scene.background = new THREE.Color(settings.bgColor);
+            }
+            if (gui) {
+                gui.controllersRecursive().forEach(c => {
+                    if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                    c.updateDisplay();
+                });
+            }
+        }
+
+        // --- Procedural Scene Randomization on Click ---
+        // IMPORTANT: NEVER SHUFFLE OR CHANGE POST-PROCESSING SETTINGS HERE!
+        function randomizeProceduralScene() {
+            const schemeKeys = Object.keys(COLOR_SCHEMES);
+            const randomScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+            applyColorScheme(randomScheme, true);
+
+            // Re-roll motion and geometric parameters only
+            settings.animSpeed = Number((0.65 + Math.random() * 0.75).toFixed(2));
+            settings.petalFlowSpeed = Number((0.7 + Math.random() * 0.8).toFixed(2));
+            settings.keyLightIntensity = Number((2.0 + Math.random() * 0.8).toFixed(2));
+            settings.innerGlowIntensity = Number((1.0 + Math.random() * 0.6).toFixed(2));
+
+            const envRotY = defaultTransforms.envelope.rot.y + (Math.random() - 0.5) * 0.12;
+            const roseRotY = defaultTransforms.rose.rot.y + (Math.random() - 0.5) * 0.18;
+            const waxRotY = defaultTransforms.waxSeal.rot.y + (Math.random() - 0.5) * 0.25;
+
+            gsap.to(envelopeGroup.rotation, { y: envRotY, duration: 1.0, ease: 'power2.out' });
+            gsap.to(roseGroup.rotation, { y: roseRotY, duration: 1.0, ease: 'power2.out' });
+            gsap.to(waxSealGroup.rotation, { y: waxRotY, duration: 1.0, ease: 'power2.out' });
+
+            // PostProcessor settings are strictly left unchanged!
+            if (gui) {
+                gui.controllersRecursive().forEach(c => {
+                    if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                    c.updateDisplay();
+                });
+            }
+        }
+
+        // --- Reset Camera & Objects to Default Transforms ---
+        function resetScene() {
+            gsap.to(settings, {
+                userZoomDistance: 7.2,
+                userOrbitYaw: 0.0,
+                userOrbitPitch: 0.0,
+                userPanX: 0.0,
+                userPanY: 0.0,
+                duration: 0.9,
+                ease: 'power2.out',
+                onUpdate: () => {
+                    if (gui) {
+                        gui.controllersRecursive().forEach(c => {
+                            if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                            c.updateDisplay();
+                        });
+                    }
+                }
+            });
+
+            gsap.to(envelopeGroup.position, {
+                x: defaultTransforms.envelope.pos.x,
+                y: defaultTransforms.envelope.pos.y,
+                z: defaultTransforms.envelope.pos.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+            gsap.to(envelopeGroup.rotation, {
+                x: defaultTransforms.envelope.rot.x,
+                y: defaultTransforms.envelope.rot.y,
+                z: defaultTransforms.envelope.rot.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+
+            gsap.to(roseGroup.position, {
+                x: defaultTransforms.rose.pos.x,
+                y: defaultTransforms.rose.pos.y,
+                z: defaultTransforms.rose.pos.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+            gsap.to(roseGroup.rotation, {
+                x: defaultTransforms.rose.rot.x,
+                y: defaultTransforms.rose.rot.y,
+                z: defaultTransforms.rose.rot.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+
+            gsap.to(waxSealGroup.position, {
+                x: defaultTransforms.waxSeal.pos.x,
+                y: defaultTransforms.waxSeal.pos.y,
+                z: defaultTransforms.waxSeal.pos.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+            gsap.to(waxSealGroup.rotation, {
+                x: defaultTransforms.waxSeal.rot.x,
+                y: defaultTransforms.waxSeal.rot.y,
+                z: defaultTransforms.waxSeal.rot.z,
+                duration: 0.9,
+                ease: 'power2.out'
+            });
+        }
+
+        // --- Recreate WebGL Renderer with Antialiasing Toggle ---
+        function setAntialias(antialiasState) {
+            settings.antialias = antialiasState;
+            const canvas = document.getElementById('webgl');
+            
+            renderer.dispose();
+
+            renderer = new THREE.WebGLRenderer({
+                canvas: canvas,
+                antialias: antialiasState,
+                powerPreference: 'high-performance'
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(settings.dpr);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = settings.exposure;
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+            if (postProcessor) {
+                postProcessor.renderer = renderer;
+                postProcessor.setSize(window.innerWidth, window.innerHeight);
+            }
+        }
+
+        // --- User Interaction Listeners ---
+        function setupInteractions() {
+            window.addEventListener('pointerdown', (e) => {
+                if (e.target.closest('.lil-gui')) return;
+
+                isPointerDown = true;
+                pointerDownPos.set(e.clientX, e.clientY);
+                lastPointerPos.set(e.clientX, e.clientY);
+
+                mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+                raycaster.setFromCamera(mouse, camera);
+
+                const interactables = [envelopeGroup, roseGroup, waxSealGroup];
+                const intersects = raycaster.intersectObjects(interactables, true);
+
+                if (intersects.length > 0) {
+                    let hitObj = intersects[0].object;
+                    while (hitObj.parent && !hitObj.userData.isInteractable) {
+                        hitObj = hitObj.parent;
+                    }
+
+                    if (hitObj.userData.isInteractable) {
+                        isDraggingObject = true;
+                        draggedObject = hitObj;
+
+                        dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), draggedObject.position);
+                        if (raycaster.ray.intersectPlane(dragPlane, planeIntersect)) {
+                            dragOffset.copy(draggedObject.position).sub(planeIntersect);
+                        }
+                    }
+                } else {
+                    isDraggingObject = false;
+                    draggedObject = null;
+                }
+            });
+
+            window.addEventListener('pointermove', (e) => {
+                if (!isPointerDown) return;
+
+                const dx = e.clientX - lastPointerPos.x;
+                const dy = e.clientY - lastPointerPos.y;
+                lastPointerPos.set(e.clientX, e.clientY);
+
+                if (isDraggingObject && draggedObject) {
+                    mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+                    mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+                    raycaster.setFromCamera(mouse, camera);
+
+                    if (raycaster.ray.intersectPlane(dragPlane, planeIntersect)) {
+                        const targetPos = planeIntersect.add(dragOffset);
+                        draggedObject.position.x = targetPos.x;
+                        draggedObject.position.z = targetPos.z;
+                    }
+                } else {
+                    if (e.buttons === 2 || e.buttons === 4 || e.shiftKey) {
+                        const panSpeed = 0.0055 * (settings.userZoomDistance / 7.2);
+                        settings.userPanX -= dx * panSpeed;
+                        settings.userPanY += dy * panSpeed;
+                    } else {
+                        const orbitSpeed = 0.0055;
+                        settings.userOrbitYaw += dx * orbitSpeed;
+                        settings.userOrbitPitch = THREE.MathUtils.clamp(settings.userOrbitPitch + dy * orbitSpeed, -0.65, 0.65);
+                    }
+                    if (gui) {
+                        gui.controllersRecursive().forEach(c => {
+                            if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                            c.updateDisplay();
+                        });
+                    }
+                }
+            });
+
+            window.addEventListener('pointerup', (e) => {
+                if (!isPointerDown) return;
+                const distMoved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+
+                if (distMoved < 6 && !isDraggingObject && settings.clickToRandomize && !e.target.closest('.lil-gui')) {
+                    randomizeProceduralScene();
+                }
+
+                isPointerDown = false;
+                isDraggingObject = false;
+                draggedObject = null;
+            });
+
+            // Zoom with mouse wheel (persists smoothly during camera animation without resetting)
+            window.addEventListener('wheel', (e) => {
+                if (e.target.closest('.lil-gui')) return;
+                e.preventDefault();
+
+                const zoomFactor = Math.exp(e.deltaY * 0.0012);
+                settings.userZoomDistance = THREE.MathUtils.clamp(settings.userZoomDistance * zoomFactor, 2.8, 16.0);
+                if (gui) {
+                    gui.controllersRecursive().forEach(c => {
+                        if (c._folder && c._folder._title && c._folder._title.includes('Post-Processing')) return;
+                        c.updateDisplay();
+                    });
+                }
+            }, { passive: false });
+
+            // Hide/Show UI with 'H' key
+            window.addEventListener('keydown', (e) => {
+                if (e.key === 'h' || e.key === 'H') {
+                    if (gui) {
+                        const isHidden = gui.domElement.style.display === 'none';
+                        gui.domElement.style.display = isHidden ? '' : 'none';
+                    }
+                }
+            });
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.setPixelRatio(settings.dpr);
+                if (postProcessor) {
+                    postProcessor.setSize(window.innerWidth, window.innerHeight);
+                }
+            });
+        }
+
+        // --- Setup lil-gui Control Panel (Default styles, no overrides) ---
+        function setupGUI() {
+            gui = new GUI({ title: 'Конверт и письмо' });
+
+            // Color Schemes & Palette
+            const fColor = gui.addFolder('Цветовая гамма');
+            fColor.add(settings, 'scheme', Object.keys(COLOR_SCHEMES)).name('Пресет палитры').onChange((val) => {
+                applyColorScheme(val, true);
+            });
+            fColor.add(settings, 'greenScreen').name('Хромакей (#00ff00)').onChange(updateGreenScreen);
+            fColor.addColor(settings, 'bgColor').name('Цвет фона').onChange((c) => {
+                if (!settings.greenScreen) scene.background.set(c);
+            });
+            fColor.addColor(settings, 'envelopeColor').name('Конверт').onChange((c) => envelopeMaterial.color.set(c));
+            fColor.addColor(settings, 'letterColor').name('Письмо').onChange((c) => letterMaterial.color.set(c));
+            fColor.addColor(settings, 'woodColor').name('Дерево стола').onChange((c) => woodMaterial.color.set(c));
+            fColor.addColor(settings, 'roseColor').name('Сухая роза').onChange((c) => {
+                roseMaterial.color.set(c);
+                petalParticles.forEach(p => p.mesh.material.color.set(c));
+            });
+            fColor.addColor(settings, 'roseStemColor').name('Стебель розы').onChange((c) => stemMaterial.color.set(c));
+            fColor.addColor(settings, 'waxSealColor').name('Восковая печать').onChange((c) => waxMaterial.color.set(c));
+            fColor.addColor(settings, 'innerGlowColor').name('Свет изнутри').onChange((c) => {
+                envelopeInnerLight.color.set(c);
+            });
+
+            // Animations & Motion
+            const fMotion = gui.addFolder('Анимация');
+            fMotion.add(settings, 'animationPreset', ANIMATION_PRESETS).name('Режим камеры').listen();
+            fMotion.add(settings, 'animSpeed', 0.1, 3.0, 0.05).name('Скорость').listen();
+            fMotion.add(settings, 'petalFlowSpeed', 0.2, 3.0, 0.05).name('Скорость лепестков').listen();
+            fMotion.add(settings, 'autoAnimateFlap').name('Авто-раскрытие клапана');
+            fMotion.add(settings, 'flapProgress', 0.0, 1.0, 0.01).name('Клапан конверта').listen();
+
+            // Camera & Procedural
+            const fCamera = gui.addFolder('Камера и управление');
+            fCamera.add(settings, 'userZoomDistance', 2.8, 16.0, 0.1).name('Дистанция (Zoom)').listen();
+            fCamera.add(settings, 'clickToRandomize').name('Рандом при клике');
+            fCamera.add({ reset: resetScene }, 'reset').name('Сбросить позицию');
+
+            // Lighting & Rendering
+            const fRender = gui.addFolder('Освещение и рендер');
+            fRender.add(settings, 'exposure', 0.2, 2.5, 0.02).name('Экспозиция').onChange(v => {
+                renderer.toneMappingExposure = v;
+            });
+            fRender.add(settings, 'keyLightIntensity', 0.0, 5.0, 0.1).name('Свет из окна').onChange(v => {
+                windowLight.intensity = v;
+            });
+            fRender.addColor(settings, 'windowLightColor').name('Цвет окна').onChange(c => windowLight.color.set(c));
+            fRender.add(settings, 'ambientLightIntensity', 0.0, 2.0, 0.05).name('Заполняющий свет').onChange(v => {
+                ambientLight.intensity = v;
+            });
+            fRender.add(settings, 'fillLightIntensity', 0.0, 2.0, 0.05).name('Контровой свет').onChange(v => {
+                fillLight.intensity = v;
+            });
+            fRender.addColor(settings, 'fillLightColor').name('Цвет контрового').onChange(c => fillLight.color.set(c));
+            fRender.add(settings, 'innerGlowIntensity', 0.0, 4.0, 0.1).name('Яркость изнутри').listen();
+            fRender.add(settings, 'dpr', 0.5, 3.0, 0.1).name('DPR (Pixel Ratio)').onChange(v => {
+                renderer.setPixelRatio(v);
+                if (postProcessor) postProcessor.setSize(window.innerWidth, window.innerHeight);
+            });
+            fRender.add(settings, 'antialias').name('Сглаживание (AA)').onChange(setAntialias);
+
+            // PostProcessor Suite Integration
+            if (postProcessor) {
+                postProcessor.attachGUI(gui, "Post-Processing (PostProcessor.js)");
+            }
+        }
+
+        // --- Main Render & Animation Loop ---
+        let clock = new THREE.Clock();
+        let animationTime = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+            const timeScale = settings.animSpeed;
+            animationTime += dt * timeScale;
+
+            // 1. Envelope Flap & Enclosed Letter Animation
+            if (settings.autoAnimateFlap) {
+                // Smooth breathing loop: stays gently open, closes softly, opens again
+                const cycle = (Math.sin(animationTime * 0.45) + 1.0) * 0.5;
+                settings.flapProgress = THREE.MathUtils.smoothstep(cycle, 0.1, 0.9);
+            }
+
+            // Flap rotates from 0 (closed, flat on front) backwards up and onto the desk (-2.6 rad)
+            const maxFlapAngle = -Math.PI * 0.82;
+            flapPivot.rotation.x = settings.flapProgress * maxFlapAngle;
+
+            // Letter is nestled inside sleeve; when flap opens, letter smoothly glides forward/up from 0.35 to 0.0
+            const letterSlide = settings.flapProgress * 0.35;
+            letterMesh.position.z = 0.35 - letterSlide;
+
+            // Delicate inner glow emerges softly as flap opens
+            const glowPower = settings.flapProgress * settings.innerGlowIntensity;
+            envelopeInnerLight.intensity = glowPower;
+            envelopeGlowMesh.material.opacity = settings.flapProgress * 0.28;
+
+            // 2. Floating Petals Animation
+            const petalSpeedFactor = settings.petalFlowSpeed * timeScale;
+            petalParticles.forEach(p => {
+                p.progress += dt * p.speed * petalSpeedFactor;
+                if (p.progress > 1.0) p.progress -= 1.0;
+
+                const prog = p.progress;
+
+                // Petal rises vertically out of the envelope mouth
+                const currentY = 0.05 + Math.pow(prog, 1.2) * 3.2;
+
+                // Spiral turbulence swirl
+                const angle = prog * p.swirlFreq * Math.PI * 2 + p.phase;
+                const radius = p.swirlRadius * Math.sin(prog * Math.PI * 0.85);
+
+                const currentX = envelopeGroup.position.x + p.originX + Math.cos(angle) * radius;
+                const currentZ = envelopeGroup.position.z + p.originZ + Math.sin(angle) * radius * 0.7;
+
+                p.mesh.position.set(currentX, currentY, currentZ);
+
+                // Organic tumbling rotation
+                p.mesh.rotation.x += dt * p.rotSpeedX * petalSpeedFactor;
+                p.mesh.rotation.y += dt * p.rotSpeedY * petalSpeedFactor;
+                p.mesh.rotation.z += dt * p.rotSpeedZ * petalSpeedFactor;
+
+                // Opacity: fades in when emerging, fades out near top, only active when flap is opening
+                const visibility = THREE.MathUtils.smoothstep(prog, 0.02, 0.18) * (1.0 - THREE.MathUtils.smoothstep(prog, 0.75, 0.98));
+                p.mesh.material.opacity = visibility * THREE.MathUtils.smoothstep(settings.flapProgress, 0.2, 0.65);
+            });
+
+            // 3. Camera Animation Presets (Maintaining user's zoom & manual angles)
+            let baseYaw = 0.0;
+            let basePitch = 0.98; // ~56 degrees elevation
+            let baseTarget = new THREE.Vector3(settings.userPanX, 0.04, settings.userPanY);
+
+            const preset = settings.animationPreset;
+
+            if (preset === 'Gentle Romantic Drift') {
+                baseYaw = Math.sin(animationTime * 0.25) * 0.22;
+                basePitch = 0.98 + Math.cos(animationTime * 0.2) * 0.08;
+            } else if (preset === 'Static (No Camera Motion)') {
+                baseYaw = 0.0;
+                basePitch = 0.98;
+            } else if (preset === 'Slow Cinematic Orbit') {
+                baseYaw = animationTime * 0.18;
+                basePitch = 0.88 + Math.sin(animationTime * 0.15) * 0.12;
+            } else if (preset === 'Top-Down Overhead Study') {
+                baseYaw = Math.sin(animationTime * 0.18) * 0.12;
+                basePitch = 1.35 + Math.cos(animationTime * 0.22) * 0.06;
+            } else if (preset === 'Window Light & Long Shadows') {
+                baseYaw = -0.75 + Math.sin(animationTime * 0.2) * 0.15;
+                basePitch = 0.58 + Math.cos(animationTime * 0.18) * 0.06;
+            } else if (preset === 'Macro Detail: Rose & Seal') {
+                baseYaw = 0.45 + Math.sin(animationTime * 0.22) * 0.12;
+                basePitch = 0.72 + Math.cos(animationTime * 0.2) * 0.06;
+                baseTarget.set(1.1 + settings.userPanX, 0.08, 0.2 + settings.userPanY);
+            } else if (preset === 'Ethereal Petal Ascent') {
+                const ascentCycle = (Math.sin(animationTime * 0.3) + 1.0) * 0.5;
+                baseYaw = Math.sin(animationTime * 0.2) * 0.2;
+                basePitch = 0.75 + ascentCycle * 0.35;
+                baseTarget.set(settings.userPanX, 0.04 + ascentCycle * 0.8, settings.userPanY);
+            } else if (preset === 'Poetic Still-Life Infinity') {
+                baseYaw = Math.sin(animationTime * 0.22) * 0.28;
+                basePitch = 0.95 + Math.sin(animationTime * 0.44) * 0.12;
+            }
+
+            const totalYaw = baseYaw + settings.userOrbitYaw;
+            const totalPitch = THREE.MathUtils.clamp(basePitch + settings.userOrbitPitch, 0.12, Math.PI * 0.48);
+            const dist = settings.userZoomDistance;
+
+            camera.position.x = baseTarget.x + dist * Math.sin(totalYaw) * Math.cos(totalPitch);
+            camera.position.y = baseTarget.y + dist * Math.sin(totalPitch);
+            camera.position.z = baseTarget.z + dist * Math.cos(totalYaw) * Math.cos(totalPitch);
+            camera.lookAt(baseTarget);
+
+            // Render through PostProcessor pipeline
+            if (postProcessor && postProcessor.settings.enabled) {
+                postProcessor.renderScene(scene, camera);
+            } else {
+                renderer.render(scene, camera);
+            }
+        }
+
+        // --- Application Bootstrap ---
+        function init() {
+            const canvas = document.getElementById('webgl');
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(settings.bgColor);
+
+            camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 60);
+
+            renderer = new THREE.WebGLRenderer({
+                canvas: canvas,
+                antialias: settings.antialias,
+                powerPreference: 'high-performance'
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(settings.dpr);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = settings.exposure;
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+            // Initialize PostProcessor Suite with Anamorphic strictly OFF by default
+            postProcessor = new PostProcessor(renderer, {
+                enabled: true,
+                bloomEnabled: true,
+                bloomStrength: 0.85,
+                bloomRadius: 0.5,
+                bloomThreshold: 0.25,
+                anamorphicEnabled: false, // Default is OFF
+                chromaticAberration: 0.003,
+                vignetteBoost: 1.05,
+                vignetteReduction: 0.55,
+                noiseIntensity: 0.008
+            });
+            postProcessor.setSize(window.innerWidth, window.innerHeight);
+
+            generateProceduralTextures();
+            setupLights();
+            createDesk();
+            createEnvelope();
+            createDriedRose();
+            createWaxSeal();
+            createFloatingPetals();
+
+            setupInteractions();
+            setupGUI();
+
+            animate();
+        }
+
+        window.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

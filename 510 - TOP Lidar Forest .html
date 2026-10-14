@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lidar Forest — Sonic Scanner</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #031a1f; }
+  #app { position: fixed; inset: 0; touch-action: none; cursor: grab; }
+  #app:active { cursor: grabbing; }
+  #app canvas { display: block; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+// Raw sRGB values everywhere (custom shaders, no colour-space conversion)
+THREE.ColorManagement.enabled = false;
+
+/* =====================================================================
+   Helpers
+   ===================================================================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rad = d => d * Math.PI / 180;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function hsl(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const x = v => Math.round(v * 255).toString(16).padStart(2, '0');
+  return '#' + x(f(0)) + x(f(8)) + x(f(4));
+}
+
+function hexLum(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return (0.2126 * (n >> 16 & 255) + 0.7152 * (n >> 8 & 255) + 0.0722 * (n & 255)) / 255;
+}
+
+/* =====================================================================
+   Colour schemes (19)  — roles: bg, dim (outside noise), scan (lit),
+   accent (leaves / dust), ring (sonar wavefront + shell)
+   ===================================================================== */
+const H0 = 42; // gold base hue used by the generated harmony schemes
+const pal = (bg, dim, scan, accent, ring) => () => ({ bg, dim, scan, accent, ring });
+
+const SCHEMES = [
+  { name: 'Original', make: pal('#031a1f', '#1f7a7a', '#ffb830', '#ffd978', '#fff0b8') },
+  { name: 'Monochromatic', make: () => ({
+      bg: hsl(H0, 45, 5), dim: hsl(H0, 40, 32), scan: hsl(H0, 100, 58), accent: hsl(H0, 85, 78), ring: hsl(H0, 100, 90) }) },
+  { name: 'Analogous', make: () => ({
+      bg: hsl(H0 - 30, 45, 5), dim: hsl(H0 - 30, 50, 32), scan: hsl(H0, 100, 58), accent: hsl(H0 + 30, 90, 62), ring: hsl(H0 + 15, 100, 88) }) },
+  { name: 'Complementary', make: () => ({
+      bg: hsl(H0 + 180, 50, 6), dim: hsl(H0 + 180, 45, 38), scan: hsl(H0, 100, 58), accent: hsl(H0 + 180, 90, 75), ring: hsl(H0, 100, 88) }) },
+  { name: 'Split-complementary', make: () => ({
+      bg: hsl(H0 + 180, 50, 6), dim: hsl(H0 + 150, 50, 36), scan: hsl(H0, 100, 58), accent: hsl(H0 + 210, 80, 72), ring: hsl(H0, 100, 88) }) },
+  { name: 'Triadic', make: () => ({
+      bg: hsl(H0 + 240, 45, 6), dim: hsl(H0 + 120, 50, 34), scan: hsl(H0, 100, 58), accent: hsl(H0 + 240, 75, 72), ring: hsl(H0, 100, 88) }) },
+  { name: 'Tetradic', make: () => ({
+      bg: hsl(H0 + 240, 50, 6), dim: hsl(H0 + 60, 45, 34), scan: hsl(H0, 100, 58), accent: hsl(H0 + 180, 80, 72), ring: hsl(H0 + 240, 80, 86) }) },
+  { name: 'Double split-complementary', make: () => ({
+      bg: hsl(H0 + 195, 50, 6), dim: hsl(H0 + 180, 45, 38), scan: hsl(H0, 100, 58), accent: hsl(H0 + 30, 85, 64), ring: hsl(H0 + 210, 90, 86) }) },
+  { name: 'Achromatic', make: v => v === 'Black on white'
+      ? { bg: '#ffffff', dim: '#9a9a9a', scan: '#000000', accent: '#333333', ring: '#000000' }
+      : { bg: '#000000', dim: '#5a5a5a', scan: '#ffffff', accent: '#cfcfcf', ring: '#ffffff' } },
+  { name: 'Achromatic + Accent', make: v => v === 'Black on white'
+      ? { bg: '#ffffff', dim: '#aaaaaa', scan: '#000000', accent: '#e00000', ring: '#e00000' }
+      : { bg: '#000000', dim: '#666666', scan: '#ffffff', accent: '#ff1a1a', ring: '#ff1a1a' } },
+  { name: 'Neutral + Accent', make: pal('#101114', '#8a8f98', '#ff6a3d', '#e6e2d8', '#ff9a78') },
+  { name: 'Ember (F6AA1C)',   make: pal('#220901', '#941B0C', '#F6AA1C', '#BC3908', '#F6AA1C') },
+  { name: 'Lagoon (63D1CF)',  make: pal('#0B132B', '#4BAD9E', '#63D1CF', '#5BC0BE', '#63D1CF') },
+  { name: 'Orchid (AA60C8)',  make: pal('#0D001D', '#AA60C8', '#D69ADE', '#C9A3C6', '#CFB5C2') },
+  { name: 'Saffron (FEF1BE)', make: pal('#061210', '#00474D', '#FFBA00', '#008189', '#FEF1BE') },
+  { name: 'Lime (D4FFB0)',    make: pal('#05140A', '#00B894', '#7FFF00', '#D4FFB0', '#D4FFB0') },
+  { name: 'Sunset (FFE8CC)',  make: pal('#0E0618', '#C7501A', '#FF8C00', '#FFE8CC', '#FFE8CC') },
+  { name: 'Violet (E8E0FF)',  make: pal('#090612', '#6A3DE8', '#B38FFF', '#E8E0FF', '#E8E0FF') },
+  { name: 'Neon (E0FBFF)',    make: pal('#05020F', '#D40078', '#00F0FF', '#E0FBFF', '#E0FBFF') },
+];
+
+/* =====================================================================
+   Camera animations: 8 slow ones + static
+   azRate = azimuth rate (rad/s), *A amplitudes, *W frequencies (rad/s)
+   ===================================================================== */
+const ANIMS = {
+  'Slow Orbit':      { azRate: 0.055 },
+  'Pendulum Sweep':  { azA: 0.60, azW: 0.12 },
+  'Breathing Dolly': { dA: 0.22, dW: 0.14, azA: 0.10, azW: 0.07 },
+  'Crane Rise':      { elA: 0.30, elW: 0.10, azRate: 0.025 },
+  'Figure Eight':    { azA: 0.50, azW: 0.10, elA: 0.18, elW: 0.20 },
+  'Canopy Spiral':   { azRate: 0.05, dA: 0.28, dW: 0.07, elA: 0.16, elW: 0.07, elPh: Math.PI / 2 },
+  'Floating Drift':  { azRate: 0.012, azA: 0.18, azW: 0.17, elA: 0.07, elW: 0.23, dA: 0.06, dW: 0.19 },
+  'Low Skim':        { azRate: 0.035, elBias: -0.14, dA: 0.08, dW: 0.09 },
+  'Static':          {},
+};
+const ANIM_DEFAULTS = { azRate: 0, azA: 0, azW: 1, elA: 0, elW: 1, elPh: 0, elBias: 0, dA: 0, dW: 1, dPh: 0 };
+
+/* =====================================================================
+   Parameters
+   ===================================================================== */
+const params = {
+  // scene
+  randomOnClick: true,
+  greenscreen: false,
+  antialias: true,
+  pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+  speed: 1,
+  exposure: 1,
+  // camera
+  animation: 'Slow Orbit',
+  animAmp: 1,
+  reverse: false,
+  zoom: 1,
+  azOffset: 0,
+  elOffset: 0,
+  distance: 46,
+  elevation: 18,
+  fov: 50,
+  // colours
+  scheme: 'Original',
+  variant: 'White on black',
+  bg: '#031a1f', dim: '#1f7a7a', scan: '#ffb830', accent: '#ffd978', ring: '#fff0b8',
+  // lights
+  ambient: 0.9,
+  sky: 0.7,
+  scanLight: 1.5,
+  ringLight: 1.8,
+  coreLight: 0.9,
+  coreRadius: 14,
+  shellLight: 0.6,
+  // scanner
+  scanRadius: 32,
+  scanInterval: 5.5,
+  scanDuration: 9,
+  edge: 3,
+  ringWidth: 0.9,
+  outDensity: 0.2,
+  outLine: 0.05,
+  showShell: true,
+  // forest
+  seed: 20241,
+  trees: 34,
+  depth: 5,
+  branches: 2,
+  angle: 34,
+  ratio: 0.72,
+  spread: 38,
+  rocks: 18,
+  undergrowth: 160,
+  density: 1,
+  noise: 9000,
+  terrain: 1,
+  groundGrid: true,
+  sway: 0.8,
+  pointSize: 2.6,
+  fog: 0.008,
+};
+
+/* =====================================================================
+   Shaders
+   ===================================================================== */
+const COMMON_GLSL = /* glsl */`
+uniform float uTime, uPx, uSize, uSway, uMaxH;
+uniform float uExposure, uAmbient, uSky, uScanLight, uRingLight, uCoreLight, uCoreRadius;
+uniform float uEdge, uRingWidth, uOutDensity, uOutLine, uFog;
+uniform vec3 uDim, uScan, uAccent, uRing;
+uniform vec4 uPulse[4];
+uniform float uPulseFade[4];
+
+// x: inside the sonic sphere, y: wavefront ring, z: core glow
+vec3 scanState(vec3 wp) {
+  float inside = 0.0, ring = 0.0, core = 0.0;
+  for (int i = 0; i < 4; i++) {
+    float r = uPulse[i].w;
+    if (r > 0.0) {
+      float f = uPulseFade[i];
+      float d = distance(wp, uPulse[i].xyz);
+      inside = max(inside, (1.0 - smoothstep(r - uEdge, r, d)) * f);
+      float q = (d - r) / uRingWidth;
+      ring = max(ring, exp(-q * q) * f);
+      core = max(core, exp(-d / uCoreRadius) * f);
+    }
+  }
+  return vec3(inside, ring, core);
+}
+
+vec3 animatePos(vec3 p, float kind, float rnd) {
+  float k = clamp(p.y / uMaxH, 0.0, 1.0); k *= k;
+  bool swayKind = kind < 1.5 || (kind > 2.5 && kind < 3.5);
+  if (swayKind) {
+    p.x += sin(uTime * 0.7 + p.z * 0.25 + p.y * 0.12) * uSway * k;
+    p.z += cos(uTime * 0.6 + p.x * 0.2 + p.y * 0.10) * uSway * k * 0.7;
+  }
+  if (kind > 3.5 && kind < 4.5) {
+    p += vec3(sin(uTime * 0.25 + rnd * 40.0),
+              0.6 * cos(uTime * 0.20 + rnd * 31.0),
+              sin(uTime * 0.22 + rnd * 57.0)) * 1.4;
+  }
+  return p;
+}
+`;
+
+const SHADE_GLSL = /* glsl */`
+varying vec3 vWp;
+varying float vKind;
+varying float vDepth;
+
+vec3 litColor(float kind) {
+  if (kind < 0.5) return uScan;
+  if (kind < 1.5) return uAccent;
+  if (kind < 2.5) return mix(uScan, uDim, 0.35);
+  if (kind < 3.5) return mix(uScan, uAccent, 0.5);
+  if (kind < 4.5) return uAccent;
+  return uScan * 0.85;
+}
+
+vec3 shade(vec3 s, vec3 wp, float kind, float rnd) {
+  float sky = smoothstep(0.0, uMaxH, wp.y);
+  vec3 dimC = uDim * (0.7 + 0.5 * fract(rnd * 3.7));
+  vec3 base = dimC * (uAmbient + uSky * sky);
+  vec3 lit = litColor(kind) * (uScanLight + uCoreLight * s.z);
+  vec3 col = mix(base, lit, s.x);
+  col += uRing * s.y * uRingLight;
+  return col;
+}
+
+vec4 finish(vec3 col, float a) {
+  col *= uExposure;
+  a *= exp(-vDepth * uFog) * min(uExposure, 1.0);
+  float m = max(col.r, max(col.g, col.b));
+  if (m > 1.0) col /= m;
+  return vec4(col, clamp(a, 0.0, 1.0));
+}
+`;
+
+const POINT_VERT = COMMON_GLSL + /* glsl */`
+attribute float aRand;
+attribute float aKind;
+varying vec3 vWp;
+varying float vRand;
+varying float vKind;
+varying float vDepth;
+void main() {
+  vec3 p = animatePos(position, aKind, aRand);
+  vec4 mv = viewMatrix * vec4(p, 1.0);
+  vec3 s = scanState(p);
+  float dens = (aKind > 3.5 && aKind < 4.5) ? min(1.0, uOutDensity * 3.0) : uOutDensity;
+  float vis = step(aRand, mix(dens, 1.0, s.x));
+  float sz = uSize * (0.6 + fract(aRand * 13.7)) * (1.0 + s.x * 0.4 + s.y * 1.0);
+  float ps = sz * uPx * 40.0 / max(-mv.z, 1.0);
+  gl_PointSize = max(ps, uPx);
+  vWp = p; vRand = aRand; vKind = aKind; vDepth = -mv.z;
+  gl_Position = vis > 0.5 ? projectionMatrix * mv : vec4(2.0, 2.0, 2.0, 1.0);
+}
+`;
+
+const POINT_FRAG = COMMON_GLSL + SHADE_GLSL + /* glsl */`
+varying float vRand;
+void main() {
+  vec2 c = gl_PointCoord - 0.5;
+  float r = length(c) * 2.0;
+  if (r > 1.0) discard;
+  vec3 s = scanState(vWp);
+  vec3 col = shade(s, vWp, vKind, vRand);
+  float a = mix(0.6, 1.0, s.x) * smoothstep(1.0, 0.25, r);
+  gl_FragColor = finish(col, a);
+}
+`;
+
+const LINE_VERT = COMMON_GLSL + /* glsl */`
+attribute float aKind;
+varying vec3 vWp;
+varying float vKind;
+varying float vDepth;
+void main() {
+  vec3 p = animatePos(position, aKind, 0.5);
+  vec4 mv = viewMatrix * vec4(p, 1.0);
+  vWp = p; vKind = aKind; vDepth = -mv.z;
+  gl_Position = projectionMatrix * mv;
+}
+`;
+
+const LINE_FRAG = COMMON_GLSL + SHADE_GLSL + /* glsl */`
+void main() {
+  vec3 s = scanState(vWp);
+  vec3 col = shade(s, vWp, vKind, 0.5);
+  float a = mix(uOutLine, 0.8, s.x) + s.y * 0.5;
+  gl_FragColor = finish(col, a);
+}
+`;
+
+const SHELL_VERT = /* glsl */`
+varying vec3 vN; varying vec3 vV; varying vec3 vO;
+void main() {
+  vO = normalize(position);
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  vN = normalize(normalMatrix * normal);
+  vV = normalize(-mv.xyz);
+  gl_Position = projectionMatrix * mv;
+}
+`;
+
+const SHELL_FRAG = /* glsl */`
+uniform vec3 uRing;
+uniform float uOpacity, uFade, uExposure;
+varying vec3 vN; varying vec3 vV; varying vec3 vO;
+float grid(float x) {
+  float f = abs(fract(x - 0.5) - 0.5) / max(fwidth(x), 1e-4);
+  return 1.0 - min(f, 1.0);
+}
+void main() {
+  float fres = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.5);
+  float lat = asin(clamp(vO.y, -1.0, 1.0)) * 12.0 / 3.14159265;
+  float lon = atan(vO.z, vO.x) * 16.0 / 6.2831853;
+  float g = max(grid(lat), grid(lon));
+  float a = (fres * 0.8 + g * 0.22) * uOpacity * uFade;
+  vec3 col = uRing * uExposure;
+  float m = max(col.r, max(col.g, col.b));
+  if (m > 1.0) col /= m;
+  gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
+}
+`;
+
+/* =====================================================================
+   Renderer / scene / camera
+   ===================================================================== */
+const container = document.getElementById('app');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(params.fov, innerWidth / innerHeight, 0.1, 500);
+let renderer = null;
+
+const U = {
+  uTime: { value: 0 }, uPx: { value: 1 }, uSize: { value: 2.6 }, uSway: { value: 0.8 }, uMaxH: { value: 22 },
+  uExposure: { value: 1 }, uAmbient: { value: 1 }, uSky: { value: 1 }, uScanLight: { value: 1 },
+  uRingLight: { value: 1 }, uCoreLight: { value: 1 }, uCoreRadius: { value: 14 },
+  uEdge: { value: 3 }, uRingWidth: { value: 0.9 }, uOutDensity: { value: 0.2 }, uOutLine: { value: 0.05 },
+  uFog: { value: 0.008 },
+  uDim: { value: new THREE.Color() }, uScan: { value: new THREE.Color() },
+  uAccent: { value: new THREE.Color() }, uRing: { value: new THREE.Color() },
+  uPulse: { value: [new THREE.Vector4(0, 0, 0, -1), new THREE.Vector4(0, 0, 0, -1), new THREE.Vector4(0, 0, 0, -1), new THREE.Vector4(0, 0, 0, -1)] },
+  uPulseFade: { value: [0, 0, 0, 0] },
+};
+const uShellOpacity = { value: 0.6 };
+
+const pointsMat = new THREE.ShaderMaterial({
+  uniforms: U, vertexShader: POINT_VERT, fragmentShader: POINT_FRAG,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+const linesMat = new THREE.ShaderMaterial({
+  uniforms: U, vertexShader: LINE_VERT, fragmentShader: LINE_FRAG,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+
+const forestPoints = new THREE.Points(new THREE.BufferGeometry(), pointsMat);
+const forestLines = new THREE.LineSegments(new THREE.BufferGeometry(), linesMat);
+forestPoints.frustumCulled = false;
+forestLines.frustumCulled = false;
+forestLines.renderOrder = 0;
+forestPoints.renderOrder = 1;
+scene.add(forestLines, forestPoints);
+
+const shellGeo = new THREE.SphereGeometry(1, 64, 40);
+const shells = [];
+for (let i = 0; i < 4; i++) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uRing: U.uRing, uExposure: U.uExposure, uOpacity: uShellOpacity, uFade: { value: 0 } },
+    vertexShader: SHELL_VERT, fragmentShader: SHELL_FRAG,
+    transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+  });
+  const m = new THREE.Mesh(shellGeo, mat);
+  m.visible = false; m.frustumCulled = false; m.renderOrder = 2;
+  shells.push(m); scene.add(m);
+}
+
+function effectiveBg() { return params.greenscreen ? '#00ff00' : params.bg; }
+
+function applyColors() {
+  U.uDim.value.set(params.dim);
+  U.uScan.value.set(params.scan);
+  U.uAccent.value.set(params.accent);
+  U.uRing.value.set(params.ring);
+  const bg = effectiveBg();
+  if (renderer) renderer.setClearColor(bg, 1);
+  document.body.style.background = bg;
+  // additive glow only works on dark backgrounds; use normal blending for light bg / greenscreen
+  const additive = !params.greenscreen && hexLum(bg) < 0.5;
+  const mode = additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+  [pointsMat, linesMat, ...shells.map(s => s.material)].forEach(m => { m.blending = mode; m.needsUpdate = true; });
+}
+
+function createRenderer() {
+  if (renderer) {
+    renderer.dispose();
+    renderer.forceContextLoss();
+    renderer.domElement.remove();
+  }
+  renderer = new THREE.WebGLRenderer({ antialias: params.antialias, powerPreference: 'high-performance' });
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  renderer.setPixelRatio(params.pixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  container.appendChild(renderer.domElement);
+  applyColors();
+}
+
+/* =====================================================================
+   Procedural forest
+   ===================================================================== */
+const MAX_POINTS = 700000;
+const V3 = THREE.Vector3;
+const AX_X = new V3(1, 0, 0), AX_Y = new V3(0, 1, 0);
+const _q = new THREE.Quaternion();
+
+function basis(d) {
+  const a = Math.abs(d.y) > 0.9 ? AX_X : AX_Y;
+  const u = new V3().crossVectors(d, a).normalize();
+  const v = new V3().crossVectors(d, u).normalize();
+  return [u, v];
+}
+
+function buildForest() {
+  const rnd = mulberry32(params.seed >>> 0);
+  const P = [], R = [], K = [], L = [], LK = [];
+  const ph1 = rnd() * 10, ph2 = rnd() * 10;
+
+  const terrain = (x, z) => params.terrain * (
+    Math.sin(x * 0.09 + ph1) * Math.cos(z * 0.08 + ph2) * 1.2 +
+    Math.sin(x * 0.21 + z * 0.17 + ph2) * 0.45 +
+    Math.sin(z * 0.33 - x * 0.11 + ph1) * 0.2);
+
+  const pushPoint = (x, y, z, kind) => {
+    if (P.length / 3 >= MAX_POINTS) return;
+    P.push(x, y, z); R.push(rnd()); K.push(kind);
+  };
+  const line = (ax, ay, az, bx, by, bz, kind) => {
+    L.push(ax, ay, az, bx, by, bz); LK.push(kind, kind);
+  };
+
+  // ---- branch segment: points on a thin cylinder shell + connecting lines
+  function segment(a, b, d, ra, rb, level, o, segLen) {
+    const [u, v] = basis(d);
+    const n = Math.max(2, Math.round(segLen * params.density * (o.small ? 5 : 6) * (level < 2 ? 1.5 : 1)));
+    for (let i = 0; i < n; i++) {
+      const t = rnd(), ang = rnd() * TAU, r = ra + (rb - ra) * t;
+      const c = Math.cos(ang) * r, s = Math.sin(ang) * r;
+      pushPoint(
+        a.x + (b.x - a.x) * t + u.x * c + v.x * s,
+        a.y + (b.y - a.y) * t + u.y * c + v.y * s,
+        a.z + (b.z - a.z) * t + u.z * c + v.z * s, o.kb);
+    }
+    if (level < 2 && !o.small) {
+      for (let k = 0; k < 3; k++) {
+        const ang = k * 2.0944 + level;
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        line(a.x + (u.x * ca + v.x * sa) * ra, a.y + (u.y * ca + v.y * sa) * ra, a.z + (u.z * ca + v.z * sa) * ra,
+             b.x + (u.x * ca + v.x * sa) * rb, b.y + (u.y * ca + v.y * sa) * rb, b.z + (u.z * ca + v.z * sa) * rb, o.kb);
+      }
+      // hexagonal ring at segment start
+      for (let k = 0; k < 6; k++) {
+        const a0 = k * TAU / 6, a1 = (k + 1) * TAU / 6;
+        const c0 = Math.cos(a0) * ra, s0 = Math.sin(a0) * ra, c1 = Math.cos(a1) * ra, s1 = Math.sin(a1) * ra;
+        line(a.x + u.x * c0 + v.x * s0, a.y + u.y * c0 + v.y * s0, a.z + u.z * c0 + v.z * s0,
+             a.x + u.x * c1 + v.x * s1, a.y + u.y * c1 + v.y * s1, a.z + u.z * c1 + v.z * s1, o.kb);
+      }
+    } else {
+      line(a.x, a.y, a.z, b.x, b.y, b.z, o.kb);
+    }
+  }
+
+  // ---- recursive fractal branch
+  function grow(p0, dir, len, level, maxL, rad0, o) {
+    if (P.length / 3 >= MAX_POINTS) return;
+    const sub = o.small ? 2 : (level < 2 ? 3 : 2);
+    const segLen = len / sub;
+    const p = p0.clone();
+    const d = dir.clone().normalize();
+    for (let s = 0; s < sub; s++) {
+      d.x += (rnd() - 0.5) * 0.28; d.z += (rnd() - 0.5) * 0.28; d.y += 0.05 - level * 0.014;
+      d.normalize();
+      const q = p.clone().addScaledVector(d, segLen);
+      segment(p, q, d, rad0 * (1 - 0.28 * s / sub), rad0 * (1 - 0.28 * (s + 1) / sub), level, o, segLen);
+      p.copy(q);
+    }
+    if (level < maxL) {
+      const count = params.branches >= 3 ? 3 : (rnd() < 0.3 ? 3 : 2);
+      const [u, v] = basis(d);
+      const phi0 = rnd() * TAU;
+      for (let i = 0; i < count; i++) {
+        const phi = phi0 + i * TAU / count + (rnd() - 0.5) * 0.6;
+        const axis = new V3().addScaledVector(u, Math.cos(phi)).addScaledVector(v, Math.sin(phi)).normalize();
+        _q.setFromAxisAngle(axis, rad(params.angle) * (o.angleMul || 1) * (0.75 + rnd() * 0.5));
+        const cd = d.clone().applyQuaternion(_q);
+        grow(p, cd, len * params.ratio * (0.85 + rnd() * 0.3), level + 1, maxL, rad0 * 0.62, o);
+      }
+    } else {
+      // foliage cluster of loose points + a few veins
+      const n = Math.max(2, Math.round((o.small ? 6 : 10) * params.density));
+      const Rr = o.small ? len * 0.7 + 0.15 : len * 0.9 + 0.5;
+      for (let i = 0; i < n; i++) {
+        let x = rnd() - 0.5, y = rnd() - 0.5, z = rnd() - 0.5;
+        const l = Math.hypot(x, y, z) || 1;
+        const rr = Math.cbrt(rnd()) * Rr / l;
+        x = p.x + x * rr; y = p.y + y * rr; z = p.z + z * rr;
+        pushPoint(x, y, z, o.kl);
+        if (i < 3) line(p.x, p.y, p.z, x, y, z, o.kl);
+      }
+    }
+  }
+
+  function tree(x, z, scale) {
+    const base = new V3(x, terrain(x, z), z);
+    const dir = new V3((rnd() - 0.5) * 0.15, 1, (rnd() - 0.5) * 0.15);
+    const len = (8 + rnd() * 6) * scale;
+    grow(base, dir, len, 0, params.depth, 0.34 * scale, { kb: 0, kl: 1, small: false });
+    // surface roots
+    for (let r = 0; r < 4; r++) {
+      const a = rnd() * TAU, rl = (1 + rnd() * 1.6) * scale;
+      const ex = x + Math.cos(a) * rl, ez = z + Math.sin(a) * rl;
+      line(x, base.y + 0.3, z, ex, terrain(ex, ez), ez, 0);
+      pushPoint(ex, terrain(ex, ez), ez, 0);
+    }
+  }
+
+  // ---- rocks: displaced low-poly icosahedra (edges + vertices + face dust)
+  function rock(x, z, size) {
+    const g = new THREE.IcosahedronGeometry(1, 1);
+    const pa = g.attributes.position;
+    const sx = 0.8 + rnd() * 0.9, sy = 0.45 + rnd() * 0.5, sz = 0.8 + rnd() * 0.9, sd = rnd() * 1000;
+    const by = terrain(x, z) + size * 0.15;
+    const verts = [];
+    for (let i = 0; i < pa.count; i++) {
+      const vx = pa.getX(i), vy = pa.getY(i), vz = pa.getZ(i);
+      const s = Math.sin(Math.round(vx * 1000) * 12.9898 + Math.round(vy * 1000) * 78.233 + Math.round(vz * 1000) * 37.719 + sd) * 43758.5453;
+      const f = 0.72 + 0.55 * (s - Math.floor(s));
+      verts.push([x + vx * f * sx * size, Math.max(vy * f * sy * size, -size * 0.22) + by, z + vz * f * sz * size]);
+    }
+    const keyOf = a => a[0].toFixed(3) + ',' + a[1].toFixed(3) + ',' + a[2].toFixed(3);
+    const edges = new Set(), uniq = new Set();
+    const np = Math.round(3 * params.density);
+    for (let t = 0; t < pa.count; t += 3) {
+      for (let e = 0; e < 3; e++) {
+        const a = verts[t + e], b = verts[t + (e + 1) % 3];
+        const ka = keyOf(a), kb = keyOf(b);
+        const key = ka < kb ? ka + '|' + kb : kb + '|' + ka;
+        if (!edges.has(key)) { edges.add(key); line(a[0], a[1], a[2], b[0], b[1], b[2], 2); }
+        if (!uniq.has(ka)) { uniq.add(ka); pushPoint(a[0], a[1], a[2], 2); }
+      }
+      const A = verts[t], B = verts[t + 1], C = verts[t + 2];
+      for (let k = 0; k < np; k++) {
+        let u = rnd(), v = rnd(); if (u + v > 1) { u = 1 - u; v = 1 - v; }
+        pushPoint(A[0] + (B[0] - A[0]) * u + (C[0] - A[0]) * v,
+                  A[1] + (B[1] - A[1]) * u + (C[1] - A[1]) * v,
+                  A[2] + (B[2] - A[2]) * u + (C[2] - A[2]) * v, 2);
+      }
+    }
+    g.dispose();
+  }
+
+  // ---- place trees (Poisson-like, with a small clearing in the middle)
+  const placed = [];
+  for (let i = 0; i < params.trees; i++) {
+    for (let tries = 0; tries < 24; tries++) {
+      const r = params.spread * Math.sqrt(rnd()), a = rnd() * TAU;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r;
+      if (Math.hypot(x, z) < 4) continue;
+      if (placed.some(p => Math.hypot(p[0] - x, p[1] - z) < 3)) continue;
+      placed.push([x, z]);
+      tree(x, z, 0.75 + rnd() * 0.55);
+      break;
+    }
+  }
+
+  // ---- rocks
+  for (let i = 0; i < params.rocks; i++) {
+    const r = params.spread * 1.05 * Math.sqrt(rnd()), a = rnd() * TAU;
+    const size = rnd() < 0.15 ? 1.8 + rnd() * 1.4 : 0.5 + rnd() * 1.1;
+    rock(Math.cos(a) * r, Math.sin(a) * r, size);
+  }
+
+  // ---- undergrowth sprigs (tiny fractal ferns)
+  for (let i = 0; i < params.undergrowth; i++) {
+    const r = params.spread * 1.05 * Math.sqrt(rnd()), a = rnd() * TAU;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const dir = new V3((rnd() - 0.5) * 0.9, 1, (rnd() - 0.5) * 0.9);
+    grow(new V3(x, terrain(x, z), z), dir, 0.7 + rnd() * 1.3, 0, 3, 0.03, { kb: 3, kl: 3, small: true, angleMul: 1.2 });
+  }
+
+  // ---- ground scatter
+  const groundN = Math.round(2.5 * params.spread * params.spread);
+  for (let i = 0; i < groundN; i++) {
+    const r = params.spread * 1.15 * Math.sqrt(rnd()), a = rnd() * TAU;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    pushPoint(x, terrain(x, z) + rnd() * 0.08, z, 5);
+  }
+
+  // ---- polar ground grid (lidar scan-lines)
+  if (params.groundGrid) {
+    const Rmax = params.spread * 1.15, rings = 12, seg = 72, rays = 20, rseg = 36;
+    for (let k = 1; k <= rings; k++) {
+      const rr = Rmax * k / rings;
+      for (let s = 0; s < seg; s++) {
+        const a0 = s * TAU / seg, a1 = (s + 1) * TAU / seg;
+        const x0 = Math.cos(a0) * rr, z0 = Math.sin(a0) * rr, x1 = Math.cos(a1) * rr, z1 = Math.sin(a1) * rr;
+        line(x0, terrain(x0, z0) + 0.02, z0, x1, terrain(x1, z1) + 0.02, z1, 5);
+      }
+    }
+    for (let k = 0; k < rays; k++) {
+      const a = k * TAU / rays;
+      for (let s = 0; s < rseg; s++) {
+        const r0 = Rmax * s / rseg, r1 = Rmax * (s + 1) / rseg;
+        const x0 = Math.cos(a) * r0, z0 = Math.sin(a) * r0, x1 = Math.cos(a) * r1, z1 = Math.sin(a) * r1;
+        line(x0, terrain(x0, z0) + 0.02, z0, x1, terrain(x1, z1) + 0.02, z1, 5);
+      }
+    }
+  }
+
+  // ---- floating noise field (spores / dust)
+  for (let i = 0; i < params.noise; i++) {
+    const r = params.spread * 1.2 * Math.sqrt(rnd()), a = rnd() * TAU;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    pushPoint(x, terrain(x, z) + Math.pow(rnd(), 1.5) * 24, z, 4);
+  }
+
+  // ---- upload
+  const pg = new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
+  pg.setAttribute('aRand', new THREE.BufferAttribute(new Float32Array(R), 1));
+  pg.setAttribute('aKind', new THREE.BufferAttribute(new Float32Array(K), 1));
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(L), 3));
+  lg.setAttribute('aKind', new THREE.BufferAttribute(new Float32Array(LK), 1));
+
+  forestPoints.geometry.dispose(); forestPoints.geometry = pg;
+  forestLines.geometry.dispose(); forestLines.geometry = lg;
+}
+
+/* =====================================================================
+   Camera: animation + user control (wheel zoom, drag pan, right-drag rotate)
+   ===================================================================== */
+const FOCUS = new V3(0, 6, 0);
+const panTarget = new V3(), panCur = new V3();
+const targetCur = new V3().copy(FOCUS);
+let zoomCur = 1;
+let azAcc = 0, azRateCur = 0, azCur = 0, elCur = 0, dCur = 0;
+let simTime = 0;
+let uiDirty = false;
+
+function updateCamera(dt, sdt) {
+  const pr = { ...ANIM_DEFAULTS, ...(ANIMS[params.animation] || {}) };
+  const sign = params.reverse ? -1 : 1;
+  const amp = params.animAmp;
+
+  azRateCur += (pr.azRate - azRateCur) * (1 - Math.exp(-dt * 1.2));
+  azAcc += sdt * azRateCur * sign * amp;
+
+  const azT = pr.azA * amp * sign * Math.sin(simTime * pr.azW);
+  const elT = pr.elBias + pr.elA * amp * Math.sin(simTime * pr.elW + pr.elPh);
+  const dT = pr.dA * amp * Math.sin(simTime * pr.dW + pr.dPh);
+  const k = 1 - Math.exp(-dt * 1.5);
+  azCur += (azT - azCur) * k;
+  elCur += (elT - elCur) * k;
+  dCur += (dT - dCur) * k;
+
+  zoomCur += (params.zoom - zoomCur) * (1 - Math.exp(-dt * 9));
+  panCur.lerp(panTarget, 1 - Math.exp(-dt * 14));
+  targetCur.copy(FOCUS).add(panCur);
+
+  const az = rad(params.azOffset) + azAcc + azCur;
+  const el = clamp(rad(params.elevation + params.elOffset) + elCur, 0.04, 1.5);
+  const dist = Math.max(3, params.distance * (1 + dCur) * zoomCur);
+
+  camera.fov = params.fov;
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  camera.position.set(
+    targetCur.x + dist * Math.cos(el) * Math.sin(az),
+    targetCur.y + dist * Math.sin(el),
+    targetCur.z + dist * Math.cos(el) * Math.cos(az));
+  camera.lookAt(targetCur);
+  camera.updateMatrixWorld();
+}
+
+const _r = new V3(), _u = new V3(), _z = new V3();
+function panBy(dx, dy) {
+  camera.matrixWorld.extractBasis(_r, _u, _z);
+  const dist = camera.position.distanceTo(targetCur);
+  const s = 2 * Math.tan(rad(camera.fov) / 2) * dist / container.clientHeight;
+  panTarget.addScaledVector(_r, -dx * s).addScaledVector(_u, dy * s);
+  if (panTarget.length() > 90) panTarget.setLength(90);
+}
+
+function wrapDeg(a) { return ((a + 180) % 360 + 360) % 360 - 180; }
+
+function resetView() {
+  panTarget.set(0, 0, 0);
+  params.zoom = 1; params.azOffset = 0; params.elOffset = 0;
+  uiDirty = true;
+}
+
+/* ---- pointer input ---- */
+const pointers = new Map();
+let drag = null, pinchDist = 0;
+
+container.addEventListener('contextmenu', e => e.preventDefault());
+container.addEventListener('pointerdown', e => {
+  container.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1) {
+    drag = { mode: (e.button === 2 || e.shiftKey) ? 'rotate' : 'pan', moved: 0, t: performance.now(), button: e.button, shift: e.shiftKey };
+  } else if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+    if (drag) drag.moved = 999;
+  }
+});
+container.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinchDist > 0 && d > 0) { params.zoom = clamp(params.zoom * pinchDist / d, 0.1, 4); uiDirty = true; }
+    pinchDist = d;
+  } else if (drag) {
+    drag.moved += Math.abs(dx) + Math.abs(dy);
+    if (drag.mode === 'pan') {
+      panBy(dx, dy);
+    } else {
+      params.azOffset = wrapDeg(params.azOffset - dx * 0.3);
+      params.elOffset = clamp(params.elOffset + dy * 0.3, -60, 60);
+      uiDirty = true;
+    }
+  }
+});
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinchDist = 0;
+  if (drag && e.type === 'pointerup' && drag.moved < 6 && drag.button === 0 && !drag.shift &&
+      performance.now() - drag.t < 500 && params.randomOnClick) {
+    randomizeTheme();
+  }
+  if (pointers.size === 0) drag = null;
+}
+container.addEventListener('pointerup', endPointer);
+container.addEventListener('pointercancel', endPointer);
+container.addEventListener('wheel', e => {
+  e.preventDefault();
+  params.zoom = clamp(params.zoom * Math.exp(e.deltaY * 0.0012), 0.1, 4);
+  uiDirty = true;
+}, { passive: false });
+
+/* =====================================================================
+   Sonic pulses
+   ===================================================================== */
+let pulses = [];
+let nextSpawn = 0;
+
+function updatePulses() {
+  const dur = params.scanDuration;
+  const intv = Math.max(params.scanInterval, dur / 4 + 0.01);
+  if (simTime >= nextSpawn) {
+    pulses.push({ t0: simTime, o: targetCur.clone() });
+    nextSpawn += intv;
+    if (nextSpawn < simTime) nextSpawn = simTime + intv;
+  }
+  pulses = pulses.filter(p => simTime - p.t0 < dur).slice(-4);
+  for (let i = 0; i < 4; i++) {
+    const p = pulses[i];
+    const v4 = U.uPulse.value[i];
+    if (p) {
+      const t = (simTime - p.t0) / dur;
+      const r = Math.max(0.01, params.scanRadius * (1 - Math.pow(1 - t, 2.2)));
+      const f = smooth(0, 0.06, t) * (1 - smooth(0.55, 1, t));
+      v4.set(p.o.x, p.o.y, p.o.z, r);
+      U.uPulseFade.value[i] = f;
+      const sh = shells[i];
+      sh.visible = params.showShell;
+      sh.position.copy(p.o); sh.scale.setScalar(r);
+      sh.material.uniforms.uFade.value = f;
+    } else {
+      v4.w = -1; U.uPulseFade.value[i] = 0; shells[i].visible = false;
+    }
+  }
+}
+
+/* =====================================================================
+   Random theme on click
+   ===================================================================== */
+const rr = (a, b) => a + Math.random() * (b - a);
+const ri = (a, b) => Math.floor(rr(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+function refreshGUI() { gui.controllersRecursive().forEach(c => c.updateDisplay()); }
+
+function applyScheme() {
+  const s = SCHEMES.find(x => x.name === params.scheme) || SCHEMES[0];
+  Object.assign(params, s.make(params.variant));
+  applyColors();
+}
+
+function randomizeTheme() {
+  // visual theme
+  params.scheme = pick(SCHEMES).name;
+  params.variant = pick(['White on black', 'Black on white']);
+  applyScheme();
+  // geometry
+  params.seed = ri(0, 999999);
+  params.trees = ri(14, 48);
+  params.depth = ri(4, 6);
+  params.branches = ri(2, 3);
+  params.angle = Math.round(rr(20, 52));
+  params.ratio = +rr(0.62, 0.78).toFixed(2);
+  params.spread = ri(26, 56);
+  params.rocks = ri(6, 40);
+  params.undergrowth = ri(60, 320);
+  params.noise = ri(4000, 15000);
+  params.terrain = +rr(0.4, 2.4).toFixed(2);
+  params.sway = +rr(0.2, 1.6).toFixed(2);
+  // motion
+  const moving = Object.keys(ANIMS).filter(n => n !== 'Static');
+  params.animation = pick(moving);
+  params.animAmp = +rr(0.7, 1.4).toFixed(2);
+  params.reverse = Math.random() < 0.5;
+  params.scanInterval = +rr(3.5, 7).toFixed(1);
+  params.scanDuration = +rr(6.5, 11).toFixed(1);
+  params.scanRadius = ri(24, 40);
+  params.ringWidth = +rr(0.5, 1.5).toFixed(2);
+  buildForest();
+  refreshGUI();
+}
+
+/* =====================================================================
+   GUI
+   ===================================================================== */
+const gui = new GUI({ title: 'Lidar Forest' });
+
+const fScene = gui.addFolder('Scene');
+fScene.add(params, 'randomOnClick').name('Random theme on click');
+fScene.add({ randomize: () => randomizeTheme() }, 'randomize').name('Randomize now');
+fScene.add({ reset: () => resetView() }, 'reset').name('Reset view');
+fScene.add(params, 'greenscreen').name('Greenscreen #00ff00').onChange(applyColors);
+fScene.add(params, 'antialias').name('Antialias').onChange(() => { createRenderer(); });
+fScene.add(params, 'pixelRatio', 0.25, 3, 0.05).name('Pixel ratio (DPR)').onChange(v => renderer.setPixelRatio(v));
+fScene.add(params, 'speed', 0, 3, 0.01).name('Animation speed');
+fScene.add(params, 'exposure', 0, 3, 0.01).name('Exposure');
+
+const fCam = gui.addFolder('Camera').close();
+fCam.add(params, 'animation', Object.keys(ANIMS)).name('Animation');
+fCam.add(params, 'animAmp', 0, 2, 0.01).name('Animation amount');
+fCam.add(params, 'reverse').name('Reverse direction');
+fCam.add(params, 'zoom', 0.1, 4, 0.01).name('Zoom');
+fCam.add(params, 'azOffset', -180, 180, 1).name('Angle: azimuth');
+fCam.add(params, 'elOffset', -60, 60, 1).name('Angle: elevation');
+fCam.add(params, 'distance', 15, 120, 1).name('Distance');
+fCam.add(params, 'elevation', 2, 80, 1).name('Base elevation');
+fCam.add(params, 'fov', 20, 100, 1).name('Field of view');
+
+const fCol = gui.addFolder('Colors').close();
+fCol.add(params, 'scheme', SCHEMES.map(s => s.name)).name('Color scheme').onChange(() => { applyScheme(); refreshGUI(); });
+fCol.add(params, 'variant', ['White on black', 'Black on white']).name('Achromatic variant').onChange(() => { applyScheme(); refreshGUI(); });
+fCol.addColor(params, 'bg').name('Background').onChange(applyColors);
+fCol.addColor(params, 'dim').name('Foliage (outside)').onChange(applyColors);
+fCol.addColor(params, 'scan').name('Scanned (inside)').onChange(applyColors);
+fCol.addColor(params, 'accent').name('Accent').onChange(applyColors);
+fCol.addColor(params, 'ring').name('Pulse ring').onChange(applyColors);
+
+const fLight = gui.addFolder('Lights').close();
+fLight.add(params, 'ambient', 0, 3, 0.01).name('Ambient light');
+fLight.add(params, 'sky', 0, 3, 0.01).name('Sky light');
+fLight.add(params, 'scanLight', 0, 3, 0.01).name('Scanner light');
+fLight.add(params, 'ringLight', 0, 4, 0.01).name('Wavefront light');
+fLight.add(params, 'coreLight', 0, 3, 0.01).name('Core light');
+fLight.add(params, 'coreRadius', 2, 40, 0.5).name('Core light radius');
+fLight.add(params, 'shellLight', 0, 2, 0.01).name('Sphere shell light');
+
+const fScan = gui.addFolder('Scanner').close();
+fScan.add(params, 'scanRadius', 8, 60, 0.5).name('Max radius');
+fScan.add(params, 'scanInterval', 1, 15, 0.1).name('Pulse interval');
+fScan.add(params, 'scanDuration', 3, 20, 0.1).name('Pulse duration');
+fScan.add(params, 'edge', 0.1, 12, 0.1).name('Edge softness');
+fScan.add(params, 'ringWidth', 0.2, 4, 0.05).name('Ring width');
+fScan.add(params, 'outDensity', 0, 1, 0.01).name('Outside point density');
+fScan.add(params, 'outLine', 0, 0.5, 0.005).name('Outside line opacity');
+fScan.add(params, 'showShell').name('Show sphere shell');
+
+const fFor = gui.addFolder('Forest').close();
+const regen = () => buildForest();
+fFor.add(params, 'seed', 0, 999999, 1).name('Seed').onFinishChange(regen);
+fFor.add(params, 'trees', 0, 80, 1).name('Trees').onFinishChange(regen);
+fFor.add(params, 'depth', 2, 7, 1).name('Fractal depth').onFinishChange(regen);
+fFor.add(params, 'branches', 2, 3, 1).name('Branches per node').onFinishChange(regen);
+fFor.add(params, 'angle', 10, 70, 1).name('Branch angle').onFinishChange(regen);
+fFor.add(params, 'ratio', 0.5, 0.85, 0.01).name('Length ratio').onFinishChange(regen);
+fFor.add(params, 'spread', 15, 70, 1).name('Forest radius').onFinishChange(regen);
+fFor.add(params, 'rocks', 0, 60, 1).name('Rocks').onFinishChange(regen);
+fFor.add(params, 'undergrowth', 0, 500, 1).name('Undergrowth').onFinishChange(regen);
+fFor.add(params, 'density', 0.3, 2, 0.05).name('Point density').onFinishChange(regen);
+fFor.add(params, 'noise', 0, 30000, 100).name('Noise field').onFinishChange(regen);
+fFor.add(params, 'terrain', 0, 3, 0.05).name('Terrain').onFinishChange(regen);
+fFor.add(params, 'groundGrid').name('Ground scan-lines').onFinishChange(regen);
+fFor.add(params, 'sway', 0, 3, 0.01).name('Wind sway');
+fFor.add(params, 'pointSize', 0.5, 8, 0.1).name('Point size');
+fFor.add(params, 'fog', 0, 0.04, 0.001).name('Depth fade');
+fFor.add({ newSeed: () => { params.seed = ri(0, 999999); buildForest(); refreshGUI(); } }, 'newSeed').name('New forest');
+
+/* H toggles the whole UI */
+let uiHidden = false;
+window.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && t.type === 'text'))) return;
+  if (e.code === 'KeyH' || e.key === 'h' || e.key === 'H') {
+    uiHidden = !uiHidden;
+    gui.show(!uiHidden);
+  }
+});
+
+/* =====================================================================
+   Main loop (infinite auto-animation)
+   ===================================================================== */
+function syncUniforms() {
+  U.uExposure.value = params.exposure;
+  U.uAmbient.value = params.ambient;
+  U.uSky.value = params.sky;
+  U.uScanLight.value = params.scanLight;
+  U.uRingLight.value = params.ringLight;
+  U.uCoreLight.value = params.coreLight;
+  U.uCoreRadius.value = params.coreRadius;
+  U.uEdge.value = params.edge;
+  U.uRingWidth.value = params.ringWidth;
+  U.uOutDensity.value = params.outDensity;
+  U.uOutLine.value = params.outLine;
+  U.uSize.value = params.pointSize;
+  U.uSway.value = params.sway;
+  U.uFog.value = params.fog;
+  U.uPx.value = renderer.getPixelRatio();
+  uShellOpacity.value = params.shellLight;
+}
+
+window.addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  const sdt = dt * params.speed;
+  simTime += sdt;
+  U.uTime.value = simTime;
+
+  updateCamera(dt, sdt);
+  updatePulses();
+  syncUniforms();
+
+  if (uiDirty) { uiDirty = false; refreshGUI(); }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+/* ---- boot ---- */
+createRenderer();
+applyScheme();
+buildForest();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
