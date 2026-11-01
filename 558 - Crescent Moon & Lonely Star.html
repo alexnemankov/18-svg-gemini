@@ -1,0 +1,2937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crescent Moon & Lonely Star Over Night Water</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #030712;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      overflow: hidden;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // =========================================================================
+    // POST PROCESSOR SUITE (From postprocessing/PostProcessor.js)
+    // =========================================================================
+    const orthoVertexShader = `
+    precision highp float;
+    in vec3 position;
+    out vec2 vUv;
+    void main() {
+      vUv = position.xy * 0.5 + 0.5;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+    `;
+
+    const brightFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float bloomThreshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    vec3 sanitize(vec3 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      return clamp(v, vec3(0.0), vec3(65000.0));
+    }
+
+    void main() {
+      vec4 raw = texture(inputTexture, vUv);
+      vec3 color = sanitize(raw.rgb);
+      float luminance = max(0.0, dot(color, vec3(0.2126, 0.7152, 0.0722)));
+      float knee = 0.1;
+      float soft = luminance - bloomThreshold + knee;
+      soft = clamp(soft, 0.0, 2.0 * knee);
+      soft = (soft * soft) / (4.0 * knee + 0.00001);
+      float contribution = max(soft, luminance - bloomThreshold);
+      contribution /= max(luminance, 0.0001);
+      vec3 result = color * contribution;
+      fragColor = vec4(sanitize(result), clamp(raw.a, 0.0, 1.0));
+    }
+    `;
+
+    const blur13ShaderChunk = `
+    vec4 blur13(sampler2D image, vec2 uv, vec2 direction) {
+      vec2 resolution = vec2(textureSize(image, 0));
+      vec4 color = vec4(0.0);
+      vec2 off1 = vec2(1.411764705882353) * direction;
+      vec2 off2 = vec2(3.2941176470588234) * direction;
+      vec2 off3 = vec2(5.176470588235294) * direction;
+      color += texture(image, uv) * 0.1964825501511404;
+      color += texture(image, uv + (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv - (off1 / resolution)) * 0.2969069646728344;
+      color += texture(image, uv + (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv - (off2 / resolution)) * 0.09447039785044732;
+      color += texture(image, uv + (off3 / resolution)) * 0.010381362401148057;
+      color += texture(image, uv - (off3 / resolution)) * 0.010381362401148057;
+      return color;
+    }
+    `;
+
+    const blurFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 direction;
+    in vec2 vUv;
+    out vec4 color;
+    ${blur13ShaderChunk}
+
+    vec4 sanitize(vec4 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      if (isnan(v.w) || isinf(v.w)) v.w = 0.0;
+      return clamp(v, vec4(0.0), vec4(65000.0));
+    }
+
+    void main() {
+      color = sanitize(blur13(inputTexture, vUv, direction));
+    }
+    `;
+
+    const godRaysDepthMaskShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float factor = smoothstep(threshold, threshold + 0.15, lum);
+      fragColor = vec4(vec3(factor), 1.0);
+    }
+    `;
+
+    const godRaysGenerateShader = `
+    precision highp float;
+    #define TAPS_PER_PASS 6.0
+
+    uniform sampler2D inputTexture;
+    uniform vec3 vSunPositionScreenSpace;
+    uniform float fStepSize;
+    uniform float distanceAttenuation;
+    uniform float maxDensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec2 delta = vSunPositionScreenSpace.xy - vUv;
+      float dist = length(delta);
+      vec2 stepv = fStepSize * delta / max(dist, 0.0001);
+      float iters = dist / max(fStepSize, 0.00001);
+
+      vec2 uv = vUv;
+      float col = 0.0;
+      float f = min(1.0, max(vSunPositionScreenSpace.z, 0.0));
+      float atten = 1.0 / (1.0 + pow(dist, distanceAttenuation));
+
+      if (0.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (1.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (2.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (3.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (4.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+      uv += stepv;
+      if (5.0 <= iters && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col += texture(inputTexture, uv).r * f;
+
+      float finalVal = min(col / TAPS_PER_PASS * atten, maxDensity);
+      fragColor = vec4(vec3(finalVal), 1.0);
+    }
+    `;
+
+    const anamorphicBrightShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float threshold;
+    uniform float smoothWidth;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec4 color = texture(inputTexture, vUv);
+      float v = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float alpha = smoothstep(threshold, threshold + smoothWidth, v);
+      fragColor = mix(vec4(0.0), color, alpha);
+    }
+    `;
+
+    const anamorphicBlurShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    uniform float samples;
+    uniform float intensity;
+    uniform vec3 tintColor;
+    uniform float bloomRadius;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      int halfSamples = max(1, int(samples) / 2);
+      float fHalfSamples = float(halfSamples);
+      vec2 invSize = 1.0 / resolution;
+      vec4 total = vec4(0.0);
+
+      for (int i = -64; i <= 64; i++) {
+        if (i < -halfSamples || i > halfSamples) continue;
+        float softness = 1.0 - abs(float(i)) / fHalfSamples;
+        softness = pow(softness, 2.0);
+        vec2 shiftedUV = vec2(vUv.x + invSize.x * float(i) * (4.0 + bloomRadius * 8.0), vUv.y);
+        shiftedUV = clamp(shiftedUV, 0.001, 0.999);
+        total += texture(inputTexture, shiftedUV) * softness;
+      }
+
+      fragColor = (total / (samples / 3.0)) * vec4(tintColor, 1.0) * intensity;
+    }
+    `;
+
+    const finalFragmentShader = `
+    precision highp float;
+    uniform vec2 resolution;
+    uniform sampler2D inputTexture;
+    uniform sampler2D blur0Texture;
+    uniform sampler2D blur1Texture;
+    uniform sampler2D blur2Texture;
+    uniform sampler2D blur3Texture;
+    uniform sampler2D blur4Texture;
+    uniform sampler2D raysTexture;
+    uniform sampler2D anamorphicTexture;
+    uniform bool bloomEnabled;
+    uniform float bloomStrength;
+    uniform bool raysEnabled;
+    uniform float raysStrength;
+    uniform vec3 raysColor;
+    uniform bool anamorphicEnabled;
+    uniform float vignetteBoost;
+    uniform float vignetteReduction;
+    uniform float noiseIntensity;
+    uniform float time;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    vec3 sanitize(vec3 v) {
+      if (isnan(v.x) || isinf(v.x)) v.x = 0.0;
+      if (isnan(v.y) || isinf(v.y)) v.y = 0.0;
+      if (isnan(v.z) || isinf(v.z)) v.z = 0.0;
+      return clamp(v, vec3(0.0), vec3(65000.0));
+    }
+
+    float vignette(vec2 uv, float boost, float reduction) {
+      vec2 position = vUv - 0.5;
+      return boost - length(position) * reduction;
+    }
+
+    float hash1(uint n) {
+      n = (n << 13U) ^ n;
+      n = n * (n * n * 15731U + 789221U) + 1376312589U;
+      return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+    }
+
+    float noise(in vec2 uv, in float timeVal) {
+      uvec2 p = uvec2(uv);
+      return hash1(p.x + 1920U * p.y + (1920U * 1080U) * (uint(timeVal) % 65536U));
+    }
+
+    void main() {
+      vec4 raw = texture(inputTexture, vUv);
+      vec3 color = sanitize(raw.rgb);
+
+      if (bloomEnabled && bloomStrength > 0.001) {
+        vec3 b0 = sanitize(texture(blur0Texture, vUv).rgb);
+        vec3 b1 = sanitize(texture(blur1Texture, vUv).rgb);
+        vec3 b2 = sanitize(texture(blur2Texture, vUv).rgb);
+        vec3 b3 = sanitize(texture(blur3Texture, vUv).rgb);
+        vec3 b4 = sanitize(texture(blur4Texture, vUv).rgb);
+        vec3 bloomSum = (b0 * 0.3 + b1 * 0.25 + b2 * 0.2 + b3 * 0.15 + b4 * 0.1);
+        color += bloomSum * bloomStrength;
+      }
+
+      if (raysEnabled && raysStrength > 0.001) {
+        vec3 r = sanitize(texture(raysTexture, vUv).rgb);
+        color += r * raysColor * raysStrength;
+      }
+
+      if (anamorphicEnabled) {
+        vec3 a = sanitize(texture(anamorphicTexture, vUv).rgb);
+        color += a;
+      }
+
+      float vig = max(0.0, vignette(vUv, vignetteBoost, vignetteReduction));
+      color *= vig;
+      color += max(0.0, noiseIntensity) * noise(gl_FragCoord.xy, time);
+      fragColor = vec4(sanitize(color), 1.0);
+    }
+    `;
+
+    const chromaticAberrationShaderChunk = `
+    vec2 barrelDistortion(vec2 coord, float amt) {
+      vec2 cc = coord - 0.5;
+      float dist = dot(cc, cc);
+      return coord + cc * dist * amt;
+    }
+    float sat(float t) { return clamp(t, 0.0, 1.0); }
+    float linterp(float t) { return sat(1.0 - abs(2.0 * t - 1.0)); }
+    float remap(float t, float a, float b) { return sat((t - a) / (b - a)); }
+    vec4 spectrum_offset(float t) {
+      float lo = step(t, 0.5);
+      float hi = 1.0 - lo;
+      float w = linterp(remap(t, 1.0/6.0, 5.0/6.0));
+      vec4 ret = vec4(lo, 1.0, hi, 1.0) * vec4(1.0 - w, w, 1.0 - w, 1.0);
+      return pow(ret, vec4(1.0 / 2.2));
+    }
+    const float max_distort = 2.2;
+    const int num_iter = 8;
+    const float reci_num_iter_f = 1.0 / float(num_iter);
+    vec4 chromaticAberration(sampler2D inputTexture, vec2 uv, float amount, vec2 dir) {
+      vec4 sumcol = vec4(0.0);
+      vec4 sumw = vec4(0.0);
+      for (int i = 0; i < num_iter; ++i) {
+        float t = float(i) * reci_num_iter_f;
+        vec4 w = spectrum_offset(t);
+        sumw += w;
+        sumcol += w * texture(inputTexture, barrelDistortion(uv, amount * max_distort * t));
+      }
+      return sumcol / sumw;
+    }
+    `;
+
+    const colorFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform float chromaticAberrationAmount;
+    uniform float minInputLevel;
+    uniform float maxInputLevel;
+    uniform float gammaLevel;
+    uniform float exposure;
+    uniform float fisheyeStrength;
+    uniform float fisheyeRadius;
+    uniform float time;
+    uniform int visionMode;
+    uniform float thermalSensitivity;
+    uniform float nightVisionNoise;
+    uniform float nightVisionGain;
+    uniform float crtIntensity;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    ${chromaticAberrationShaderChunk}
+
+    vec2 applyFisheye(vec2 uv, float strength, float radius) {
+      if (abs(strength) < 0.0001) return uv;
+      vec2 p = uv - 0.5;
+      float d = length(p);
+      if (d > radius * 1.5) return uv;
+      float r = d / max(radius, 0.001);
+      float theta = atan(p.y, p.x);
+      float rDist = r + strength * (r * r * r);
+      return 0.5 + vec2(cos(theta), sin(theta)) * (rDist * radius);
+    }
+
+    vec3 ACESFilmicToneMapping(vec3 color) {
+      color = max(vec3(0.0), color);
+      float a = 2.51;
+      float b = 0.03;
+      float c = 2.43;
+      float d = 0.59;
+      float e = 0.14;
+      vec3 denom = max(color * (c * color + d) + e, vec3(0.0001));
+      return clamp((color * (a * color + b)) / denom, 0.0, 1.0);
+    }
+
+    vec3 gammaCorrect(vec3 color, vec3 gamma) {
+      return pow(max(color, vec3(0.0)), 1.0 / max(gamma, vec3(0.001)));
+    }
+    vec3 levelRange(vec3 color, vec3 minInput, vec3 maxInput) {
+      return min(max(color - minInput, vec3(0.0)) / max(maxInput - minInput, vec3(0.0001)), vec3(1.0));
+    }
+    vec3 finalLevels(vec3 color, vec3 minInput, vec3 gamma, vec3 maxInput) {
+      return gammaCorrect(levelRange(color, minInput, maxInput), gamma);
+    }
+
+    vec3 applyNightVision(vec3 color, vec2 uv, float timeVal, float noiseAmt, float gain, float crt) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float amplified = pow(lum * gain, 0.72);
+      vec3 phosphorColor = mix(vec3(0.02, 0.12, 0.03), vec3(0.18, 1.0, 0.32), clamp(amplified, 0.0, 1.0));
+      phosphorColor += vec3(0.7, 1.0, 0.8) * max(0.0, amplified - 0.75) * 1.8;
+      vec2 p = uv - 0.5;
+      float tubeDist = length(p);
+      float tubeMask = smoothstep(0.72, 0.44, tubeDist);
+      float n = fract(sin(dot(uv * 280.0 + timeVal * 0.05, vec2(12.9898, 78.233))) * 43758.5453);
+      float scanline = sin(uv.y * 650.0) * crt;
+      phosphorColor += (n - 0.5) * noiseAmt * 2.0 + scanline;
+      return clamp(phosphorColor * tubeMask, 0.0, 1.0);
+    }
+
+    vec3 ironbow(float t) {
+      t = clamp(t, 0.0, 1.0);
+      vec3 c0 = vec3(0.02, 0.01, 0.18);
+      vec3 c1 = vec3(0.22, 0.02, 0.48);
+      vec3 c2 = vec3(0.82, 0.05, 0.25);
+      vec3 c3 = vec3(1.0, 0.62, 0.02);
+      vec3 c4 = vec3(1.0, 1.0, 0.92);
+      if (t < 0.25) return mix(c0, c1, t * 4.0);
+      if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+      if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+      return mix(c3, c4, (t - 0.75) * 4.0);
+    }
+
+    vec3 applyThermal(vec3 color, vec2 uv, float sensitivity, float crt, bool whiteHot) {
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      float heat = clamp(lum * sensitivity, 0.0, 1.0);
+      float sensorRaster = sin(uv.y * 900.0) * (crt * 0.3);
+      heat = clamp(heat + sensorRaster, 0.0, 1.0);
+      if (whiteHot) {
+        float grad = pow(heat, 0.85);
+        return vec3(grad);
+      } else {
+        return ironbow(heat);
+      }
+    }
+
+    void main() {
+      vec2 uv = applyFisheye(vUv, fisheyeStrength, fisheyeRadius);
+      vec4 col = chromaticAberration(inputTexture, uv, chromaticAberrationAmount, (uv - 0.5));
+      vec3 finalCol = col.rgb;
+      if (isnan(finalCol.x) || isinf(finalCol.x)) finalCol.x = 0.0;
+      if (isnan(finalCol.y) || isinf(finalCol.y)) finalCol.y = 0.0;
+      if (isnan(finalCol.z) || isinf(finalCol.z)) finalCol.z = 0.0;
+      finalCol = clamp(finalCol, vec3(0.0), vec3(65000.0));
+
+      if (visionMode == 1) {
+        finalCol = applyNightVision(finalCol, uv, time, nightVisionNoise, nightVisionGain, crtIntensity);
+      } else if (visionMode == 2) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, false);
+      } else if (visionMode == 3) {
+        finalCol = applyThermal(finalCol, uv, thermalSensitivity, crtIntensity, true);
+      } else {
+        vec3 exposedColor = finalCol * exposure;
+        vec3 toneMappedColor = ACESFilmicToneMapping(exposedColor);
+        finalCol = finalLevels(toneMappedColor, vec3(minInputLevel), vec3(gammaLevel), vec3(maxInputLevel));
+        if (crtIntensity > 0.0001) {
+          float scanline = sin(uv.y * 900.0 + time * 2.0) * crtIntensity;
+          finalCol -= scanline;
+        }
+      }
+      fragColor = vec4(finalCol, 1.0);
+    }
+    `;
+
+    const copyFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    in vec2 vUv;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(inputTexture, vUv);
+    }
+    `;
+
+    const fxaaFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec2 inverseVP = 1.0 / resolution;
+      vec3 rgbNW = texture(inputTexture, vUv + vec2(-1.0, -1.0) * inverseVP).rgb;
+      vec3 rgbNE = texture(inputTexture, vUv + vec2(1.0, -1.0) * inverseVP).rgb;
+      vec3 rgbSW = texture(inputTexture, vUv + vec2(-1.0, 1.0) * inverseVP).rgb;
+      vec3 rgbSE = texture(inputTexture, vUv + vec2(1.0, 1.0) * inverseVP).rgb;
+      vec3 rgbM  = texture(inputTexture, vUv).rgb;
+
+      vec3 luma = vec3(0.299, 0.587, 0.114);
+      float lumaNW = dot(rgbNW, luma);
+      float lumaNE = dot(rgbNE, luma);
+      float lumaSW = dot(rgbSW, luma);
+      float lumaSE = dot(rgbSE, luma);
+      float lumaM  = dot(rgbM,  luma);
+
+      float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+      float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+      vec2 dir;
+      dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+      dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+      float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * (1.0 / 8.0)), 1.0 / 128.0);
+      float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+      dir = min(vec2(8.0, 8.0), max(vec2(-8.0, -8.0), dir * rcpDirMin)) * inverseVP;
+
+      vec3 rgbA = 0.5 * (
+          texture(inputTexture, vUv + dir * (1.0 / 3.0 - 0.5)).rgb +
+          texture(inputTexture, vUv + dir * (2.0 / 3.0 - 0.5)).rgb);
+      vec3 rgbB = rgbA * 0.5 + 0.25 * (
+          texture(inputTexture, vUv + dir * -0.5).rgb +
+          texture(inputTexture, vUv + dir * 0.5).rgb);
+
+      float lumaB = dot(rgbB, luma);
+      if ((lumaB < lumaMin) || (lumaB > lumaMax)) {
+          fragColor = vec4(rgbA, 1.0);
+      } else {
+          fragColor = vec4(rgbB, 1.0);
+      }
+    }
+    `;
+
+    const smaaFragmentShader = `
+    precision highp float;
+    uniform sampler2D inputTexture;
+    uniform vec2 resolution;
+    in vec2 vUv;
+    out vec4 fragColor;
+
+    void main() {
+      vec2 invRes = 1.0 / resolution;
+      vec4 center = texture(inputTexture, vUv);
+      vec3 cU = texture(inputTexture, vUv + vec2(0.0, -1.0) * invRes).rgb;
+      vec3 cD = texture(inputTexture, vUv + vec2(0.0, 1.0) * invRes).rgb;
+      vec3 cL = texture(inputTexture, vUv + vec2(-1.0, 0.0) * invRes).rgb;
+      vec3 cR = texture(inputTexture, vUv + vec2(1.0, 0.0) * invRes).rgb;
+      vec3 cUL = texture(inputTexture, vUv + vec2(-1.0, -1.0) * invRes).rgb;
+      vec3 cUR = texture(inputTexture, vUv + vec2(1.0, -1.0) * invRes).rgb;
+      vec3 cDL = texture(inputTexture, vUv + vec2(-1.0, 1.0) * invRes).rgb;
+      vec3 cDR = texture(inputTexture, vUv + vec2(1.0, 1.0) * invRes).rgb;
+
+      vec3 lumaW = vec3(0.299, 0.587, 0.114);
+      float lM = dot(center.rgb, lumaW);
+      float lU = dot(cU, lumaW);
+      float lD = dot(cD, lumaW);
+      float lL = dot(cL, lumaW);
+      float lR = dot(cR, lumaW);
+
+      float gx = (lR - lL) * 2.0 + (dot(cUR, lumaW) - dot(cUL, lumaW)) + (dot(cDR, lumaW) - dot(cDL, lumaW));
+      float gy = (lD - lU) * 2.0 + (dot(cDL, lumaW) - dot(cUL, lumaW)) + (dot(cDR, lumaW) - dot(cUR, lumaW));
+      float edgeStrength = length(vec2(gx, gy));
+
+      if (edgeStrength < 0.04) {
+        fragColor = center;
+        return;
+      }
+
+      vec2 dir = normalize(vec2(-gy, gx)) * invRes * clamp(edgeStrength * 1.5, 0.5, 1.5);
+      vec4 sampleA = texture(inputTexture, vUv + dir * 0.5);
+      vec4 sampleB = texture(inputTexture, vUv - dir * 0.5);
+      vec4 sampleC = texture(inputTexture, vUv + dir * 1.0);
+      vec4 sampleD = texture(inputTexture, vUv - dir * 1.0);
+      vec4 blended = (center * 2.0 + sampleA + sampleB + (sampleC + sampleD) * 0.5) / 5.0;
+      fragColor = vec4(blended.rgb, center.a);
+    }
+    `;
+
+    function createFBO(w, h, options = {}) {
+      return new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+        wrapS: options.wrapS || THREE.ClampToEdgeWrapping,
+        wrapT: options.wrapT || THREE.ClampToEdgeWrapping,
+        minFilter: options.minFilter || THREE.LinearFilter,
+        magFilter: options.magFilter || THREE.LinearFilter,
+        format: options.format || THREE.RGBAFormat,
+        type: options.type || THREE.HalfFloatType,
+        stencilBuffer: options.stencilBuffer || false,
+        depthBuffer: options.depthBuffer !== undefined ? options.depthBuffer : false,
+        samples: options.samples !== undefined ? options.samples : 0,
+      });
+    }
+
+    class ShaderPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbo = createFBO(1, 1, options);
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+        this.texture = this.fbo.texture;
+      }
+      render(renderer, toScreen = false) {
+        if (!toScreen) renderer.setRenderTarget(this.fbo);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        if (!toScreen) renderer.setRenderTarget(null);
+      }
+      setSize(width, height) {
+        this.fbo.setSize(Math.max(1, width), Math.max(1, height));
+      }
+    }
+
+    class ShaderPingPongPass {
+      constructor(shader, options = {}) {
+        this.shader = shader;
+        this.shader.depthTest = false;
+        this.shader.depthWrite = false;
+        this.orthoScene = new THREE.Scene();
+        this.fbos = [createFBO(1, 1, options), createFBO(1, 1, options)];
+        this.currentFBO = 0;
+        this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        this.orthoQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shader);
+        this.orthoScene.add(this.orthoQuad);
+      }
+      render(renderer) {
+        renderer.setRenderTarget(this.fbos[1 - this.currentFBO]);
+        renderer.render(this.orthoScene, this.orthoCamera);
+        renderer.setRenderTarget(null);
+        this.currentFBO = 1 - this.currentFBO;
+      }
+      get current() { return this.fbos[this.currentFBO]; }
+      get texture() { return this.current.texture; }
+      setSize(width, height) {
+        const w = Math.max(1, width);
+        const h = Math.max(1, height);
+        this.fbos[0].setSize(w, h);
+        this.fbos[1].setSize(w, h);
+      }
+    }
+
+    class BloomPass {
+      constructor(strength = 0.8, radius = 0.5, threshold = 0.2, levels = 5) {
+        this.strength = strength;
+        this.radius = radius;
+        this.threshold = threshold;
+        this.enabled = true;
+        this.levels = levels;
+
+        this.brightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            bloomThreshold: { value: this.threshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: brightFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.brightPass = new ShaderPass(this.brightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.blurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            direction: { value: new THREE.Vector2(0, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: blurFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+
+        this.blurPasses = [];
+        for (let i = 0; i < this.levels; i++) {
+          this.blurPasses.push(new ShaderPingPongPass(this.blurShader, {
+            format: THREE.RGBAFormat,
+            type: THREE.HalfFloatType,
+          }));
+        }
+      }
+
+      setSize(w, h) {
+        let tw = Math.max(1, w);
+        let th = Math.max(1, h);
+        this.brightPass.setSize(tw, th);
+        for (let i = 0; i < this.levels; i++) {
+          tw = Math.max(1, Math.round(tw / 2));
+          th = Math.max(1, Math.round(th / 2));
+          this.blurPasses[i].setSize(tw, th);
+        }
+      }
+
+      set source(texture) {
+        this.brightShader.uniforms.inputTexture.value = texture;
+      }
+
+      render(renderer) {
+        if (!this.enabled || this.strength <= 0.001) return;
+        this.brightShader.uniforms.bloomThreshold.value = this.threshold;
+        this.brightPass.render(renderer);
+
+        const baseOffset = Math.max(0.1, this.radius * 2.0);
+        const u = this.blurShader.uniforms;
+
+        for (let j = 0; j < this.levels; j++) {
+          const blurPass = this.blurPasses[j];
+          const stepOffset = baseOffset * (1.0 + j * 0.5);
+          u.direction.value.set(stepOffset, 0);
+          u.inputTexture.value = (j === 0) ? this.brightPass.texture : this.blurPasses[j - 1].texture;
+          blurPass.render(renderer);
+          u.direction.value.set(0, stepOffset * 0.5);
+          u.inputTexture.value = blurPass.current.texture;
+          blurPass.render(renderer);
+        }
+      }
+    }
+
+    const VISION_MODE_MAP = {
+      'Normal (Cinematic)': 0,
+      'Night Vision (Phosphor)': 1,
+      'Thermal (Ironbow)': 2,
+      'Thermal (White-Hot)': 3,
+    };
+
+    const ANTIALIAS_MODES = [
+      "MSAA 4x (Standard)",
+      "MSAA 2x (Fast)",
+      "MSAA 8x (Ultra)",
+      "FXAA (Fast Approximate)",
+      "SMAA (Morphological)",
+      "SSAA 1.5x (Super-Sampling)",
+      "SSAA 2x (Ultra Super-Sampling)",
+      "Hybrid (MSAA 4x + FXAA)",
+      "Off (No Anti-Aliasing)"
+    ];
+
+    function resolveAntialiasSettings(mode, antialias) {
+      if (antialias === false && (!mode || mode === 'MSAA 4x (Standard)')) {
+        mode = 'Off (No Anti-Aliasing)';
+      }
+      let msaaSamples = 0;
+      let fxaaEnabled = false;
+      let smaaEnabled = false;
+      let ssaaScale = 1.0;
+
+      switch (mode) {
+        case 'MSAA 2x (Fast)':
+        case 'MSAA 2x':
+          msaaSamples = 2;
+          break;
+        case 'MSAA 4x (Standard)':
+        case 'MSAA 4x':
+          msaaSamples = 4;
+          break;
+        case 'MSAA 8x (Ultra)':
+        case 'MSAA 8x (High Quality)':
+        case 'MSAA 8x':
+          msaaSamples = 8;
+          break;
+        case 'FXAA (Fast Approximate)':
+        case 'FXAA':
+          fxaaEnabled = true;
+          break;
+        case 'SMAA (Morphological)':
+        case 'SMAA':
+          smaaEnabled = true;
+          break;
+        case 'SSAA 1.5x (Super-Sampling)':
+        case 'SSAA 1.5x':
+          ssaaScale = 1.5;
+          break;
+        case 'SSAA 2x (Ultra Super-Sampling)':
+        case 'SSAA 2x':
+          ssaaScale = 2.0;
+          break;
+        case 'Hybrid (MSAA 4x + FXAA)':
+        case 'MSAA 4x + FXAA':
+          msaaSamples = 4;
+          fxaaEnabled = true;
+          break;
+        case 'Off (No Anti-Aliasing)':
+        case 'None (Off)':
+        case 'Off':
+        default:
+          msaaSamples = 0;
+          break;
+      }
+
+      return {
+        mode: mode || 'MSAA 4x (Standard)',
+        msaaSamples,
+        fxaaEnabled,
+        smaaEnabled,
+        ssaaScale,
+        antialias: mode !== 'Off (No Anti-Aliasing)' && mode !== 'None (Off)' && mode !== 'Off',
+        useFxaa: fxaaEnabled
+      };
+    }
+
+    class PostProcessor {
+      constructor(renderer, params = {}) {
+        this.renderer = renderer;
+        this.width = 1;
+        this.height = 1;
+        this.dpr = 1;
+
+        const initialAa = resolveAntialiasSettings(params.antialiasMode, params.antialias);
+        if (params.useFxaa !== undefined) initialAa.fxaaEnabled = !!params.useFxaa;
+        if (params.msaaSamples !== undefined) initialAa.msaaSamples = params.msaaSamples;
+        if (params.smaaEnabled !== undefined) initialAa.smaaEnabled = !!params.smaaEnabled;
+        if (params.ssaaScale !== undefined) initialAa.ssaaScale = params.ssaaScale;
+
+        this.settings = {
+          enabled: params.enabled !== undefined ? params.enabled : true,
+          antialias: initialAa.antialias,
+          antialiasMode: initialAa.mode,
+          msaaSamples: initialAa.msaaSamples,
+          fxaaEnabled: initialAa.fxaaEnabled,
+          smaaEnabled: initialAa.smaaEnabled,
+          ssaaScale: initialAa.ssaaScale,
+          useFxaa: initialAa.fxaaEnabled,
+
+          bloomEnabled: params.bloomEnabled !== undefined ? params.bloomEnabled : true,
+          bloomStrength: params.bloomStrength !== undefined ? params.bloomStrength : 0.85,
+          bloomRadius: params.bloomRadius !== undefined ? params.bloomRadius : 0.55,
+          bloomThreshold: params.bloomThreshold !== undefined ? params.bloomThreshold : 0.28,
+
+          raysEnabled: params.raysEnabled !== undefined ? params.raysEnabled : false,
+          raysStrength: params.raysStrength !== undefined ? params.raysStrength : 0.6,
+          raysDensity: params.raysDensity !== undefined ? params.raysDensity : 1.0,
+          raysMaxDensity: params.raysMaxDensity !== undefined ? params.raysMaxDensity : 0.5,
+          raysDistanceAttenuation: params.raysDistanceAttenuation !== undefined ? params.raysDistanceAttenuation : 2.0,
+          raysThreshold: params.raysThreshold !== undefined ? params.raysThreshold : 0.15,
+          raysColor: params.raysColor ? (params.raysColor.isColor ? params.raysColor.clone() : new THREE.Color(params.raysColor)) : new THREE.Color(0xd4af37),
+          raysColorHex: params.raysColorHex || '#d4af37',
+
+          // Anamorphic default is explicitly OFF per user request
+          anamorphicEnabled: params.anamorphicEnabled !== undefined ? params.anamorphicEnabled : false,
+          anamorphicIntensity: params.anamorphicIntensity !== undefined ? params.anamorphicIntensity : 4.0,
+          anamorphicThreshold: params.anamorphicThreshold !== undefined ? params.anamorphicThreshold : 0.35,
+          anamorphicSamples: params.anamorphicSamples !== undefined ? params.anamorphicSamples : 64,
+          anamorphicRadius: params.anamorphicRadius !== undefined ? params.anamorphicRadius : 0.0,
+          anamorphicSmoothWidth: params.anamorphicSmoothWidth !== undefined ? params.anamorphicSmoothWidth : 0.05,
+          anamorphicColor: params.anamorphicColor ? (params.anamorphicColor.isColor ? params.anamorphicColor.clone() : new THREE.Color(params.anamorphicColor)) : new THREE.Color(0xffd700),
+          anamorphicColorHex: params.anamorphicColorHex || '#ffd700',
+
+          visionMode: params.visionMode !== undefined ? params.visionMode : 'Normal (Cinematic)',
+          thermalSensitivity: params.thermalSensitivity !== undefined ? params.thermalSensitivity : 1.4,
+          nightVisionGain: params.nightVisionGain !== undefined ? params.nightVisionGain : 2.1,
+          nightVisionNoise: params.nightVisionNoise !== undefined ? params.nightVisionNoise : 0.05,
+          crtIntensity: params.crtIntensity !== undefined ? params.crtIntensity : 0.0,
+
+          fisheyeStrength: params.fisheyeStrength !== undefined ? params.fisheyeStrength : 0.0,
+          fisheyeRadius: params.fisheyeRadius !== undefined ? params.fisheyeRadius : 1.0,
+          chromaticAberration: params.chromaticAberration !== undefined ? params.chromaticAberration : 0.012,
+          vignetteBoost: params.vignetteBoost !== undefined ? params.vignetteBoost : 1.08,
+          vignetteReduction: params.vignetteReduction !== undefined ? params.vignetteReduction : 0.55,
+          noiseIntensity: params.noiseIntensity !== undefined ? params.noiseIntensity : 0.012,
+
+          gamma: params.gamma !== undefined ? params.gamma : 1.0,
+          minInputLevel: params.minInputLevel !== undefined ? params.minInputLevel : 0.0,
+          maxInputLevel: params.maxInputLevel !== undefined ? params.maxInputLevel : 1.0,
+          exposure: params.exposure !== undefined ? params.exposure : 1.15,
+        };
+
+        const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+        const targetSamples = this.settings.antialias ? Math.min(this.settings.msaaSamples, maxSamples) : 0;
+        this.sceneTarget = createFBO(1, 1, { type: THREE.HalfFloatType, samples: targetSamples, depthBuffer: true });
+
+        this.bloomPass = new BloomPass(
+          this.settings.bloomStrength,
+          this.settings.bloomRadius,
+          this.settings.bloomThreshold,
+          5
+        );
+
+        this.moonScreenPos = new THREE.Vector3(0.5, 0.7, 1.0);
+        this.moonInFront = true;
+
+        this.godRaysMaskShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.raysThreshold },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysDepthMaskShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysMaskPass = new ShaderPass(this.godRaysMaskShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.godRaysGenShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            vSunPositionScreenSpace: { value: this.moonScreenPos },
+            fStepSize: { value: 1.0 },
+            distanceAttenuation: { value: this.settings.raysDistanceAttenuation },
+            maxDensity: { value: this.settings.raysMaxDensity },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: godRaysGenerateShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.godRaysPingPong = new ShaderPingPongPass(this.godRaysGenShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBrightShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            threshold: { value: this.settings.anamorphicThreshold },
+            smoothWidth: { value: this.settings.anamorphicSmoothWidth },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBrightShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBrightPass = new ShaderPass(this.anamorphicBrightShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.anamorphicBlurShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+            samples: { value: this.settings.anamorphicSamples },
+            intensity: { value: this.settings.anamorphicIntensity },
+            tintColor: { value: this.settings.anamorphicColor },
+            bloomRadius: { value: this.settings.anamorphicRadius },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: anamorphicBlurShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.anamorphicBlurPass = new ShaderPass(this.anamorphicBlurShader, {
+          format: THREE.RGBAFormat,
+          type: THREE.HalfFloatType,
+        });
+
+        this.finalShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            resolution: { value: new THREE.Vector2(1, 1) },
+            bloomEnabled: { value: this.settings.bloomEnabled },
+            bloomStrength: { value: this.settings.bloomStrength },
+            raysEnabled: { value: this.settings.raysEnabled },
+            raysStrength: { value: this.settings.raysStrength },
+            raysColor: { value: this.settings.raysColor },
+            anamorphicEnabled: { value: this.settings.anamorphicEnabled },
+            vignetteBoost: { value: this.settings.vignetteBoost },
+            vignetteReduction: { value: this.settings.vignetteReduction },
+            noiseIntensity: { value: this.settings.noiseIntensity },
+            inputTexture: { value: null },
+            blur0Texture: { value: null },
+            blur1Texture: { value: null },
+            blur2Texture: { value: null },
+            blur3Texture: { value: null },
+            blur4Texture: { value: null },
+            raysTexture: { value: null },
+            anamorphicTexture: { value: null },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: finalFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.finalPass = new ShaderPass(this.finalShader);
+
+        this.rgbShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: this.finalPass.texture },
+            fisheyeStrength: { value: this.settings.fisheyeStrength },
+            fisheyeRadius: { value: this.settings.fisheyeRadius },
+            chromaticAberrationAmount: { value: this.settings.chromaticAberration },
+            minInputLevel: { value: this.settings.minInputLevel },
+            maxInputLevel: { value: this.settings.maxInputLevel },
+            gammaLevel: { value: this.settings.gamma },
+            exposure: { value: this.settings.exposure },
+            visionMode: { value: VISION_MODE_MAP[this.settings.visionMode] ?? 0 },
+            thermalSensitivity: { value: this.settings.thermalSensitivity },
+            nightVisionGain: { value: this.settings.nightVisionGain },
+            nightVisionNoise: { value: this.settings.nightVisionNoise },
+            crtIntensity: { value: this.settings.crtIntensity },
+            time: { value: 0 },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: colorFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.rgbPass = new ShaderPass(this.rgbShader);
+
+        this.copyShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: copyFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.copyPass = new ShaderPass(this.copyShader);
+
+        this.fxaaShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: fxaaFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.fxaaPass = new ShaderPass(this.fxaaShader);
+
+        this.smaaShader = new THREE.RawShaderMaterial({
+          uniforms: {
+            inputTexture: { value: null },
+            resolution: { value: new THREE.Vector2(1, 1) },
+          },
+          vertexShader: orthoVertexShader,
+          fragmentShader: smaaFragmentShader,
+          glslVersion: THREE.GLSL3,
+        });
+        this.smaaPass = new ShaderPass(this.smaaShader);
+      }
+
+      updateSettings() {
+        this.bloomPass.enabled = this.settings.bloomEnabled;
+        this.bloomPass.strength = this.settings.bloomStrength;
+        this.bloomPass.radius = this.settings.bloomRadius;
+        this.bloomPass.threshold = this.settings.bloomThreshold;
+
+        this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+        this.godRaysGenShader.uniforms.distanceAttenuation.value = this.settings.raysDistanceAttenuation;
+        this.godRaysGenShader.uniforms.maxDensity.value = this.settings.raysMaxDensity;
+
+        this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+        this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+        this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+        this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+        this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+        this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+
+        this.finalShader.uniforms.bloomEnabled.value = this.settings.bloomEnabled;
+        this.finalShader.uniforms.bloomStrength.value = this.settings.bloomStrength;
+        this.finalShader.uniforms.raysEnabled.value = this.settings.raysEnabled && this.moonInFront;
+        this.finalShader.uniforms.raysStrength.value = this.settings.raysStrength;
+        this.finalShader.uniforms.raysColor.value.copy(this.settings.raysColor);
+        this.finalShader.uniforms.anamorphicEnabled.value = this.settings.anamorphicEnabled;
+        this.finalShader.uniforms.vignetteBoost.value = this.settings.vignetteBoost;
+        this.finalShader.uniforms.vignetteReduction.value = this.settings.vignetteReduction;
+        this.finalShader.uniforms.noiseIntensity.value = this.settings.noiseIntensity;
+
+        this.rgbShader.uniforms.fisheyeStrength.value = this.settings.fisheyeStrength;
+        this.rgbShader.uniforms.fisheyeRadius.value = this.settings.fisheyeRadius;
+        this.rgbShader.uniforms.chromaticAberrationAmount.value = this.settings.chromaticAberration;
+        this.rgbShader.uniforms.gammaLevel.value = this.settings.gamma;
+        this.rgbShader.uniforms.minInputLevel.value = this.settings.minInputLevel;
+        this.rgbShader.uniforms.maxInputLevel.value = this.settings.maxInputLevel;
+        this.rgbShader.uniforms.exposure.value = this.settings.exposure;
+        this.rgbShader.uniforms.visionMode.value = VISION_MODE_MAP[this.settings.visionMode] ?? 0;
+        this.rgbShader.uniforms.thermalSensitivity.value = this.settings.thermalSensitivity;
+        this.rgbShader.uniforms.nightVisionGain.value = this.settings.nightVisionGain;
+        this.rgbShader.uniforms.nightVisionNoise.value = this.settings.nightVisionNoise;
+        this.rgbShader.uniforms.crtIntensity.value = this.settings.crtIntensity;
+      }
+
+      setSize(w0, h0, dpr = 1) {
+        this.width = w0;
+        this.height = h0;
+        this.dpr = dpr;
+
+        const baseW = Math.max(1, Math.floor(w0 * dpr));
+        const baseH = Math.max(1, Math.floor(h0 * dpr));
+        const ssaa = this.settings.ssaaScale || 1.0;
+        const targetW = Math.max(1, Math.round(baseW * ssaa));
+        const targetH = Math.max(1, Math.round(baseH * ssaa));
+
+        this.sceneTarget.setSize(targetW, targetH);
+        this.finalPass.setSize(baseW, baseH);
+        this.finalShader.uniforms.resolution.value.set(baseW, baseH);
+        this.bloomPass.setSize(baseW, baseH);
+
+        const grW = Math.max(1, Math.round(baseW / 2));
+        const grH = Math.max(1, Math.round(baseH / 2));
+        this.godRaysMaskPass.setSize(grW, grH);
+        this.godRaysPingPong.setSize(grW, grH);
+
+        const anW = Math.max(1, Math.round(baseW / 4));
+        const anH = Math.max(1, Math.round(baseH / 4));
+        this.anamorphicBrightPass.setSize(anW, anH);
+        this.anamorphicBlurPass.setSize(anW, anH);
+        this.anamorphicBlurShader.uniforms.resolution.value.set(anW, anH);
+
+        this.rgbPass.setSize(baseW, baseH);
+        this.copyPass.setSize(baseW, baseH);
+        if (this.fxaaPass) {
+          this.fxaaPass.setSize(baseW, baseH);
+          this.fxaaShader.uniforms.resolution.value.set(baseW, baseH);
+        }
+        if (this.smaaPass) {
+          this.smaaPass.setSize(baseW, baseH);
+          this.smaaShader.uniforms.resolution.value.set(baseW, baseH);
+        }
+      }
+
+      setAntialiasMode(mode) {
+        const resolved = resolveAntialiasSettings(mode, this.settings.antialias);
+        this.setAntialiasConfig(resolved);
+      }
+
+      setAntialiasConfig(cfg) {
+        if (!cfg) return;
+        if (cfg.mode) this.settings.antialiasMode = cfg.mode;
+        this.settings.msaaSamples = cfg.msaaSamples !== undefined ? cfg.msaaSamples : 0;
+        this.settings.fxaaEnabled = !!cfg.fxaaEnabled;
+        this.settings.smaaEnabled = !!cfg.smaaEnabled;
+        this.settings.ssaaScale = cfg.ssaaScale || 1.0;
+        this.settings.useFxaa = this.settings.fxaaEnabled;
+        this.settings.antialias = (this.settings.antialiasMode !== "Off (No Anti-Aliasing)" && this.settings.antialiasMode !== "None (Off)" && this.settings.antialiasMode !== "Off");
+
+        const maxSamples = (this.renderer && this.renderer.capabilities) ? (this.renderer.capabilities.maxSamples || 4) : 4;
+        const reqSamples = Math.min(this.settings.msaaSamples, maxSamples);
+        const baseW = Math.max(1, Math.floor(this.width * this.dpr));
+        const baseH = Math.max(1, Math.floor(this.height * this.dpr));
+        const targetW = Math.max(1, Math.round(baseW * this.settings.ssaaScale));
+        const targetH = Math.max(1, Math.round(baseH * this.settings.ssaaScale));
+
+        if (this.sceneTarget.samples !== reqSamples || this.sceneTarget.width !== targetW || this.sceneTarget.height !== targetH) {
+          const oldTarget = this.sceneTarget;
+          this.sceneTarget = createFBO(targetW, targetH, {
+            type: THREE.HalfFloatType,
+            samples: reqSamples,
+            depthBuffer: true,
+          });
+          oldTarget.dispose();
+        }
+      }
+
+      setAntialias(enabled) {
+        if (typeof enabled === 'string') {
+          this.setAntialiasMode(enabled);
+        } else {
+          this.setAntialiasMode(enabled ? 'MSAA 4x (Standard)' : 'Off (No Anti-Aliasing)');
+        }
+      }
+
+      setMoonScreenPosition(camera, moonWorldPos) {
+        if (!this._camDir) {
+          this._camDir = new THREE.Vector3();
+          this._toMoon = new THREE.Vector3();
+          this._ndc = new THREE.Vector3();
+        }
+        camera.getWorldDirection(this._camDir);
+        this._toMoon.copy(moonWorldPos).sub(camera.position).normalize();
+        const dot = this._camDir.dot(this._toMoon);
+
+        if (dot <= 0.02) {
+          this.moonInFront = false;
+          this.finalShader.uniforms.raysEnabled.value = false;
+          return;
+        }
+
+        this.moonInFront = true;
+        const fade = THREE.MathUtils.clamp((dot - 0.02) / 0.15, 0.0, 1.0);
+        this._ndc.copy(moonWorldPos).project(camera);
+        const screenX = this._ndc.x * 0.5 + 0.5;
+        const screenY = this._ndc.y * 0.5 + 0.5;
+        const screenZ = fade;
+
+        this.moonScreenPos.set(screenX, screenY, screenZ);
+        this.godRaysGenShader.uniforms.vSunPositionScreenSpace.value.set(screenX, screenY, screenZ);
+      }
+
+      renderScene(scene, camera) {
+        if (!this.settings.enabled) {
+          if (this.settings.fxaaEnabled || this.settings.smaaEnabled || (this.settings.msaaSamples && this.settings.msaaSamples > 0) || (this.settings.ssaaScale && this.settings.ssaaScale > 1.0)) {
+            this.renderer.setRenderTarget(this.sceneTarget);
+            this.renderer.render(scene, camera);
+            this.renderer.setRenderTarget(null);
+            if (this.settings.fxaaEnabled) {
+              this.fxaaShader.uniforms.inputTexture.value = this.sceneTarget.texture;
+              this.fxaaPass.render(this.renderer, true);
+            } else if (this.settings.smaaEnabled) {
+              this.smaaShader.uniforms.inputTexture.value = this.sceneTarget.texture;
+              this.smaaPass.render(this.renderer, true);
+            } else {
+              this.copyPass.shader.uniforms.inputTexture.value = this.sceneTarget.texture;
+              this.copyPass.render(this.renderer, true);
+            }
+          } else {
+            this.renderer.setRenderTarget(null);
+            this.renderer.render(scene, camera);
+          }
+          return;
+        }
+        this.renderer.setRenderTarget(this.sceneTarget);
+        this.renderer.render(scene, camera);
+        this.renderer.setRenderTarget(null);
+        this.render(this.sceneTarget.texture);
+      }
+
+      render(sourceTexture) {
+        if (!this.settings.enabled) {
+          this.copyPass.shader.uniforms.inputTexture.value = sourceTexture;
+          this.copyPass.render(this.renderer, true);
+          return;
+        }
+
+        this.updateSettings();
+
+        this.bloomPass.source = sourceTexture;
+        this.finalPass.shader.uniforms.inputTexture.value = sourceTexture;
+        this.bloomPass.render(this.renderer);
+
+        this.finalPass.shader.uniforms.blur0Texture.value = this.bloomPass.blurPasses[0].texture;
+        this.finalPass.shader.uniforms.blur1Texture.value = this.bloomPass.blurPasses[1].texture;
+        this.finalPass.shader.uniforms.blur2Texture.value = this.bloomPass.blurPasses[2].texture;
+        this.finalPass.shader.uniforms.blur3Texture.value = this.bloomPass.blurPasses[3].texture;
+        this.finalPass.shader.uniforms.blur4Texture.value = this.bloomPass.blurPasses[4].texture;
+
+        if (this.settings.raysEnabled && this.settings.raysStrength > 0.001 && this.moonInFront) {
+          this.godRaysMaskShader.uniforms.inputTexture.value = sourceTexture;
+          this.godRaysMaskShader.uniforms.threshold.value = this.settings.raysThreshold;
+          this.godRaysMaskPass.render(this.renderer);
+
+          const filterLen = this.settings.raysDensity;
+          const tapsPerPass = 6.0;
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -1.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysMaskPass.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -2.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.godRaysGenShader.uniforms.fStepSize.value = filterLen * Math.pow(tapsPerPass, -3.0);
+          this.godRaysGenShader.uniforms.inputTexture.value = this.godRaysPingPong.texture;
+          this.godRaysPingPong.render(this.renderer);
+
+          this.finalPass.shader.uniforms.raysTexture.value = this.godRaysPingPong.texture;
+          this.finalPass.shader.uniforms.raysEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.raysEnabled.value = false;
+        }
+
+        if (this.settings.anamorphicEnabled && this.settings.anamorphicIntensity > 0.001) {
+          this.anamorphicBrightShader.uniforms.inputTexture.value = sourceTexture;
+          this.anamorphicBrightShader.uniforms.threshold.value = this.settings.anamorphicThreshold;
+          this.anamorphicBrightShader.uniforms.smoothWidth.value = this.settings.anamorphicSmoothWidth;
+          this.anamorphicBrightPass.render(this.renderer);
+
+          this.anamorphicBlurShader.uniforms.inputTexture.value = this.anamorphicBrightPass.texture;
+          this.anamorphicBlurShader.uniforms.samples.value = this.settings.anamorphicSamples;
+          this.anamorphicBlurShader.uniforms.intensity.value = this.settings.anamorphicIntensity;
+          this.anamorphicBlurShader.uniforms.tintColor.value.copy(this.settings.anamorphicColor);
+          this.anamorphicBlurShader.uniforms.bloomRadius.value = this.settings.anamorphicRadius;
+          this.anamorphicBlurPass.render(this.renderer);
+
+          this.finalPass.shader.uniforms.anamorphicTexture.value = this.anamorphicBlurPass.texture;
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = true;
+        } else {
+          this.finalPass.shader.uniforms.anamorphicEnabled.value = false;
+        }
+
+        const randomTime = Math.random() * 100000;
+        this.finalPass.shader.uniforms.time.value = randomTime;
+        this.rgbPass.shader.uniforms.time.value = randomTime;
+
+        this.finalPass.render(this.renderer);
+        if (this.settings.fxaaEnabled || this.settings.useFxaa) {
+          this.rgbPass.render(this.renderer, false);
+          this.fxaaShader.uniforms.inputTexture.value = this.rgbPass.texture;
+          this.fxaaPass.render(this.renderer, true);
+        } else if (this.settings.smaaEnabled) {
+          this.rgbPass.render(this.renderer, false);
+          this.smaaShader.uniforms.inputTexture.value = this.rgbPass.texture;
+          this.smaaPass.render(this.renderer, true);
+        } else {
+          this.rgbPass.render(this.renderer, true);
+        }
+      }
+
+      attachGUI(gui, title = "Post Processing") {
+        const root = gui.addFolder(title);
+        root.add(this.settings, "enabled").name("Enable Post-Process");
+        root.add(this.settings, "antialiasMode", ANTIALIAS_MODES).name("Antialiasing Mode").onChange((v) => this.setAntialiasMode(v));
+
+        const anamorphic = root.addFolder("Three.js Anamorphic Flare");
+        anamorphic.add(this.settings, "anamorphicEnabled").name("Enable Anamorphic").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicIntensity", 0, 10.0, 0.1).name("Intensity").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicThreshold", 0.0, 0.9, 0.01).name("Threshold").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicSamples", 2, 128, 1).name("Samples").onChange(() => this.updateSettings());
+        anamorphic.add(this.settings, "anamorphicRadius", 0.0, 1.0, 0.01).name("Bloom Radius").onChange(() => this.updateSettings());
+        anamorphic.addColor(this.settings, "anamorphicColorHex").name("Tint Color").onChange((v) => {
+          this.settings.anamorphicColor.set(v);
+          this.updateSettings();
+        });
+
+        const bloom = root.addFolder("Atmospheric Bloom");
+        bloom.add(this.settings, "bloomEnabled").name("Enable Bloom").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomStrength", 0, 3.0, 0.05).name("Bloom Strength").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomRadius", 0, 2.0, 0.05).name("Bloom Radius").onChange(() => this.updateSettings());
+        bloom.add(this.settings, "bloomThreshold", 0, 1.0, 0.01).name("Bloom Threshold").onChange(() => this.updateSettings());
+
+        const rays = root.addFolder("Three.js Godrays");
+        rays.add(this.settings, "raysEnabled").name("Enable Godrays").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysStrength", 0, 3.0, 0.05).name("Intensity").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysDensity", 0.1, 2.5, 0.05).name("Density (Spread)").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysMaxDensity", 0.1, 1.0, 0.05).name("Max Density").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysDistanceAttenuation", 0.5, 4.0, 0.1).name("Distance Atten").onChange(() => this.updateSettings());
+        rays.add(this.settings, "raysThreshold", 0.0, 0.8, 0.01).name("Light Threshold").onChange(() => this.updateSettings());
+        rays.addColor(this.settings, "raysColorHex").name("Ray Tint").onChange((v) => {
+          this.settings.raysColor.set(v);
+          this.updateSettings();
+        });
+
+        const lens = root.addFolder("Lens, Optics & Film Grain");
+        lens.add(this.settings, "fisheyeStrength", -1.0, 1.5, 0.01).name("Fisheye Distortion").onChange(() => this.updateSettings());
+        lens.add(this.settings, "fisheyeRadius", 0.2, 2.0, 0.05).name("Fisheye Radius").onChange(() => this.updateSettings());
+        lens.add(this.settings, "chromaticAberration", 0, 0.2, 0.005).name("Chromatic Aberration").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteBoost", 0, 2.0, 0.05).name("Vignette Boost").onChange(() => this.updateSettings());
+        lens.add(this.settings, "vignetteReduction", 0, 2.0, 0.05).name("Vignette Falloff").onChange(() => this.updateSettings());
+        lens.add(this.settings, "noiseIntensity", 0, 0.1, 0.005).name("Film Grain").onChange(() => this.updateSettings());
+        lens.add(this.settings, "gamma", 0.2, 2.0, 0.05).name("Gamma").onChange(() => this.updateSettings());
+        lens.add(this.settings, "minInputLevel", 0, 0.5, 0.01).name("Black Level").onChange(() => this.updateSettings());
+        lens.add(this.settings, "maxInputLevel", 0.5, 1.0, 0.01).name("White Level").onChange(() => this.updateSettings());
+
+        const vision = root.addFolder("Thermal & Night Vision");
+        vision.add(this.settings, "visionMode", Object.keys(VISION_MODE_MAP)).name("Vision Mode").onChange(() => this.updateSettings());
+        vision.add(this.settings, "nightVisionGain", 0.5, 5.0, 0.1).name("NVG Amplification").onChange(() => this.updateSettings());
+        vision.add(this.settings, "nightVisionNoise", 0.0, 0.3, 0.01).name("NVG Sensor Noise").onChange(() => this.updateSettings());
+        vision.add(this.settings, "thermalSensitivity", 0.5, 3.5, 0.05).name("Thermal Sensitivity").onChange(() => this.updateSettings());
+        vision.add(this.settings, "crtIntensity", 0.0, 0.1, 0.005).name("CRT Scanlines").onChange(() => this.updateSettings());
+        vision.close();
+
+        return root;
+      }
+    }
+
+    // --- 19 Preconfigured Color Schemes ---
+    const colorSchemes = {
+      'Original': {
+        skyZenith: '#040817',
+        skyMid: '#1C1A38',
+        skyHorizon: '#E87A68', // Warm peach-pink sunset afterglow
+        moon: '#F0F6FA',      // Silvery cold moon
+        star: '#FFFDF0',      // Brilliant warm silver star
+        waterDeep: '#020612',
+        waterSurface: '#0E1A2C',
+        waterShimmer: '#E4F1FA',
+        shore: '#0A0812',
+        clouds: '#7E4C62',
+        moonLight: '#DDE9F5',
+        sunsetGlow: '#F58570',
+        ambient: '#161426',
+        background: '#040817'
+      },
+      'Monochromatic': {
+        skyZenith: '#020B18',
+        skyMid: '#08223C',
+        skyHorizon: '#2A66A8',
+        moon: '#D8ECFF',
+        star: '#EBF4FF',
+        waterDeep: '#010814',
+        waterSurface: '#0A2748',
+        waterShimmer: '#98CEFC',
+        shore: '#051424',
+        clouds: '#1E447C',
+        moonLight: '#C4E5F8',
+        sunsetGlow: '#3B8EE8',
+        ambient: '#0B223B',
+        background: '#020B18'
+      },
+      'Analogous': {
+        skyZenith: '#08082A',
+        skyMid: '#0C2744',
+        skyHorizon: '#167076',
+        moon: '#E2FCFF',
+        star: '#D8F7FF',
+        waterDeep: '#040718',
+        waterSurface: '#0B3344',
+        waterShimmer: '#6CE5E5',
+        shore: '#071820',
+        clouds: '#1B5270',
+        moonLight: '#A6F5F2',
+        sunsetGlow: '#4CD2ED',
+        ambient: '#0E223B',
+        background: '#08082A'
+      },
+      'Complementary': {
+        skyZenith: '#061224',
+        skyMid: '#162C4A',
+        skyHorizon: '#F28A46',
+        moon: '#E5F3FF',
+        star: '#FFEBCA',
+        waterDeep: '#030914',
+        waterSurface: '#0D233C',
+        waterShimmer: '#FFAC5E',
+        shore: '#18110D',
+        clouds: '#D06E42',
+        moonLight: '#D3EAFF',
+        sunsetGlow: '#FA8200',
+        ambient: '#1A232E',
+        background: '#061224'
+      },
+      'Split-complementary': {
+        skyZenith: '#080E24',
+        skyMid: '#1B1E48',
+        skyHorizon: '#FF6E6E',
+        moon: '#F6FAFC',
+        star: '#FFEDB0',
+        waterDeep: '#030614',
+        waterSurface: '#121C3C',
+        waterShimmer: '#FFD175',
+        shore: '#170B1C',
+        clouds: '#BD507B',
+        moonLight: '#E2F0FA',
+        sunsetGlow: '#FF7D7C',
+        ambient: '#1F1733',
+        background: '#080E24'
+      },
+      'Triadic': {
+        skyZenith: '#100822',
+        skyMid: '#28143A',
+        skyHorizon: '#00A896',
+        moon: '#FFF7DC',
+        star: '#FFE48E',
+        waterDeep: '#070310',
+        waterSurface: '#1C112E',
+        waterShimmer: '#85D4CC',
+        shore: '#180E07',
+        clouds: '#C61A5E',
+        moonLight: '#FFE48E',
+        sunsetGlow: '#2AB2A5',
+        ambient: '#1C132B',
+        background: '#100822'
+      },
+      'Tetradic': {
+        skyZenith: '#0A1020',
+        skyMid: '#270F4E',
+        skyHorizon: '#E04A77',
+        moon: '#C4F3D8',
+        star: '#FFE373',
+        waterDeep: '#050812',
+        waterSurface: '#18143E',
+        waterShimmer: '#76E8BE',
+        shore: '#180D15',
+        clouds: '#A23495',
+        moonLight: '#C7F3D5',
+        sunsetGlow: '#FF6F92',
+        ambient: '#1B152E',
+        background: '#0A1020'
+      },
+      'Double split-complementary': {
+        skyZenith: '#060B1E',
+        skyMid: '#1C1232',
+        skyHorizon: '#EE5E56',
+        moon: '#E6FFFF',
+        star: '#FDE692',
+        waterDeep: '#020511',
+        waterSurface: '#131D36',
+        waterShimmer: '#88F8FF',
+        shore: '#110B18',
+        clouds: '#823D69',
+        moonLight: '#D0F4F8',
+        sunsetGlow: '#F78686',
+        ambient: '#18132C',
+        background: '#060B1E'
+      },
+      'Achromatic (black and white version)': {
+        skyZenith: '#080808',
+        skyMid: '#1C1C1C',
+        skyHorizon: '#6E6E6E',
+        moon: '#FFFFFF',
+        star: '#FFFFFF',
+        waterDeep: '#020202',
+        waterSurface: '#161616',
+        waterShimmer: '#E8E8E8',
+        shore: '#070707',
+        clouds: '#484848',
+        moonLight: '#FFFFFF',
+        sunsetGlow: '#8C8C8C',
+        ambient: '#161616',
+        background: '#080808'
+      },
+      'Achromatic + Accent': {
+        skyZenith: '#0A0A0A',
+        skyMid: '#1A1A1A',
+        skyHorizon: '#E2062C',
+        moon: '#FFFFFF',
+        star: '#FF2A45',
+        waterDeep: '#030303',
+        waterSurface: '#141414',
+        waterShimmer: '#FFFFFF',
+        shore: '#080808',
+        clouds: '#8C1D1D',
+        moonLight: '#FFFFFF',
+        sunsetGlow: '#E2062C',
+        ambient: '#1E0E12',
+        background: '#0A0A0A'
+      },
+      'Neutral + accent': {
+        skyZenith: '#161514',
+        skyMid: '#2B2725',
+        skyHorizon: '#524C46',
+        moon: '#FFD46E',
+        star: '#FFE7A8',
+        waterDeep: '#0D0C0B',
+        waterSurface: '#24211F',
+        waterShimmer: '#FFC54D',
+        shore: '#121110',
+        clouds: '#3E3832',
+        moonLight: '#FFD46E',
+        sunsetGlow: '#F5A21D',
+        ambient: '#221F1B',
+        background: '#161514'
+      },
+      'Palette 1 (Amber & Flame)': {
+        skyZenith: '#220901',
+        skyMid: '#941B0C',
+        skyHorizon: '#BC3908',
+        moon: '#F6AA1C',
+        star: '#FFE899',
+        waterDeep: '#140501',
+        waterSurface: '#380E03',
+        waterShimmer: '#F6AA1C',
+        shore: '#0D0300',
+        clouds: '#941B0C',
+        moonLight: '#F6AA1C',
+        sunsetGlow: '#BC3908',
+        ambient: '#321008',
+        background: '#220901'
+      },
+      'Palette 2 (Teal & Abyss)': {
+        skyZenith: '#000000',
+        skyMid: '#0B132B',
+        skyHorizon: '#4BAD9E',
+        moon: '#63D1CF',
+        star: '#E0FFFF',
+        waterDeep: '#000308',
+        waterSurface: '#0B1E2E',
+        waterShimmer: '#5BC0BE',
+        shore: '#03070E',
+        clouds: '#317068',
+        moonLight: '#63D1CF',
+        sunsetGlow: '#4BAD9E',
+        ambient: '#0D1E28',
+        background: '#000000'
+      },
+      'Palette 3 (Violet Bloom)': {
+        skyZenith: '#0D001D',
+        skyMid: '#120A12',
+        skyHorizon: '#AA60C8',
+        moon: '#D69ADE',
+        star: '#F3E1FA',
+        waterDeep: '#07000E',
+        waterSurface: '#1E082A',
+        waterShimmer: '#CFB5C2',
+        shore: '#0A030C',
+        clouds: '#82439C',
+        moonLight: '#D69ADE',
+        sunsetGlow: '#AA60C8',
+        ambient: '#1B0E24',
+        background: '#0D001D'
+      },
+      'Palette 4 (Emerald & Sun)': {
+        skyZenith: '#061210',
+        skyMid: '#00474D',
+        skyHorizon: '#008189',
+        moon: '#FEF1BE',
+        star: '#FFFDEB',
+        waterDeep: '#020A08',
+        waterSurface: '#002E32',
+        waterShimmer: '#FFBA00',
+        shore: '#040D0B',
+        clouds: '#005C61',
+        moonLight: '#FEF1BE',
+        sunsetGlow: '#008189',
+        ambient: '#0A1E1A',
+        background: '#061210'
+      },
+      'Palette 5 (Verdant Night)': {
+        skyZenith: '#05140A',
+        skyMid: '#0A3322',
+        skyHorizon: '#00B894',
+        moon: '#D4FFB0',
+        star: '#F2FFE5',
+        waterDeep: '#020A05',
+        waterSurface: '#072115',
+        waterShimmer: '#7FFF00',
+        shore: '#030D06',
+        clouds: '#084D34',
+        moonLight: '#D4FFB0',
+        sunsetGlow: '#00B894',
+        ambient: '#0B2414',
+        background: '#05140A'
+      },
+      'Palette 6 (Warm Dusk Orange)': {
+        skyZenith: '#0E0618',
+        skyMid: '#3D1050',
+        skyHorizon: '#C7501A',
+        moon: '#FFE8CC',
+        star: '#FFF5E6',
+        waterDeep: '#08030E',
+        waterSurface: '#260A34',
+        waterShimmer: '#FF8C00',
+        shore: '#0B0412',
+        clouds: '#8C2D43',
+        moonLight: '#FFE8CC',
+        sunsetGlow: '#FF8C00',
+        ambient: '#220D2C',
+        background: '#0E0618'
+      },
+      'Palette 7 (Mystic Lavender)': {
+        skyZenith: '#090612',
+        skyMid: '#1A1250',
+        skyHorizon: '#6A3DE8',
+        moon: '#E8E0FF',
+        star: '#F7F4FF',
+        waterDeep: '#05030B',
+        waterSurface: '#120A38',
+        waterShimmer: '#B38FFF',
+        shore: '#06040C',
+        clouds: '#4D24BA',
+        moonLight: '#E8E0FF',
+        sunsetGlow: '#6A3DE8',
+        ambient: '#1A133B',
+        background: '#090612'
+      },
+      'Palette 8 (Cyber Twilight)': {
+        skyZenith: '#05020F',
+        skyMid: '#1E0A3D',
+        skyHorizon: '#D40078',
+        moon: '#E0FBFF',
+        star: '#B3F8FF',
+        waterDeep: '#03010A',
+        waterSurface: '#130628',
+        waterShimmer: '#00F0FF',
+        shore: '#070214',
+        clouds: '#8C0050',
+        moonLight: '#E0FBFF',
+        sunsetGlow: '#D40078',
+        ambient: '#1C0B30',
+        background: '#05020F'
+      }
+    };
+
+    // --- State and Parameter Object ---
+    const params = {
+      // Color scheme & background
+      colorScheme: 'Original',
+      greenscreen: false,
+      backgroundColor: '#040817',
+      skyZenith: '#040817',
+      skyMid: '#1C1A38',
+      skyHorizon: '#E87A68',
+      moonColor: '#F0F6FA',
+      starColor: '#FFFDF0',
+      waterDeep: '#020612',
+      waterSurface: '#0E1A2C',
+      waterShimmer: '#E4F1FA',
+      shoreColor: '#0A0812',
+      cloudsColor: '#7E4C62',
+
+      // Lighting & Exposure
+      exposure: 1.15,
+      sceneLightIntensity: 1.0,
+      moonLightIntensity: 1.35,
+      moonLightColor: '#DDE9F5',
+      sunsetGlowIntensity: 1.6,
+      sunsetGlowColor: '#F58570',
+      ambientIntensity: 0.45,
+      ambientColor: '#161426',
+      starLightIntensity: 1.8,
+      specularIntensity: 1.65,
+      specularRoughness: 0.16,
+
+      // Animation & Motion
+      animationMode: 'Waterside Orbit',
+      animationSpeed: 1.0,
+      antialias: true,
+      dpr: Math.min(window.devicePixelRatio || 1, 2.0),
+      randomizeOnClick: true,
+
+      // Procedural scene geometry & details
+      waveHeight: 0.35,
+      waveSpeed: 0.85,
+      waveFreq: 0.15,
+      cloudDensity: 0.65,
+      cloudSpeed: 0.07,
+      moonScale: 1.0,
+      moonTilt: -0.22,
+      moonCrescentCut: 1.55,
+      moonGlow: 0.95,
+      starTwinkleSpeed: 2.4
+    };
+
+    // Global variables
+    let renderer, scene, camera, controls, container;
+    let postProcessor;
+    let folderTheme, folderLighting, folderAnim, folderScene, folderSystem;
+    let skyMesh, waterMesh, cloudsMesh, crescentMesh, starMesh, starLight, shoreGroup;
+    let ambientLight, moonDirectionalLight, sunsetPointLight;
+    let starsPoints;
+    let gui;
+    let animTime = 0;
+    let isTransitioning = false;
+
+    // Pointer tracking for click vs drag
+    let pointerDownPos = { x: 0, y: 0, time: 0 };
+
+    container = document.getElementById('canvas-container');
+
+    // --- Init Scene ---
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(46, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(0, 12, 60);
+
+      initRenderer(params.antialias);
+      setupLighting();
+      setupSky();
+      setupStars();
+      setupClouds();
+      setupCrescentMoon();
+      setupLonelyStar();
+      setupWater();
+      setupDistantShore();
+      setupPostProcessor();
+      setupGUI();
+      setupEventListeners();
+
+      applyColorScheme(params.colorScheme, false);
+      animate(0);
+    }
+
+    // --- WebGLRenderer Initialization ---
+    function initRenderer(useAntialias) {
+      if (renderer) {
+        renderer.dispose();
+        if (renderer.domElement && renderer.domElement.parentNode) {
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        }
+      }
+
+      renderer = new THREE.WebGLRenderer({
+        antialias: useAntialias,
+        powerPreference: 'high-performance',
+        alpha: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(params.dpr);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = params.exposure;
+      renderer.shadowMap.enabled = false;
+      container.appendChild(renderer.domElement);
+
+      setupControls();
+    }
+
+    // --- OrbitControls Setup ---
+    function setupControls() {
+      if (controls) controls.dispose();
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.enableZoom = true;
+      controls.zoomSpeed = 1.0;
+      controls.enablePan = true;
+      controls.panSpeed = 1.0;
+      controls.enableRotate = true;
+      controls.rotateSpeed = 0.8;
+      controls.minDistance = 8;
+      controls.maxDistance = 200;
+      controls.maxPolarAngle = Math.PI / 2 - 0.01; // Stay above water level
+      controls.target.set(0, 6, 0);
+      controls.update();
+    }
+
+    // --- Lighting Setup ---
+    function setupLighting() {
+      ambientLight = new THREE.AmbientLight(params.ambientColor, params.ambientIntensity);
+      scene.add(ambientLight);
+
+      // Silvery moonlight originating from the crescent in upper-left
+      moonDirectionalLight = new THREE.DirectionalLight(params.moonLightColor, params.moonLightIntensity);
+      moonDirectionalLight.position.set(-34, 38, -60);
+      scene.add(moonDirectionalLight);
+
+      // Warm sunset horizon point light
+      sunsetPointLight = new THREE.PointLight(params.sunsetGlowColor, params.sunsetGlowIntensity, 350, 0.85);
+      sunsetPointLight.position.set(-15, 2, -130);
+      scene.add(sunsetPointLight);
+    }
+
+    // --- Sky Dome with Radiant Sunset Afterglow & Negative Space ---
+    function setupSky() {
+      const skyGeo = new THREE.SphereGeometry(380, 48, 48);
+      const skyMat = new THREE.ShaderMaterial({
+        side: THREE.BackSide,
+        depthWrite: false,
+        uniforms: {
+          uSkyZenith: { value: new THREE.Color(params.skyZenith) },
+          uSkyMid: { value: new THREE.Color(params.skyMid) },
+          uSkyHorizon: { value: new THREE.Color(params.skyHorizon) },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          varying vec3 vWorldPosition;
+          void main() {
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+            vWorldPosition = worldPos.xyz;
+            gl_Position = projectionMatrix * viewMatrix * worldPos;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uSkyZenith;
+          uniform vec3 uSkyMid;
+          uniform vec3 uSkyHorizon;
+          uniform float uGreenscreen;
+          varying vec3 vWorldPosition;
+
+          void main() {
+            if (uGreenscreen > 0.5) {
+              gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+              return;
+            }
+            vec3 dir = normalize(vWorldPosition);
+            float h = dir.y; // Height above horizon
+
+            // Multi-stop twilight gradient:
+            // 1. Broad radiant peach-pink sunset afterglow near horizon
+            float horizonGlow = smoothstep(0.40, 0.0, h) * smoothstep(-0.2, 0.02, h);
+            float sunsetSpread = exp(-max(0.0, h) * 4.2);
+
+            // 2. Sunset focal bias: warm afterglow centered towards west/left horizon
+            vec2 hDir = normalize(dir.xz);
+            float sunDir = max(0.0, dot(hDir, normalize(vec2(-0.35, -0.92))));
+            float sunRadial = pow(sunDir, 2.5) * exp(-max(0.0, h) * 3.2) * 1.4;
+
+            // 3. Mid-sky purple/indigo gradient up to deep midnight navy at zenith
+            float midBlend = smoothstep(0.04, 0.65, h);
+            vec3 sky = mix(uSkyMid, uSkyZenith, midBlend);
+
+            float glowTotal = clamp(horizonGlow * 0.9 + sunsetSpread * 0.45 + sunRadial, 0.0, 1.0);
+            sky = mix(sky, uSkyHorizon * 1.15, glowTotal);
+
+            gl_FragColor = vec4(sky, 1.0);
+          }
+        `
+      });
+      skyMesh = new THREE.Mesh(skyGeo, skyMat);
+      scene.add(skyMesh);
+    }
+
+    // --- Sparse Twinkling Stars with Empty Right Half ---
+    function setupStars() {
+      const starCount = 500;
+      const positions = new Float32Array(starCount * 3);
+      const starPhases = new Float32Array(starCount);
+      const starSizes = new Float32Array(starCount);
+
+      let idx = 0;
+      while (idx < starCount) {
+        const u = Math.random();
+        const v = Math.random();
+        const theta = 2.0 * Math.PI * u;
+        const phi = Math.acos(2.0 * v - 1.0);
+
+        const r = 360;
+        const x = r * Math.sin(phi) * Math.cos(theta);
+        const y = Math.abs(r * Math.cos(phi));
+        const z = r * Math.sin(phi) * Math.sin(theta);
+
+        // Strict negative space filter: right portion (x > 15) is empty
+        if (x > 15 && Math.random() < 0.88) continue;
+        if (y < 28) continue; // Keep clear of bright sunset afterglow
+
+        positions[idx * 3] = x;
+        positions[idx * 3 + 1] = y;
+        positions[idx * 3 + 2] = z;
+        starPhases[idx] = Math.random() * Math.PI * 2;
+        starSizes[idx] = 1.2 + Math.random() * 2.2;
+        idx++;
+      }
+
+      const starsGeo = new THREE.BufferGeometry();
+      starsGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      starsGeo.setAttribute('aPhase', new THREE.BufferAttribute(starPhases, 1));
+      starsGeo.setAttribute('aSize', new THREE.BufferAttribute(starSizes, 1));
+
+      const starsMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(params.starColor) },
+          uTwinkleSpeed: { value: params.starTwinkleSpeed },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          uniform float uTime;
+          uniform float uTwinkleSpeed;
+          attribute float aPhase;
+          attribute float aSize;
+          varying float vBrightness;
+
+          void main() {
+            float twinkle = sin(uTime * uTwinkleSpeed + aPhase);
+            vBrightness = 0.45 + 0.55 * twinkle;
+            vec4 mvPosition = viewMatrix * modelMatrix * vec4(position, 1.0);
+            gl_PointSize = aSize * (220.0 / -mvPosition.z) * vBrightness;
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          uniform float uGreenscreen;
+          varying float vBrightness;
+
+          void main() {
+            if (uGreenscreen > 0.5) discard;
+            float dist = length(gl_PointCoord - vec2(0.5));
+            if (dist > 0.5) discard;
+            float alpha = smoothstep(0.5, 0.04, dist) * vBrightness;
+            gl_FragColor = vec4(uColor, alpha);
+          }
+        `
+      });
+
+      starsPoints = new THREE.Points(starsGeo, starsMat);
+      scene.add(starsPoints);
+    }
+
+    // --- Light Nocturnal Clouds Backlit from Below ---
+    function setupClouds() {
+      const cloudGeo = new THREE.PlaneGeometry(280, 48, 64, 20);
+      const cloudMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        side: THREE.DoubleSide,
+        uniforms: {
+          uTime: { value: 0 },
+          uCloudColor: { value: new THREE.Color(params.cloudsColor) },
+          uHorizonColor: { value: new THREE.Color(params.skyHorizon) },
+          uMoonColor: { value: new THREE.Color(params.moonColor) },
+          uCloudDensity: { value: params.cloudDensity },
+          uCloudSpeed: { value: params.cloudSpeed },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vWorldPos;
+          void main() {
+            vUv = uv;
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+            vWorldPos = worldPos.xyz;
+            gl_Position = projectionMatrix * viewMatrix * worldPos;
+          }
+        `,
+        fragmentShader: `
+          uniform float uTime;
+          uniform vec3 uCloudColor;
+          uniform vec3 uHorizonColor;
+          uniform vec3 uMoonColor;
+          uniform float uCloudDensity;
+          uniform float uCloudSpeed;
+          uniform float uGreenscreen;
+          varying vec2 vUv;
+
+          float hash(vec2 p) {
+            p = fract(p * vec2(123.34, 456.21));
+            p += dot(p, p + 45.32);
+            return fract(p.x * p.y);
+          }
+
+          float noise(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            float a = hash(i);
+            float b = hash(i + vec2(1.0, 0.0));
+            float c = hash(i + vec2(0.0, 1.0));
+            float d = hash(i + vec2(1.0, 1.0));
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+          }
+
+          float fbm(vec2 p) {
+            float v = 0.0;
+            float a = 0.5;
+            for (int i = 0; i < 5; i++) {
+              v += a * noise(p);
+              p *= 2.02;
+              a *= 0.5;
+            }
+            return v;
+          }
+
+          void main() {
+            if (uGreenscreen > 0.5) discard;
+            vec2 uv = vUv;
+            vec2 drift = vec2(uTime * uCloudSpeed * 0.035, 0.0);
+            float n = fbm(uv * vec2(4.5, 2.2) + drift);
+
+            // Soft boundaries to eliminate any quad seam
+            float edgeFade = smoothstep(0.0, 0.22, uv.x) * smoothstep(1.0, 0.78, uv.x) *
+                             smoothstep(0.0, 0.28, uv.y) * smoothstep(1.0, 0.72, uv.y);
+
+            float alpha = smoothstep(0.36, 0.72, n) * edgeFade * uCloudDensity * 0.72;
+            if (alpha < 0.005) discard;
+
+            // Warmly illuminated from beneath by the peach-pink sunset afterglow
+            float bottomLight = smoothstep(0.85, 0.15, uv.y);
+            float topLight = smoothstep(0.2, 0.9, uv.y);
+
+            vec3 col = uCloudColor;
+            col = mix(col, uHorizonColor * 1.25, bottomLight * 0.92);
+            col = mix(col, uMoonColor * 1.1, topLight * 0.35);
+
+            gl_FragColor = vec4(col, alpha);
+          }
+        `
+      });
+
+      cloudsMesh = new THREE.Mesh(cloudGeo, cloudMat);
+      cloudsMesh.position.set(-20, 18, -100);
+      cloudsMesh.rotation.y = 0.06;
+      scene.add(cloudsMesh);
+    }
+
+    // --- Mathematical Analytical SDF Crescent Moon with Earthshine & Corona ---
+    function setupCrescentMoon() {
+      // Quad size 40x40 positioned in upper left third
+      const moonGeo = new THREE.PlaneGeometry(40, 40);
+      const moonMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        uniforms: {
+          uMoonColor: { value: new THREE.Color(params.moonColor) },
+          uSkyZenith: { value: new THREE.Color(params.skyZenith) },
+          uCrescentCut: { value: params.moonCrescentCut },
+          uTilt: { value: params.moonTilt },
+          uGlowIntensity: { value: params.moonGlow },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uMoonColor;
+          uniform vec3 uSkyZenith;
+          uniform float uCrescentCut;
+          uniform float uTilt;
+          uniform float uGlowIntensity;
+          uniform float uGreenscreen;
+          varying vec2 vUv;
+
+          void main() {
+            if (uGreenscreen > 0.5) discard;
+
+            vec2 p = vUv - vec2(0.5);
+            float r = length(p);
+
+            // Strict radial boundary fade: eliminates quad boundary clipping completely!
+            float quadFade = smoothstep(0.48, 0.32, r);
+            if (quadFade <= 0.0) discard;
+
+            // Rotate coordinates by tilt angle
+            float ct = cos(uTilt);
+            float st = sin(uTilt);
+            vec2 pr = mat2(ct, -st, st, ct) * p;
+
+            // Dimensions in normalized quad space
+            float outerRadius = 0.22;
+            float cutOffset = 0.075 * uCrescentCut;
+            float innerRadius = outerRadius * 0.96;
+
+            // Analytical signed distance functions for circles
+            float dOuter = length(pr) - outerRadius;
+            vec2 cutCenter = vec2(cutOffset, 0.0);
+            float dInner = length(pr - cutCenter) - innerRadius;
+
+            // Crescent region: inside outer AND outside inner
+            float dCrescent = max(dOuter, -dInner);
+
+            // Perfectly smooth anti-aliased edges
+            float aa = fwidth(dCrescent) * 1.5;
+            if (aa < 0.001) aa = 0.003;
+            float crescentMask = smoothstep(aa, -aa, dCrescent);
+
+            // Earthshine (the faint, poetic dark disc of the moon lit by Earth's glow)
+            float earthshineMask = smoothstep(aa, -aa, dOuter) * (1.0 - crescentMask);
+            vec3 earthshineCol = mix(uSkyZenith * 1.8, uMoonColor * 0.16, 0.35);
+
+            // Lunar limb brightening
+            float limb = smoothstep(outerRadius - 0.035, outerRadius, length(pr));
+            vec3 lunarSurface = uMoonColor * (0.92 + 0.28 * limb);
+
+            // Soft atmospheric lunar corona
+            float halo = exp(-r * 8.5) * 0.85 + exp(-r * 22.0) * 1.35;
+            vec3 haloCol = uMoonColor * halo * uGlowIntensity * 0.75;
+
+            // Combine composite
+            vec3 col = haloCol;
+            float alpha = halo * 0.65;
+
+            col = mix(col, earthshineCol, earthshineMask * 0.35);
+            alpha = max(alpha, earthshineMask * 0.38);
+
+            col = mix(col, lunarSurface, crescentMask);
+            alpha = max(alpha, crescentMask);
+
+            alpha *= quadFade;
+
+            gl_FragColor = vec4(col, alpha);
+          }
+        `
+      });
+
+      crescentMesh = new THREE.Mesh(moonGeo, moonMat);
+      crescentMesh.position.set(-32, 36, -85);
+      crescentMesh.scale.setScalar(params.moonScale);
+      scene.add(crescentMesh);
+    }
+
+    // --- The Lonely Jewel Star with 4-Point Spikes & Diamond Core ---
+    function setupLonelyStar() {
+      // Quad 26x26 beside the crescent moon
+      const starGeo = new THREE.PlaneGeometry(26, 26);
+      const starMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uColor: { value: new THREE.Color(params.starColor) },
+          uGlowIntensity: { value: params.starLightIntensity },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform float uTime;
+          uniform vec3 uColor;
+          uniform float uGlowIntensity;
+          uniform float uGreenscreen;
+          varying vec2 vUv;
+
+          void main() {
+            if (uGreenscreen > 0.5) discard;
+
+            vec2 p = vUv - vec2(0.5);
+            float r = length(p);
+
+            // Strict boundary falloff: 0.0 before reaching the edge
+            float quadFade = smoothstep(0.48, 0.22, r);
+            if (quadFade <= 0.0) discard;
+
+            // Twinkling scintillation
+            float pulse = 0.88 + 0.22 * sin(uTime * 3.6);
+
+            // Brilliant pinpoint diamond core & corona
+            float core = exp(-r * 50.0) * 2.8;
+            float innerGlow = exp(-r * 15.0) * 0.95;
+            float outerAura = exp(-r * 5.5) * 0.28;
+
+            // Slender 4-point cross diffraction spikes
+            float spikeX = exp(-abs(p.y) * 65.0) * exp(-abs(p.x) * 4.5);
+            float spikeY = exp(-abs(p.x) * 65.0) * exp(-abs(p.y) * 4.5);
+
+            // Delicate 45-degree secondary diagonal rays
+            vec2 pDiag = mat2(0.7071, -0.7071, 0.7071, 0.7071) * p;
+            float diagX = exp(-abs(pDiag.y) * 85.0) * exp(-abs(pDiag.x) * 8.0);
+            float diagY = exp(-abs(pDiag.x) * 85.0) * exp(-abs(pDiag.y) * 8.0);
+
+            float spikes = (spikeX + spikeY) * 1.1 + (diagX + diagY) * 0.38;
+            float brightness = (core + innerGlow + outerAura + spikes) * pulse * uGlowIntensity;
+            float alpha = clamp(brightness * quadFade, 0.0, 1.0);
+
+            vec3 col = uColor * (1.0 + core * 0.6);
+            gl_FragColor = vec4(col, alpha);
+          }
+        `
+      });
+
+      starMesh = new THREE.Mesh(starGeo, starMat);
+      starMesh.position.set(-19, 31, -80);
+      scene.add(starMesh);
+
+      // Star PointLight
+      starLight = new THREE.PointLight(params.starColor, params.starLightIntensity, 65, 1.8);
+      starLight.position.copy(starMesh.position);
+      scene.add(starLight);
+    }
+
+    // --- Calm Water with Long Shimmering Moonlight Road ---
+    function setupWater() {
+      const waterGeo = new THREE.PlaneGeometry(360, 360, 96, 96);
+      const waterMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uWaveSpeed: { value: params.waveSpeed },
+          uWaveHeight: { value: params.waveHeight },
+          uWaveFreq: { value: params.waveFreq },
+          uWaterColorDeep: { value: new THREE.Color(params.waterDeep) },
+          uWaterColorSurface: { value: new THREE.Color(params.waterSurface) },
+          uSkyHorizon: { value: new THREE.Color(params.skyHorizon) },
+          uSkyZenith: { value: new THREE.Color(params.skyZenith) },
+          uSkyMid: { value: new THREE.Color(params.skyMid) },
+          uMoonColor: { value: new THREE.Color(params.waterShimmer) },
+          uMoonWorldPos: { value: new THREE.Vector3(-32, 36, -85) },
+          uSpecularIntensity: { value: params.specularIntensity },
+          uSpecularRoughness: { value: params.specularRoughness },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          uniform float uTime;
+          uniform float uWaveSpeed;
+          uniform float uWaveHeight;
+          varying vec3 vWorldPosition;
+          varying vec2 vUv;
+
+          void main() {
+            vUv = uv;
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+
+            // Gentle calm nocturnal swell
+            float t = uTime * uWaveSpeed;
+            float swell1 = sin(worldPos.x * 0.025 + t * 0.5) * cos(worldPos.z * 0.02 + t * 0.4);
+            float swell2 = sin(worldPos.x * 0.05 - t * 0.6) * sin(worldPos.z * 0.045 + t * 0.5) * 0.4;
+            worldPos.y += (swell1 + swell2) * uWaveHeight * 0.75;
+
+            vWorldPosition = worldPos.xyz;
+            gl_Position = projectionMatrix * viewMatrix * worldPos;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uWaterColorDeep;
+          uniform vec3 uWaterColorSurface;
+          uniform vec3 uSkyHorizon;
+          uniform vec3 uSkyZenith;
+          uniform vec3 uSkyMid;
+          uniform vec3 uMoonColor;
+          uniform vec3 uMoonWorldPos;
+          uniform float uSpecularIntensity;
+          uniform float uSpecularRoughness;
+          uniform float uWaveHeight;
+          uniform float uWaveFreq;
+          uniform float uWaveSpeed;
+          uniform float uTime;
+          uniform float uGreenscreen;
+
+          varying vec3 vWorldPosition;
+          varying vec2 vUv;
+
+          // Multi-octave wave normal calculation directly in fragment shader
+          vec3 calculateWaveNormal(vec2 p, float t) {
+            vec2 slope = vec2(0.0);
+            float freq = uWaveFreq * 1.8;
+
+            // 4 natural wave trains
+            vec2 dir1 = normalize(vec2(0.7, 0.4));
+            float w1 = dot(p, dir1) * freq * 0.7 + t * 1.2;
+            slope += dir1 * cos(w1) * 0.045;
+
+            vec2 dir2 = normalize(vec2(-0.5, 0.8));
+            float w2 = dot(p, dir2) * freq * 1.4 - t * 1.5;
+            slope += dir2 * cos(w2) * 0.032;
+
+            vec2 dir3 = normalize(vec2(0.3, -0.9));
+            float w3 = dot(p, dir3) * freq * 3.1 + t * 2.2;
+            slope += dir3 * cos(w3) * 0.02;
+
+            vec2 dir4 = normalize(vec2(-0.85, -0.35));
+            float w4 = dot(p, dir4) * freq * 6.5 - t * 3.4;
+            slope += dir4 * cos(w4) * 0.012;
+
+            slope *= uWaveHeight * 2.2;
+            return normalize(vec3(-slope.x, 1.0, -slope.y));
+          }
+
+          void main() {
+            if (uGreenscreen > 0.5) {
+              gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+              return;
+            }
+
+            vec3 V = normalize(cameraPosition - vWorldPosition);
+            float t = uTime * uWaveSpeed;
+            vec3 N = calculateWaveNormal(vWorldPosition.xz, t);
+
+            // Fresnel factor
+            float NdotV = max(0.0, dot(N, V));
+            float fresnel = 0.035 + 0.965 * pow(1.0 - NdotV, 4.5);
+
+            // Reflected ray
+            vec3 R = reflect(-V, N);
+
+            // Sky reflection sampling
+            float horizonFactor = smoothstep(0.40, 0.0, max(0.0, R.y)) * smoothstep(-0.2, 0.05, R.y);
+            float midFactor = smoothstep(0.04, 0.7, max(0.0, R.y));
+            vec3 skyRefl = mix(uSkyMid, uSkyZenith, midFactor);
+            skyRefl = mix(skyRefl, uSkyHorizon * 1.15, horizonFactor * 0.95);
+
+            // Base calm nocturnal water
+            vec3 baseWater = mix(uWaterColorDeep, uWaterColorSurface, clamp(fresnel * 0.5, 0.0, 1.0));
+            vec3 color = mix(baseWater, skyRefl, fresnel * 0.86);
+
+            // --- Shimmering Moonlight Road ("длинная дрожащая дорожка на воде") ---
+            vec3 toMoon = normalize(uMoonWorldPos - vWorldPosition);
+            vec3 H = normalize(toMoon + V);
+
+            float NdotH = max(0.0, dot(N, H));
+            float shininess = mix(35.0, 260.0, 1.0 - uSpecularRoughness);
+            float spec = pow(NdotH, shininess);
+
+            // Azimuthal alignment corridor stretching from horizon to camera
+            vec2 toMoonXZ = normalize(uMoonWorldPos.xz - vWorldPosition.xz);
+            vec2 toCamXZ = normalize(cameraPosition.xz - vWorldPosition.xz);
+            float corridor = max(0.0, dot(toMoonXZ, -toCamXZ));
+            float roadSpread = pow(corridor, 6.0);
+
+            // Shimmering dancing glints
+            float sparkleNoise = sin(dot(vWorldPosition.xz, vec2(1.5, 2.2)) + t * 4.0) * 
+                                 cos(dot(vWorldPosition.xz, vec2(-2.1, 1.3)) - t * 3.5);
+            float sparkle = smoothstep(0.3, 0.9, sparkleNoise * 0.5 + 0.5);
+
+            float roadLight = (spec * 2.8 + roadSpread * spec * 8.0) * (0.75 + 0.5 * sparkle);
+            vec3 shimmerLight = uMoonColor * roadLight * uSpecularIntensity;
+
+            // Atmospheric horizon mist blending
+            float camDist = length(vWorldPosition - cameraPosition);
+            float horizonMist = smoothstep(60.0, 220.0, camDist);
+            color = mix(color, uSkyHorizon * 0.65, horizonMist * 0.42);
+
+            color += shimmerLight;
+
+            gl_FragColor = vec4(color, 1.0);
+          }
+        `
+      });
+
+      waterMesh = new THREE.Mesh(waterGeo, waterMat);
+      waterMesh.rotation.x = -Math.PI / 2;
+      waterMesh.position.y = 0;
+      scene.add(waterMesh);
+    }
+
+    // --- Layered Distant Shore Silhouette along Horizon ---
+    function setupDistantShore() {
+      shoreGroup = new THREE.Group();
+
+      const shoreMat = new THREE.ShaderMaterial({
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        uniforms: {
+          uShoreColor: { value: new THREE.Color(params.shoreColor) },
+          uHorizonColor: { value: new THREE.Color(params.skyHorizon) },
+          uGreenscreen: { value: params.greenscreen ? 1.0 : 0.0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vWorldPos;
+          void main() {
+            vUv = uv;
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+            vWorldPos = worldPos.xyz;
+            gl_Position = projectionMatrix * viewMatrix * worldPos;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uShoreColor;
+          uniform vec3 uHorizonColor;
+          uniform float uGreenscreen;
+          varying vec2 vUv;
+
+          void main() {
+            if (uGreenscreen > 0.5) discard;
+            float baseMist = smoothstep(0.0, 0.35, vUv.y);
+            float rim = smoothstep(0.65, 0.98, vUv.y);
+
+            vec3 col = mix(uHorizonColor * 0.5, uShoreColor, baseMist * 0.75 + 0.25);
+            col = mix(col, uHorizonColor * 1.15, rim * 0.55);
+
+            gl_FragColor = vec4(col, baseMist * 0.95);
+          }
+        `
+      });
+
+      // Front low undulating shoreline
+      const shoreGeo1 = new THREE.PlaneGeometry(360, 5, 120, 1);
+      const pos1 = shoreGeo1.attributes.position;
+      for (let i = 0; i < pos1.count; i++) {
+        const x = pos1.getX(i);
+        const y = pos1.getY(i);
+        if (y > 0) {
+          const h = (Math.sin(x * 0.04) * 0.6 + Math.sin(x * 0.09 + 1.2) * 0.35 + Math.cos(x * 0.02) * 0.45) + 1.0;
+          pos1.setY(i, Math.max(0.2, h));
+        }
+      }
+      shoreGeo1.computeVertexNormals();
+
+      const mesh1 = new THREE.Mesh(shoreGeo1, shoreMat);
+      mesh1.position.set(0, 1.2, -135);
+      shoreGroup.add(mesh1);
+
+      // Distant secondary hill ridge
+      const shoreGeo2 = new THREE.PlaneGeometry(380, 7, 80, 1);
+      const pos2 = shoreGeo2.attributes.position;
+      for (let i = 0; i < pos2.count; i++) {
+        const x = pos2.getX(i);
+        const y = pos2.getY(i);
+        if (y > 0) {
+          const h = (Math.sin(x * 0.025 + 0.5) * 1.0 + Math.cos(x * 0.05) * 0.6) + 1.4;
+          pos2.setY(i, Math.max(0.3, h));
+        }
+      }
+      shoreGeo2.computeVertexNormals();
+
+      const mesh2 = new THREE.Mesh(shoreGeo2, shoreMat);
+      mesh2.position.set(-15, 2.0, -155);
+      shoreGroup.add(mesh2);
+
+      scene.add(shoreGroup);
+    }
+
+    // --- Setup Post-Processor Suite (from postprocessing/PostProcessor.js) ---
+    function setupPostProcessor() {
+      postProcessor = new PostProcessor(renderer, {
+        enabled: true,
+        antialias: params.antialias,
+        bloomEnabled: true,
+        bloomStrength: 0.95,
+        bloomRadius: 0.55,
+        bloomThreshold: 0.22,
+        anamorphicEnabled: false, // Anamorphic default is explicitly OFF per user request
+        raysEnabled: true,
+        raysStrength: 0.65,
+        raysThreshold: 0.20,
+        raysColor: new THREE.Color(params.moonLightColor),
+        chromaticAberration: 0.012,
+        vignetteBoost: 1.08,
+        vignetteReduction: 0.65,
+        noiseIntensity: 0.008,
+        exposure: params.exposure
+      });
+      postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+    }
+
+    // --- Color Scheme Application ---
+    function applyColorScheme(schemeName, animateTransition = true) {
+      const scheme = colorSchemes[schemeName];
+      if (!scheme) return;
+
+      const duration = animateTransition ? 1.2 : 0;
+      const ease = 'power2.out';
+
+      params.skyZenith = scheme.skyZenith;
+      params.skyMid = scheme.skyMid;
+      params.skyHorizon = scheme.skyHorizon;
+      params.moonColor = scheme.moon;
+      params.starColor = scheme.star;
+      params.waterDeep = scheme.waterDeep;
+      params.waterSurface = scheme.waterSurface;
+      params.waterShimmer = scheme.waterShimmer;
+      params.shoreColor = scheme.shore;
+      params.cloudsColor = scheme.clouds;
+      params.moonLightColor = scheme.moonLight;
+      params.sunsetGlowColor = scheme.sunsetGlow;
+      params.ambientColor = scheme.ambient;
+      params.backgroundColor = scheme.background;
+
+      if (!params.greenscreen) {
+        document.body.style.backgroundColor = scheme.background;
+      }
+
+      if (duration > 0 && typeof gsap !== 'undefined') {
+        isTransitioning = true;
+        // Sky
+        gsap.to(skyMesh.material.uniforms.uSkyZenith.value, { ...new THREE.Color(scheme.skyZenith), duration, ease });
+        gsap.to(skyMesh.material.uniforms.uSkyMid.value, { ...new THREE.Color(scheme.skyMid), duration, ease });
+        gsap.to(skyMesh.material.uniforms.uSkyHorizon.value, { ...new THREE.Color(scheme.skyHorizon), duration, ease });
+
+        // Water
+        gsap.to(waterMesh.material.uniforms.uWaterColorDeep.value, { ...new THREE.Color(scheme.waterDeep), duration, ease });
+        gsap.to(waterMesh.material.uniforms.uWaterColorSurface.value, { ...new THREE.Color(scheme.waterSurface), duration, ease });
+        gsap.to(waterMesh.material.uniforms.uSkyHorizon.value, { ...new THREE.Color(scheme.skyHorizon), duration, ease });
+        gsap.to(waterMesh.material.uniforms.uSkyZenith.value, { ...new THREE.Color(scheme.skyZenith), duration, ease });
+        gsap.to(waterMesh.material.uniforms.uSkyMid.value, { ...new THREE.Color(scheme.skyMid), duration, ease });
+        gsap.to(waterMesh.material.uniforms.uMoonColor.value, { ...new THREE.Color(scheme.waterShimmer), duration, ease });
+
+        // Moon & Star
+        gsap.to(crescentMesh.material.uniforms.uMoonColor.value, { ...new THREE.Color(scheme.moon), duration, ease });
+        gsap.to(crescentMesh.material.uniforms.uSkyZenith.value, { ...new THREE.Color(scheme.skyZenith), duration, ease });
+        gsap.to(starMesh.material.uniforms.uColor.value, { ...new THREE.Color(scheme.star), duration, ease });
+        gsap.to(starLight.color, { ...new THREE.Color(scheme.star), duration, ease });
+        gsap.to(starsPoints.material.uniforms.uColor.value, { ...new THREE.Color(scheme.star), duration, ease });
+
+        // Lights
+        gsap.to(ambientLight.color, { ...new THREE.Color(scheme.ambient), duration, ease });
+        gsap.to(moonDirectionalLight.color, { ...new THREE.Color(scheme.moonLight), duration, ease });
+        gsap.to(sunsetPointLight.color, { ...new THREE.Color(scheme.sunsetGlow), duration, ease });
+
+        // Clouds & Shore
+        gsap.to(cloudsMesh.material.uniforms.uCloudColor.value, { ...new THREE.Color(scheme.clouds), duration, ease });
+        gsap.to(cloudsMesh.material.uniforms.uHorizonColor.value, { ...new THREE.Color(scheme.skyHorizon), duration, ease });
+        gsap.to(cloudsMesh.material.uniforms.uMoonColor.value, { ...new THREE.Color(scheme.moon), duration, ease });
+
+        shoreGroup.children.forEach(mesh => {
+          gsap.to(mesh.material.uniforms.uShoreColor.value, { ...new THREE.Color(scheme.shore), duration, ease });
+          gsap.to(mesh.material.uniforms.uHorizonColor.value, { ...new THREE.Color(scheme.skyHorizon), duration, ease, onComplete: () => { isTransitioning = false; } });
+        });
+      } else {
+        skyMesh.material.uniforms.uSkyZenith.value.set(scheme.skyZenith);
+        skyMesh.material.uniforms.uSkyMid.value.set(scheme.skyMid);
+        skyMesh.material.uniforms.uSkyHorizon.value.set(scheme.skyHorizon);
+
+        waterMesh.material.uniforms.uWaterColorDeep.value.set(scheme.waterDeep);
+        waterMesh.material.uniforms.uWaterColorSurface.value.set(scheme.waterSurface);
+        waterMesh.material.uniforms.uSkyHorizon.value.set(scheme.skyHorizon);
+        waterMesh.material.uniforms.uSkyZenith.value.set(scheme.skyZenith);
+        waterMesh.material.uniforms.uSkyMid.value.set(scheme.skyMid);
+        waterMesh.material.uniforms.uMoonColor.value.set(scheme.waterShimmer);
+
+        crescentMesh.material.uniforms.uMoonColor.value.set(scheme.moon);
+        crescentMesh.material.uniforms.uSkyZenith.value.set(scheme.skyZenith);
+        starMesh.material.uniforms.uColor.value.set(scheme.star);
+        starLight.color.set(scheme.star);
+        starsPoints.material.uniforms.uColor.value.set(scheme.star);
+
+        ambientLight.color.set(scheme.ambient);
+        moonDirectionalLight.color.set(scheme.moonLight);
+        sunsetPointLight.color.set(scheme.sunsetGlow);
+
+        cloudsMesh.material.uniforms.uCloudColor.value.set(scheme.clouds);
+        cloudsMesh.material.uniforms.uHorizonColor.value.set(scheme.skyHorizon);
+        cloudsMesh.material.uniforms.uMoonColor.value.set(scheme.moon);
+
+        shoreGroup.children.forEach(mesh => {
+          mesh.material.uniforms.uShoreColor.value.set(scheme.shore);
+          mesh.material.uniforms.uHorizonColor.value.set(scheme.skyHorizon);
+        });
+      }
+
+      updateAllGUIControllers();
+    }
+
+    // --- Update Single Material Colors from Individual GUI Controls ---
+    function updateIndividualColors() {
+      skyMesh.material.uniforms.uSkyZenith.value.set(params.skyZenith);
+      skyMesh.material.uniforms.uSkyMid.value.set(params.skyMid);
+      skyMesh.material.uniforms.uSkyHorizon.value.set(params.skyHorizon);
+
+      waterMesh.material.uniforms.uWaterColorDeep.value.set(params.waterDeep);
+      waterMesh.material.uniforms.uWaterColorSurface.value.set(params.waterSurface);
+      waterMesh.material.uniforms.uSkyHorizon.value.set(params.skyHorizon);
+      waterMesh.material.uniforms.uSkyZenith.value.set(params.skyZenith);
+      waterMesh.material.uniforms.uSkyMid.value.set(params.skyMid);
+      waterMesh.material.uniforms.uMoonColor.value.set(params.waterShimmer);
+
+      crescentMesh.material.uniforms.uMoonColor.value.set(params.moonColor);
+      crescentMesh.material.uniforms.uSkyZenith.value.set(params.skyZenith);
+      starMesh.material.uniforms.uColor.value.set(params.starColor);
+      starLight.color.set(params.starColor);
+      starsPoints.material.uniforms.uColor.value.set(params.starColor);
+
+      ambientLight.color.set(params.ambientColor);
+      moonDirectionalLight.color.set(params.moonLightColor);
+      sunsetPointLight.color.set(params.sunsetGlowColor);
+
+      cloudsMesh.material.uniforms.uCloudColor.value.set(params.cloudsColor);
+      cloudsMesh.material.uniforms.uHorizonColor.value.set(params.skyHorizon);
+      cloudsMesh.material.uniforms.uMoonColor.value.set(params.moonColor);
+
+      shoreGroup.children.forEach(mesh => {
+        mesh.material.uniforms.uShoreColor.value.set(params.shoreColor);
+        mesh.material.uniforms.uHorizonColor.value.set(params.skyHorizon);
+      });
+
+      if (!params.greenscreen) {
+        document.body.style.backgroundColor = params.backgroundColor;
+      }
+    }
+
+    // --- Greenscreen Toggle ---
+    function toggleGreenscreen(val) {
+      const gsVal = val ? 1.0 : 0.0;
+      skyMesh.material.uniforms.uGreenscreen.value = gsVal;
+      starsPoints.material.uniforms.uGreenscreen.value = gsVal;
+      cloudsMesh.material.uniforms.uGreenscreen.value = gsVal;
+      waterMesh.material.uniforms.uGreenscreen.value = gsVal;
+      crescentMesh.material.uniforms.uGreenscreen.value = gsVal;
+      starMesh.material.uniforms.uGreenscreen.value = gsVal;
+
+      shoreGroup.children.forEach(mesh => {
+        mesh.material.uniforms.uGreenscreen.value = gsVal;
+      });
+
+      if (val) {
+        document.body.style.backgroundColor = '#00ff00';
+      } else {
+        document.body.style.backgroundColor = params.backgroundColor;
+      }
+    }
+
+    // --- Update Crescent Moon Shape Parameters ---
+    function updateCrescentParameters() {
+      if (crescentMesh) {
+        crescentMesh.material.uniforms.uCrescentCut.value = params.moonCrescentCut;
+        crescentMesh.material.uniforms.uTilt.value = params.moonTilt;
+        crescentMesh.scale.setScalar(params.moonScale);
+      }
+    }
+
+    // --- Randomize Scene Procedurally (Triggered by Scene Click) ---
+    function randomizeScene(animateMorph = true) {
+      const schemeKeys = Object.keys(colorSchemes);
+      const chosenScheme = schemeKeys[Math.floor(Math.random() * schemeKeys.length)];
+      params.colorScheme = chosenScheme;
+
+      // NOTE: Postprocessor settings are explicitly preserved (NOT shuffled or modified)
+      // Randomize parameters within pleasing aesthetic ranges
+      params.waveHeight = THREE.MathUtils.randFloat(0.20, 0.50);
+      params.waveSpeed = THREE.MathUtils.randFloat(0.65, 1.35);
+      params.waveFreq = THREE.MathUtils.randFloat(0.12, 0.20);
+      params.cloudDensity = THREE.MathUtils.randFloat(0.45, 0.85);
+      params.cloudSpeed = THREE.MathUtils.randFloat(0.04, 0.12);
+      params.specularIntensity = THREE.MathUtils.randFloat(1.3, 2.2);
+      params.specularRoughness = THREE.MathUtils.randFloat(0.10, 0.24);
+      params.exposure = THREE.MathUtils.randFloat(1.0, 1.3);
+      params.moonScale = THREE.MathUtils.randFloat(0.9, 1.25);
+      params.moonTilt = THREE.MathUtils.randFloat(-0.35, -0.05);
+      params.moonCrescentCut = THREE.MathUtils.randFloat(1.25, 1.85);
+      params.moonGlow = THREE.MathUtils.randFloat(0.7, 1.25);
+      params.starTwinkleSpeed = THREE.MathUtils.randFloat(1.8, 3.8);
+      params.animationSpeed = THREE.MathUtils.randFloat(0.75, 1.3);
+
+      if (animateMorph && typeof gsap !== 'undefined') {
+        gsap.to(crescentMesh.scale, { x: params.moonScale, y: params.moonScale, z: params.moonScale, duration: 1.2 });
+        gsap.to(crescentMesh.material.uniforms.uTilt, { value: params.moonTilt, duration: 1.2 });
+        gsap.to(crescentMesh.material.uniforms.uCrescentCut, { value: params.moonCrescentCut, duration: 1.2 });
+        gsap.to(renderer, { toneMappingExposure: params.exposure, duration: 1.2 });
+      } else {
+        crescentMesh.scale.setScalar(params.moonScale);
+        crescentMesh.material.uniforms.uTilt.value = params.moonTilt;
+        crescentMesh.material.uniforms.uCrescentCut.value = params.moonCrescentCut;
+        renderer.toneMappingExposure = params.exposure;
+      }
+
+      applyColorScheme(chosenScheme, animateMorph);
+    }
+
+    // --- GUI Setup (Standard lil-gui, no custom styles) ---
+    function setupGUI() {
+      gui = new GUI({ title: 'Scene Controls' });
+
+      // 1. Color Palette & Presets
+      folderTheme = gui.addFolder('Theme & Colors');
+      folderTheme.add(params, 'colorScheme', Object.keys(colorSchemes)).name('Color Palette').onChange(v => {
+        applyColorScheme(v, true);
+      });
+      folderTheme.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(v => {
+        toggleGreenscreen(v);
+      });
+      folderTheme.addColor(params, 'backgroundColor').name('Background Color').onChange(v => {
+        if (!params.greenscreen) document.body.style.backgroundColor = v;
+      });
+
+      // Individual colors customization
+      const folderCustomColors = folderTheme.addFolder('Individual Colors');
+      folderCustomColors.close();
+      folderCustomColors.addColor(params, 'skyZenith').name('Sky Zenith').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'skyMid').name('Sky Mid').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'skyHorizon').name('Sunset Afterglow').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'moonColor').name('Crescent Moon').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'starColor').name('Lonely Star').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'waterDeep').name('Water Deep').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'waterSurface').name('Water Surface').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'waterShimmer').name('Water Shimmer Trail').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'shoreColor').name('Distant Shore').onChange(updateIndividualColors);
+      folderCustomColors.addColor(params, 'cloudsColor').name('Clouds').onChange(updateIndividualColors);
+
+      // 2. Lighting & Exposure
+      folderLighting = gui.addFolder('Lighting & Exposure');
+      folderLighting.add(params, 'exposure', 0.2, 2.5, 0.01).name('Scene Exposure').onChange(v => {
+        renderer.toneMappingExposure = v;
+        if (postProcessor) {
+          postProcessor.settings.exposure = v;
+        }
+      });
+      folderLighting.add(params, 'sceneLightIntensity', 0.1, 2.5, 0.05).name('Master Light Mult');
+      folderLighting.add(params, 'moonLightIntensity', 0.0, 3.5, 0.05).name('Moonlight Intensity');
+      folderLighting.addColor(params, 'moonLightColor').name('Moonlight Color').onChange(updateIndividualColors);
+      folderLighting.add(params, 'sunsetGlowIntensity', 0.0, 3.5, 0.05).name('Sunset Rim Intensity');
+      folderLighting.addColor(params, 'sunsetGlowColor').name('Sunset Rim Color').onChange(updateIndividualColors);
+      folderLighting.add(params, 'ambientIntensity', 0.0, 1.5, 0.05).name('Ambient Intensity');
+      folderLighting.addColor(params, 'ambientColor').name('Ambient Color').onChange(updateIndividualColors);
+      folderLighting.add(params, 'starLightIntensity', 0.0, 3.5, 0.05).name('Star Glow Intensity');
+      folderLighting.add(params, 'specularIntensity', 0.1, 4.0, 0.05).name('Water Specular Road');
+      folderLighting.add(params, 'specularRoughness', 0.02, 0.45, 0.01).name('Water Roughness');
+
+      // 3. Animations & Camera Modes (8 preconfigured slow smooth animations)
+      folderAnim = gui.addFolder('Camera & Animation');
+      const animationList = [
+        'Waterside Orbit',
+        'Gentle Shore Drift',
+        'Crescent Gaze',
+        'Floating Reflection',
+        'Distant Horizon Pan',
+        'Twilight Elevation',
+        'Meditative Breathing',
+        'Static (Stillness)'
+      ];
+      folderAnim.add(params, 'animationMode', animationList).name('Animation Mode');
+      folderAnim.add(params, 'animationSpeed', 0.1, 3.0, 0.05).name('Animation Speed');
+
+      // 4. Procedural & Geometric Scene Parameters
+      folderScene = gui.addFolder('Procedural Details');
+      folderScene.add(params, 'waveHeight', 0.05, 0.8, 0.01).name('Water Ripple Height');
+      folderScene.add(params, 'waveSpeed', 0.2, 2.5, 0.05).name('Water Ripple Speed');
+      folderScene.add(params, 'waveFreq', 0.05, 0.35, 0.01).name('Water Frequency');
+      folderScene.add(params, 'cloudDensity', 0.0, 1.0, 0.05).name('Cloud Density');
+      folderScene.add(params, 'cloudSpeed', 0.0, 0.3, 0.01).name('Cloud Drift Speed');
+      folderScene.add(params, 'moonScale', 0.5, 2.0, 0.05).name('Moon Scale').onChange(updateCrescentParameters);
+      folderScene.add(params, 'moonTilt', -0.8, 0.5, 0.01).name('Moon Tilt').onChange(updateCrescentParameters);
+      folderScene.add(params, 'moonCrescentCut', 1.0, 2.4, 0.05).name('Crescent Thinness').onChange(updateCrescentParameters);
+      folderScene.add(params, 'moonGlow', 0.2, 2.0, 0.05).name('Moon Glow');
+
+      // 5. System & Interaction
+      folderSystem = gui.addFolder('System Settings');
+      folderSystem.add(params, 'randomizeOnClick').name('Randomize on Click');
+      folderSystem.add(params, 'dpr', 0.5, 2.5, 0.1).name('DPR (Pixel Ratio)').onChange(v => {
+        renderer.setPixelRatio(v);
+        if (postProcessor) {
+          postProcessor.setSize(window.innerWidth, window.innerHeight, v);
+        }
+      });
+      folderSystem.add(params, 'antialias').name('Antialiasing').onChange(v => {
+        initRenderer(v);
+        if (postProcessor) {
+          postProcessor.setAntialias(v);
+        }
+      });
+
+      // Quick action button to trigger procedural variation
+      folderSystem.add({ reRoll: () => randomizeScene(true) }, 'reRoll').name('Generate Variation');
+
+      // Attach Post-Processing Suite from postprocessing/PostProcessor.js
+      if (postProcessor) {
+        postProcessor.attachGUI(gui, "Post-Processing Suite");
+      }
+    }
+
+    function updateAllGUIControllers() {
+      if (!gui) return;
+      // When randomizing scene, DO NOT shuffle or modify Postprocessing settings
+      [folderTheme, folderLighting, folderAnim, folderScene, folderSystem].forEach(folder => {
+        if (folder) folder.controllersRecursive().forEach(c => c.updateDisplay());
+      });
+    }
+
+    // --- Event Listeners ---
+    function setupEventListeners() {
+      window.addEventListener('resize', onWindowResize);
+
+      // 'H' key to hide/show lil-gui UI
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'h' || e.key === 'H') {
+          gui.show(gui._hidden);
+        }
+      });
+
+      // Pointer event tracking for click vs drag detection on scene
+      window.addEventListener('pointerdown', (e) => {
+        pointerDownPos.x = e.clientX;
+        pointerDownPos.y = e.clientY;
+        pointerDownPos.time = performance.now();
+      });
+
+      window.addEventListener('pointerup', (e) => {
+        // Only trigger if click landed on webgl canvas and not inside GUI controls
+        if (gui.domElement.contains(e.target)) return;
+
+        const dist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+        const elapsed = performance.now() - pointerDownPos.time;
+
+        if (dist < 6 && elapsed < 350) {
+          if (params.randomizeOnClick && !isTransitioning) {
+            randomizeScene(true);
+          }
+        }
+      });
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if (postProcessor) {
+        postProcessor.setSize(window.innerWidth, window.innerHeight, params.dpr);
+      }
+    }
+
+    // --- Main Infinite Animation Loop ---
+    let lastTime = performance.now();
+
+    function animate(currentTime) {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min((currentTime - lastTime) * 0.001, 0.1);
+      lastTime = currentTime;
+
+      const spd = params.animationSpeed;
+      animTime += delta * spd;
+
+      // Celestial billboards always face the camera directly to preserve spherical perfection
+      if (crescentMesh) {
+        crescentMesh.quaternion.copy(camera.quaternion);
+        crescentMesh.material.uniforms.uGlowIntensity.value = params.moonGlow;
+      }
+
+      if (starMesh) {
+        starMesh.quaternion.copy(camera.quaternion);
+        starMesh.material.uniforms.uTime.value = animTime;
+        starMesh.material.uniforms.uGlowIntensity.value = params.starLightIntensity;
+      }
+
+      // Update shader uniforms
+      if (waterMesh) {
+        waterMesh.material.uniforms.uTime.value = animTime;
+        waterMesh.material.uniforms.uWaveSpeed.value = params.waveSpeed;
+        waterMesh.material.uniforms.uWaveHeight.value = params.waveHeight;
+        waterMesh.material.uniforms.uWaveFreq.value = params.waveFreq;
+        waterMesh.material.uniforms.uSpecularIntensity.value = params.specularIntensity * params.sceneLightIntensity;
+        waterMesh.material.uniforms.uSpecularRoughness.value = params.specularRoughness;
+      }
+
+      if (cloudsMesh) {
+        cloudsMesh.material.uniforms.uTime.value = animTime;
+        cloudsMesh.material.uniforms.uCloudDensity.value = params.cloudDensity;
+        cloudsMesh.material.uniforms.uCloudSpeed.value = params.cloudSpeed;
+      }
+
+      if (starsPoints) {
+        starsPoints.material.uniforms.uTime.value = animTime;
+        starsPoints.material.uniforms.uTwinkleSpeed.value = params.starTwinkleSpeed;
+      }
+
+      // Update lights with intensities
+      if (moonDirectionalLight) {
+        moonDirectionalLight.intensity = params.moonLightIntensity * params.sceneLightIntensity;
+      }
+      if (sunsetPointLight) {
+        sunsetPointLight.intensity = params.sunsetGlowIntensity * params.sceneLightIntensity;
+      }
+      if (ambientLight) {
+        ambientLight.intensity = params.ambientIntensity * params.sceneLightIntensity;
+      }
+      if (starLight) {
+        const starTwinkle = 0.88 + 0.28 * Math.sin(animTime * 3.6);
+        starLight.intensity = params.starLightIntensity * params.sceneLightIntensity * starTwinkle;
+      }
+
+      // --- Camera Animation Handling ---
+      // Requirement: Zoom in/out with wheel and manual angle changes are NOT overwritten or reset.
+      applyCameraAnimation(delta, spd);
+
+      controls.update();
+
+      if (postProcessor) {
+        postProcessor.setMoonScreenPosition(camera, new THREE.Vector3(-32, 36, -85));
+        postProcessor.renderScene(scene, camera);
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+
+    function applyCameraAnimation(delta, spd) {
+      const mode = params.animationMode;
+
+      if (mode === 'Waterside Orbit') {
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 0.45 * spd;
+      } else {
+        controls.autoRotate = false;
+      }
+
+      if (mode === 'Gentle Shore Drift') {
+        // Slow horizontal sway without resetting camera zoom radius or user polar angle
+        const driftVelocity = Math.cos(animTime * 0.35) * 0.035 * spd;
+        camera.position.x += driftVelocity;
+        controls.target.x += driftVelocity;
+      } else if (mode === 'Crescent Gaze') {
+        // Subtle vertical tilt focusing towards crescent moon and star, then lowering to water
+        const gazeDelta = Math.cos(animTime * 0.28) * 0.02 * spd;
+        camera.position.y += gazeDelta;
+        controls.target.y += gazeDelta * 1.4;
+      } else if (mode === 'Floating Reflection') {
+        // Gentle boat heave: slight vertical and lateral bobbing
+        const heaveY = Math.sin(animTime * 0.6) * 0.025 * spd;
+        const heaveX = Math.cos(animTime * 0.4) * 0.015 * spd;
+        camera.position.y += heaveY;
+        controls.target.y += heaveY * 0.5;
+        camera.position.x += heaveX;
+        controls.target.x += heaveX;
+      } else if (mode === 'Distant Horizon Pan') {
+        // Broad slow sweeping pan along the horizon
+        const panDelta = Math.sin(animTime * 0.2) * 0.045 * spd;
+        camera.position.x += panDelta;
+        controls.target.x += panDelta;
+      } else if (mode === 'Twilight Elevation') {
+        // Slow rise and descent between waterline and elevated vantage
+        const elevDelta = Math.sin(animTime * 0.24) * 0.03 * spd;
+        camera.position.y += elevDelta;
+        controls.target.y += elevDelta * 0.4;
+      } else if (mode === 'Meditative Breathing') {
+        // Calm subtle rhythmic breathing: shifts focal distance slightly without fighting OrbitControls
+        const breath = Math.sin(animTime * 0.3) * 0.015 * spd;
+        const toTarget = new THREE.Vector3().subVectors(controls.target, camera.position).normalize();
+        camera.position.addScaledVector(toTarget, breath);
+      }
+    }
+
+    // Start everything
+    window.onload = init;
+  </script>
+</body>
+</html>
