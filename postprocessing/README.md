@@ -8,6 +8,7 @@ A modular, high-performance post-processing suite for Three.js providing film-gr
 
 - **`PostProcessor.js`** — Main custom post-processing pipeline featuring multi-pass Gaussian bloom, chromatic aberration, film grain noise, vignette, levels adjustment, offscreen rendering, and one-line `lil-gui` binding.
 - **`cinematic-pack.js`** — Preset definitions, pass updaters, and GUI attachment functions for standard Three.js `EffectComposer` passes.
+- **`video-record.js`** — Self-contained, studio-grade MP4 video recording engine (WebCodecs + embedded mp4-muxer + tiled GPU assembly + QP quantizer control + modal verification UI). Ready to copy-paste into any WebGL/Three.js project.
 
 ---
 
@@ -142,3 +143,21 @@ attachCinematicGUI(gui, passes);
 ## 💡 Usage Note for Local (`file://`) Protocol
 
 When running standalone single HTML files locally without a web server (using `file://` protocol), inline `PostProcessor.js` directly within a `<script type="module">` block to avoid browser CORS restrictions on local module imports.
+
+---
+
+## 🎬 `video-record.js` Studio-Grade MP4 Export Engine
+
+### ⚠️ Critical Directive for AI Agents & Developers
+> **DO NOT IMPORT `video-record.js` AS AN EXTERNAL ES MODULE IN STANDALONE CODEPEN / HTML PROJECTS!**
+> Most projects in this repository are 100% self-contained single-file HTML applications. Importing from relative paths will break under `file://` protocols, iframe sandboxes, and offline environments.
+>
+> **INSTEAD: Copy the code directly into the target project's single HTML file** (or inside its main `<script>` tag alongside lil-gui and Three.js).
+
+### Features Included
+- **Exact Deterministic Rendering**: Renders frames at `startTime + (frameIndex / 30) * animationSpeed` for perfect 30 fps playback regardless of render speed.
+- **Tiled GPU Assembly**: High-resolution exports (native, 2x, 3x, 4x, custom DPR) via 1024px core tiles + 16px overlap apron, preserving screen-space derivatives and dithering.
+- **Crucial Rule**: Sets `renderer.setPixelRatio(1)` during export to eliminate tile buffer scaling mismatch, broken geometry, and seams.
+- **Pristine H.264 Master Quality**: Passes `avc: { quantizer: 1 }` per frame with `latencyMode: 'quality'` to eliminate macroblocking and banding on dark gradients.
+- **Embedded `mp4-muxer` v5.2.2**: 100% self-contained, zero external network requests.
+- **Dual Verification**: Validates container boxes (`mvhd`, `tkhd`, `stsz`) and in-memory `HTMLVideoElement` before download.

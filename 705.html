@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#160d18" />
+  <title>Neon Liquid Reverie | Three.js + GLSL</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #170f1a; }
+    body { overscroll-behavior: none; }
+    canvas { display: block; width: 100%; height: 100%; }
+    canvas { touch-action: none; }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js';
+    import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+    // Art direction:
+    // 1. Dark aubergine / warm-black ground.
+    // 2. Cyan-centered, violet-rimmed out-of-focus liquid reflections.
+    // 3. Independent but coordinated flowing upper and lower light ribbons.
+    // 4. Exactly periodic animation. No textures or uploaded image are used.
+    const LOOP_SECONDS = 18.0;
+    const TAU = Math.PI * 2;
+    const QUALITY_DPR_CAP = 1.7;
+    const BLOOM_STRENGTH = 0.66;
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
+      powerPreference: 'high-performance',
+    });
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.setClearColor(0x170f1a, 1);
+    document.body.appendChild(renderer.domElement);
+
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), null);
+    quad.frustumCulled = false;
+    const scene = new THREE.Scene();
+    scene.add(quad);
+
+    const vertexShader = /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `;
+
+    const artFragment = /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      uniform float uPhase;
+      uniform vec2 uResolution;
+      uniform vec3 uColors[5];
+      uniform vec2 uPan;
+      uniform vec2 uAngles;
+      uniform float uZoom;
+      uniform float uRotation;
+      uniform float uWidth;
+      uniform float uBend;
+      uniform float uSpacing;
+      uniform float uFlow;
+      uniform float uSeed;
+      #define PI 3.141592653589793
+      #define TAU 6.283185307179586
+
+      float hash21(vec2 p) {
+        p = fract(p * vec2(123.34, 456.21));
+        p += dot(p, p + 45.32);
+        return fract(p.x * p.y);
+      }
+
+      float valueNoise(vec2 p) {
+        vec2 id = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        float a = hash21(id);
+        float b = hash21(id + vec2(1.0, 0.0));
+        float c = hash21(id + vec2(0.0, 1.0));
+        float d = hash21(id + vec2(1.0, 1.0));
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
+
+      // Time is sampled along a closed circle: the noise is guaranteed
+      // to return to precisely the same position after every 18 seconds.
+      vec2 periodicFlow(vec2 p, float phase) {
+        p += vec2(uSeed * 0.37, uSeed * 0.61);
+        vec2 orbitA = 0.28 * vec2(cos(phase), sin(phase));
+        vec2 orbitB = 0.19 * vec2(cos(2.0 * phase + 0.7), sin(2.0 * phase + 0.7));
+        float a = valueNoise(p * vec2(3.7, 4.9) + orbitA);
+        float b = valueNoise(p * vec2(6.8, 5.5) + orbitB);
+        float c = valueNoise(p * vec2(5.2, 7.2) - orbitA);
+        return vec2(
+          0.015 * sin(9.0 * p.y + phase + 1.7 * a) + 0.019 * (b - 0.5),
+          0.014 * sin(7.0 * p.x - phase + 1.4 * c) + 0.021 * (a - 0.5)
+        );
+      }
+
+      // Diffuse glowing ribbon, with a gently curved centerline and
+      // physically art-directed inner / outer color falloffs.
+      vec3 luminousRibbon(
+        vec2 p,
+        vec2 left, vec2 right,
+        float bend,
+        vec2 halfWidths,
+        float strength,
+        float cyanAmount,
+        float phaseOffset,
+        float phase
+      ) {
+        float t = (p.x - left.x) / max(0.01, right.x - left.x);
+        float s = clamp(t, 0.0, 1.0);
+        float envelope = smoothstep(-0.21, 0.08, t) *
+                         (1.0 - smoothstep(0.91, 1.20, t));
+        float centerY = mix(left.y, right.y, s) + bend * uBend * sin(PI * s);
+        centerY = 0.5 + (centerY - 0.5) * uSpacing;
+        centerY += 0.025 * sin(uSeed + phaseOffset * 2.7);
+
+        // Different sections of each ribbon lead/follow at slightly
+        // different times; all harmonics have integer loop frequency.
+        centerY += 0.012 * sin(phase + phaseOffset + s * 5.5);
+        centerY += 0.006 * sin(2.0 * phase + 2.2 * phaseOffset - s * 9.0);
+
+        float width = mix(halfWidths.x, halfWidths.y, s) *
+                      (0.89 + 0.11 * sin(PI * s));
+        width *= 1.0 + 0.12 * sin(phase + phaseOffset - 5.0 * s);
+        float y = (p.y - centerY) / max(width * uWidth, 0.006);
+        float d2 = y * y;
+
+        // Large atmospheric aureole, softer violet shoulders, bright core.
+        float haze     = exp(-0.37 * d2) * envelope;
+        float shoulder = exp(-1.12 * d2) * envelope;
+        float core     = exp(-3.55 * d2) * envelope;
+        float hot      = exp(-8.25 * d2) * envelope;
+
+        // Traveling bands are advected through the ribbon and slowly
+        // exchange dominance, never cycling the whole hue wheel.
+        float traveling = 0.5 + 0.5 * sin(
+          9.0 * s + phase + phaseOffset + 0.80 * sin(2.0 * phase - 5.0 * s)
+        );
+        float pearl = 0.5 + 0.5 * cos(4.0 * s - 2.0 * phase + phaseOffset);
+        float cyan = clamp(cyanAmount * (0.78 + 0.26 * traveling), 0.0, 1.0);
+
+        vec3 ultraviolet = uColors[0];
+        vec3 deepViolet  = uColors[1];
+        vec3 cobalt      = uColors[2];
+        vec3 clearCyan   = uColors[3];
+        vec3 milkCyan    = uColors[4];
+
+        vec3 innerColor = mix(cobalt, clearCyan, cyan);
+        innerColor = mix(innerColor, milkCyan, 0.22 * pearl * cyan);
+        vec3 result = vec3(0.0);
+        result += 0.22 * haze * deepViolet;
+        result += 0.49 * shoulder * ultraviolet;
+        result += 0.86 * core * innerColor;
+        result += 0.10 * hot * mix(ultraviolet, milkCyan, cyan);
+        return result * strength;
+      }
+
+      // Gentle volumetric light islands add natural bokeh-like bulges,
+      // preventing the elongated forms from looking like flat bands.
+      vec3 luminousPool(
+        vec2 p,
+        vec2 center,
+        vec2 radius,
+        float rotation,
+        float strength,
+        float cyanAmount,
+        float phaseOffset,
+        float phase
+      ) {
+        float a = rotation + 0.04 * sin(phase + phaseOffset);
+        mat2 r = mat2(cos(a), -sin(a), sin(a), cos(a));
+        center.y = 0.5 + (center.y - 0.5) * uSpacing;
+        center.y += 0.025 * sin(uSeed + phaseOffset * 2.7);
+        vec2 q = r * (p - center);
+        q.x += 0.012 * sin(phase + phaseOffset + 5.0 * q.y);
+        vec2 v = q / (radius * vec2(1.0, uWidth));
+        float rr = dot(v, v);
+        float halo = exp(-1.20 * rr);
+        float outer = exp(-2.25 * rr);
+        float inner = exp(-4.9 * rr);
+        float g = 0.5 + 0.5 * sin(phase + phaseOffset + 5.0 * v.x);
+        vec3 purple = uColors[0];
+        vec3 aqua = mix(uColors[2],
+                        uColors[4],
+                        clamp(cyanAmount * (0.86 + 0.23 * g), 0.0, 1.0));
+        return strength * (0.26 * halo * purple +
+                           0.42 * outer * purple +
+                           0.74 * inner * aqua);
+      }
+
+      void main() {
+        // Coordinates are defined in reference-image space: x left-right,
+        // y top-bottom. The composition stretches naturally to any viewport.
+        vec2 p = vec2(vUv.x, 1.0 - vUv.y);
+        float aspect = uResolution.x / uResolution.y;
+        vec2 q = (p - 0.5 - uPan) * vec2(aspect, 1.0) / uZoom;
+        float perspective = max(0.35, 1.0 + 0.25 * dot(q, sin(uAngles)));
+        q *= perspective / max(vec2(0.4), cos(uAngles));
+        q = mat2(cos(uRotation), -sin(uRotation), sin(uRotation), cos(uRotation)) * q;
+        p = q / vec2(aspect, 1.0) + 0.5;
+        float phase = uPhase + uSeed;
+
+        // Smooth multi-scale domain warping gives the softly melting edges.
+        vec2 warped = p + periodicFlow(p, phase) * uFlow;
+        float billow = valueNoise(p * vec2(2.8, 4.1) +
+                       0.22 * vec2(cos(phase), sin(phase)));
+        warped.y += 0.011 * (billow - 0.5) * uFlow;
+
+        // Render light independently so backgrounds remain editable and keyable.
+        vec3 color = vec3(0.0);
+
+        // BACKGROUND: nearly lost purple atmospheric islands.
+        color += luminousRibbon(warped,
+          vec2(-0.14, 0.225), vec2(0.54, 0.211),
+          0.007, vec2(0.032, 0.044),
+          0.47, 0.06, 0.4, phase);
+        color += luminousPool(warped, vec2(0.20, 0.238),
+          vec2(0.28, 0.071), -0.08, 0.20, 0.04, 1.8, phase);
+        color += luminousRibbon(warped,
+          vec2(0.89, 0.160), vec2(1.20, 0.172),
+          -0.01, vec2(0.017, 0.024),
+          0.23, 0.05, 2.1, phase);
+
+        // MIDGROUND: braided cyan-violet liquid light, slightly staggered.
+        color += luminousRibbon(warped,
+          vec2(0.40, 0.250), vec2(1.12, 0.255),
+          -0.023, vec2(0.036, 0.055),
+          0.82, 0.87, 0.7, phase);
+        color += luminousRibbon(warped,
+          vec2(0.22, 0.391), vec2(0.98, 0.290),
+          -0.025, vec2(0.060, 0.044),
+          0.95, 0.88, 1.3, phase);
+        color += luminousPool(warped, vec2(0.75, 0.250),
+          vec2(0.225, 0.069), -0.05, 0.42, 0.85, 0.8, phase);
+        color += luminousPool(warped, vec2(0.48, 0.418),
+          vec2(0.22, 0.077), -0.09, 0.23, 0.04, 2.2, phase);
+        color += luminousRibbon(warped,
+          vec2(-0.11, 0.426), vec2(0.11, 0.432),
+          0.004, vec2(0.030, 0.030),
+          0.31, 0.14, 2.8, phase);
+
+        // FOREGROUND: broadest and brightest liquid reflections.
+        color += luminousRibbon(warped,
+          vec2(-0.31, 0.599), vec2(0.55, 0.628),
+          -0.012, vec2(0.078, 0.063),
+          1.06, 0.91, 1.9, phase);
+        color += luminousPool(warped, vec2(0.13, 0.603),
+          vec2(0.315, 0.096), -0.07, 0.48, 0.96, 2.1, phase);
+        color += luminousRibbon(warped,
+          vec2(0.18, 0.732), vec2(1.26, 0.618),
+          -0.008, vec2(0.098, 0.129),
+          1.13, 0.94, 3.1, phase);
+        color += luminousPool(warped, vec2(0.66, 0.755),
+          vec2(0.55, 0.174), -0.10, 0.67, 0.86, 3.6, phase);
+        color += luminousRibbon(warped,
+          vec2(-0.23, 0.851), vec2(1.20, 0.808),
+          -0.065, vec2(0.144, 0.173),
+          0.66, 0.47, 4.2, phase);
+        color += luminousPool(warped, vec2(0.52, 0.961),
+          vec2(0.58, 0.225), 0.03, 0.35, 0.12, 5.1, phase);
+        color += luminousRibbon(warped,
+          vec2(0.90, 0.531), vec2(1.27, 0.482),
+          -0.002, vec2(0.051, 0.049),
+          0.54, 0.95, 5.0, phase);
+
+        // Complex but restrained pearlescent interference where light pools
+        // overlap. Slow and spatially correlated, never strobing or flashing.
+        float interference = 0.5 + 0.5 * sin(
+          3.0 * phase + 10.0 * warped.x - 6.0 * warped.y +
+          1.5 * sin(2.0 * phase + 5.0 * warped.y));
+        color *= 0.955 + 0.065 * interference;
+
+        // Softened low-frequency dark veil creates perceived depth.
+        float veilCoordinate = (p.y - 0.515) / 0.072;
+        float veil = exp(-veilCoordinate * veilCoordinate);
+        color *= 1.0 - 0.16 * veil;
+
+        gl_FragColor = vec4(max(color, vec3(0.0)), 1.0);
+      }
+    `;
+
+    const extractFragment = /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uTexture;
+      void main() {
+        vec3 color = texture2D(uTexture, vUv).rgb;
+        float brightness = max(color.r, max(color.g, color.b));
+        float mask = smoothstep(0.13, 0.65, brightness);
+        gl_FragColor = vec4(color * mask, 1.0);
+      }
+    `;
+
+    const blurFragment = /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uTexture;
+      uniform vec2 uDirection;
+      // Nine-tap separable Gaussian: two passes, low-resolution glow buffer.
+      void main() {
+        vec3 color = texture2D(uTexture, vUv).rgb * 0.2270270270;
+        color += texture2D(uTexture, vUv + 1.3846153846 * uDirection).rgb * 0.3162162162;
+        color += texture2D(uTexture, vUv - 1.3846153846 * uDirection).rgb * 0.3162162162;
+        color += texture2D(uTexture, vUv + 3.2307692308 * uDirection).rgb * 0.0702702703;
+        color += texture2D(uTexture, vUv - 3.2307692308 * uDirection).rgb * 0.0702702703;
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `;
+
+    const compositeFragment = /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uScene;
+      uniform sampler2D uBloom;
+      uniform float uBloomStrength;
+      uniform vec2 uResolution;
+      uniform vec3 uBackground;
+      uniform bool uGreenscreen;
+      uniform bool uAchromatic;
+      uniform bool uAccent;
+      uniform bool uReverse;
+      uniform vec3 uAccentColor;
+      float hash21(vec2 p) {
+        p = fract(p * vec2(123.34, 456.21));
+        p += dot(p, p + 45.32);
+        return fract(p.x * p.y);
+      }
+      void main() {
+        vec3 base = texture2D(uScene, vUv).rgb;
+        vec3 bloom = texture2D(uBloom, vUv).rgb;
+        vec3 radiance = base + uBloomStrength * bloom;
+
+        // Smooth photographic shoulder prevents neon from clipping to white.
+        vec3 color = vec3(1.0) - exp(-radiance * 1.05);
+
+        // The reference has dark corners and a very soft, analog texture.
+        vec2 centered = (vUv - 0.5) * vec2(0.88, 1.0);
+        float vignette = 1.0 - 0.12 * smoothstep(0.18, 0.78, dot(centered, centered));
+        color *= vignette;
+
+        // Composite the background after bloom, keeping the key color clean.
+        float coverage = smoothstep(0.018, 0.24, max(radiance.r, max(radiance.g, radiance.b)));
+        if (uAchromatic) {
+          float shade = dot(color, vec3(0.2126, 0.7152, 0.0722));
+          color = vec3(uReverse ? 1.0 - shade : shade);
+          if (uAccent) {
+            float accent = smoothstep(0.04, 0.4, radiance.r - max(radiance.g, radiance.b));
+            color = mix(color, uAccentColor, accent);
+          }
+        }
+
+        // Static fine-grained dithering: no temporal flicker and no loop seam.
+        float grain = hash21(gl_FragCoord.xy);
+        color += (grain - 0.5) * 0.0068 * coverage;
+        color = mix(uGreenscreen ? vec3(0.0, 1.0, 0.0) : uBackground, color, coverage);
+        gl_FragColor = vec4(max(color, vec3(0.0)), 1.0);
+        #include <colorspace_fragment>
+      }
+    `;
+
+    const makeMaterial = (fragmentShader, uniforms) => new THREE.ShaderMaterial({
+      uniforms,
+      vertexShader,
+      fragmentShader,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+
+    const artMaterial = makeMaterial(artFragment, {
+      uPhase: { value: 0 },
+      uResolution: { value: new THREE.Vector2(1, 1) },
+      uColors: { value: Array.from({ length: 5 }, () => new THREE.Color()) },
+      uPan: { value: new THREE.Vector2() },
+      uAngles: { value: new THREE.Vector2() },
+      uZoom: { value: 1 },
+      uRotation: { value: 0 },
+      uWidth: { value: 1 },
+      uBend: { value: 1 },
+      uSpacing: { value: 1 },
+      uFlow: { value: 1 },
+      uSeed: { value: 0 },
+    });
+    const extractMaterial = makeMaterial(extractFragment, {
+      uTexture: { value: null },
+    });
+    const blurMaterial = makeMaterial(blurFragment, {
+      uTexture: { value: null },
+      uDirection: { value: new THREE.Vector2() },
+    });
+    const compositeMaterial = makeMaterial(compositeFragment, {
+      uScene: { value: null },
+      uBloom: { value: null },
+      uBloomStrength: { value: BLOOM_STRENGTH },
+      uResolution: { value: new THREE.Vector2(1, 1) },
+      uBackground: { value: new THREE.Color('#170f1a') },
+      uGreenscreen: { value: false },
+      uAchromatic: { value: false },
+      uAccent: { value: false },
+      uReverse: { value: false },
+      uAccentColor: { value: new THREE.Color('#ff0000') },
+    });
+
+    const colorType = renderer.extensions.has('EXT_color_buffer_float')
+      ? THREE.HalfFloatType
+      : THREE.UnsignedByteType;
+
+    const makeTarget = (w, h) => new THREE.WebGLRenderTarget(w, h, {
+      type: colorType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+      generateMipmaps: false,
+    });
+    const sceneTarget = makeTarget(1, 1);
+    const extractTarget = makeTarget(1, 1);
+    const blurTarget = makeTarget(1, 1);
+    const bloomTarget = makeTarget(1, 1);
+
+    let fullWidth = 1;
+    let fullHeight = 1;
+    let bloomWidth = 1;
+    let bloomHeight = 1;
+    let lastTime = performance.now();
+    let elapsed = 0;
+
+    // Eleven harmony families plus eight supplied palettes = nineteen presets.
+    // The two achromatic families each support both background polarities.
+    const palettes = {
+      'Original': ['b54bea', '943bd8', '5297ff', '21f6ff', '73ffff', '170f1a'],
+      'Monochromatic': ['253d80', '151f50', '496fd9', '81a8ff', 'dbe8ff', '070b18'],
+      'Analogous': ['793dea', '3b248c', '3f71e8', '22d9dd', 'b0fff0', '090b1c'],
+      'Complementary': ['ee7d32', '963d27', '4644d9', '599eff', 'ffd8a2', '100d1b'],
+      'Split-complementary': ['ba48e0', '64237c', 'e8a43a', '72dc91', 'e7ffc1', '100b17'],
+      'Triadic': ['f05ca1', '703d9a', '58c8ed', 'efd85a', 'fff3af', '100d20'],
+      'Tetradic': ['ce50c4', '6241a5', '4bcece', 'f18e48', 'd6ef87', '100d19'],
+      'Double split-complementary': ['e46e96', '6550b4', '6ab6e5', '7cdbb4', 'f0cb75', '0c101c'],
+      'Achromatic': ['9d9d9d', '575757', 'c4c4c4', 'eeeeee', 'ffffff', '000000'],
+      'Achromatic + Accent': ['b4b4b4', '626262', 'd5d5d5', 'ff0000', 'ff0000', '000000'],
+      'Neutral + accent': ['b9ab99', '68615b', 'dfd8c8', 'e66a36', 'ffe7c2', '151311'],
+      'Amber / Ember': ['F6AA1C', 'BC3908', '941B0C', 'F6AA1C', '220901'],
+      'Sea Glass': ['63D1CF', '5BC0BE', '4BAD9E', '4BAD9E', '0B132B', '000000'],
+      'Orchid': ['AA60C8', 'D69ADE', 'C9A3C6', 'CFB5C2', '0D001D', '120A12'],
+      'Lagoon / Gold': ['FEF1BE', 'FFBA00', '008189', '00474D', '061210'],
+      'Electric Fern': ['D4FFB0', '7FFF00', '00B894', '0A3322', '05140A'],
+      'Tangerine / Plum': ['FFE8CC', 'FF8C00', 'C7501A', '3D1050', '0E0618'],
+      'Velvet Violet': ['E8E0FF', 'B38FFF', '6A3DE8', '1A1250', '090612'],
+      'Cyan / Fuchsia': ['E0FBFF', '00F0FF', 'D40078', '1E0A3D', '05020F'],
+    };
+    const animations = ['Static', 'Liquid flow', 'Slow drift', 'Orbit', 'Pendulum', 'Tidal sweep', 'Figure eight', 'Breathing'];
+    const settings = {
+      palette: 'Original', reverse: false, greenscreen: false, background: '#170f1a',
+      color1: '#b54bea', color2: '#943bd8', color3: '#5297ff', color4: '#21f6ff', color5: '#73ffff',
+      accent: '#ff0000', pixelRatio: Math.min(devicePixelRatio || 1, QUALITY_DPR_CAP),
+      animation: 'Liquid flow', speed: 0.65, cameraMotion: 0.45,
+      zoom: 1, panX: 0, panY: 0, angle: 0, pitch: 0, yaw: 0,
+      width: 1, bend: 1, spacing: 1, flow: 1, seed: 0, bloom: BLOOM_STRENGTH,
+      clickToRandomize: true,
+      randomize: randomizeScene,
+      resetView() {
+        Object.assign(settings, { zoom: 1, panX: 0, panY: 0, angle: 0, pitch: 0, yaw: 0 });
+        refreshPanel();
+      },
+    };
+    const gui = new GUI({ title: 'Neon Liquid Reverie' });
+    const refreshPanel = () => gui.controllersRecursive().forEach(controller => controller.updateDisplay());
+
+    function applyColors() {
+      artMaterial.uniforms.uColors.value.forEach((color, i) => color.set(settings[`color${i + 1}`]));
+      compositeMaterial.uniforms.uBackground.value.set(settings.background);
+      compositeMaterial.uniforms.uAccentColor.value.set(settings.accent);
+    }
+
+    function applyPalette() {
+      const colors = palettes[settings.palette];
+      const foreground = colors.slice(0, -1);
+      for (let i = 0; i < 5; i++) settings[`color${i + 1}`] = '#' + foreground[i % foreground.length];
+      const achromatic = settings.palette.startsWith('Achromatic');
+      settings.background = achromatic ? (settings.reverse ? '#ffffff' : '#000000') : '#' + colors.at(-1);
+      settings.accent = achromatic ? '#ff0000' : settings.color4;
+      applyColors();
+      compositeMaterial.uniforms.uAchromatic.value = achromatic;
+      compositeMaterial.uniforms.uAccent.value = settings.palette === 'Achromatic + Accent';
+      compositeMaterial.uniforms.uReverse.value = settings.reverse;
+      if (settings.palette === 'Original') {
+        const original = [[0.44, 0.070, 0.85], [0.29, 0.055, 0.69], [0.085, 0.31, 1.10], [0.015, 0.92, 1.12], [0.17, 1.01, 1.14]];
+        original.forEach((rgb, i) => {
+          artMaterial.uniforms.uColors.value[i].setRGB(...rgb);
+          settings[`color${i + 1}`] = '#' + artMaterial.uniforms.uColors.value[i].getHexString();
+        });
+      }
+      refreshPanel();
+    }
+
+    function randomizeScene() {
+      const range = (min, max) => Math.round((min + Math.random() * (max - min)) * 100) / 100;
+      const names = Object.keys(palettes).filter(name => name !== settings.palette);
+      Object.assign(settings, {
+        palette: names[Math.floor(Math.random() * names.length)], reverse: Math.random() < 0.5,
+        width: range(0.65, 1.65), bend: range(0.4, 2.8), spacing: range(0.7, 1.3),
+        flow: range(0.4, 2), seed: range(0, 100), bloom: range(0.3, 1),
+        animation: animations[1 + Math.floor(Math.random() * (animations.length - 1))],
+        speed: range(0.25, 0.85), cameraMotion: range(0.2, 0.65),
+      });
+      applyPalette();
+    }
+
+    const colorFolder = gui.addFolder('Colors');
+    colorFolder.add(settings, 'palette', Object.keys(palettes)).name('Color scheme').onChange(applyPalette);
+    colorFolder.add(settings, 'reverse').name('Black on white').onChange(applyPalette);
+    ['Violet rim', 'Deep halo', 'Inner light', 'Liquid core', 'Pearl highlight'].forEach((label, i) => {
+      colorFolder.addColor(settings, `color${i + 1}`).name(label).onChange(() => {
+        compositeMaterial.uniforms.uAchromatic.value = false;
+        compositeMaterial.uniforms.uAccent.value = false;
+        applyColors();
+      });
+    });
+    colorFolder.addColor(settings, 'accent').name('Accent color').onChange(() => {
+      if (!compositeMaterial.uniforms.uAchromatic.value) settings.color4 = settings.accent;
+      applyColors();
+      refreshPanel();
+    });
+    colorFolder.addColor(settings, 'background').name('Background').onChange(applyColors);
+    colorFolder.add(settings, 'greenscreen').name('Greenscreen');
+    const motionFolder = gui.addFolder('Animation');
+    motionFolder.add(settings, 'animation', animations).name('Animation');
+    motionFolder.add(settings, 'speed', 0, 2, 0.01).name('Speed');
+    motionFolder.add(settings, 'cameraMotion', 0, 1, 0.01).name('Camera motion');
+    const shapeFolder = gui.addFolder('Liquid geometry');
+    shapeFolder.add(settings, 'width', 0.4, 2, 0.01).name('Ribbon width');
+    shapeFolder.add(settings, 'bend', 0, 3, 0.01).name('Ribbon bend');
+    shapeFolder.add(settings, 'spacing', 0.5, 1.5, 0.01).name('Ribbon spacing');
+    shapeFolder.add(settings, 'flow', 0, 3, 0.01).name('Flow distortion');
+    shapeFolder.add(settings, 'seed', 0, 100, 0.01).name('Variation seed');
+    shapeFolder.add(settings, 'bloom', 0, 1.5, 0.01).name('Glow');
+    shapeFolder.close();
+    const viewFolder = gui.addFolder('View');
+    viewFolder.add(settings, 'zoom', 0.2, 6, 0.01).name('Zoom');
+    viewFolder.add(settings, 'panX', -3, 3, 0.001).name('Horizontal position');
+    viewFolder.add(settings, 'panY', -3, 3, 0.001).name('Vertical position');
+    viewFolder.add(settings, 'angle', -180, 180, 0.1).name('Camera angle');
+    viewFolder.add(settings, 'pitch', -60, 60, 0.1).name('Camera pitch');
+    viewFolder.add(settings, 'yaw', -60, 60, 0.1).name('Camera yaw');
+    viewFolder.add(settings, 'resetView').name('Reset view');
+    viewFolder.close();
+    gui.add(settings, 'pixelRatio', 0.5, 3, 0.1).name('Pixel Ratio (DPR)').onChange(resize);
+    gui.add(settings, 'clickToRandomize').name('Randomize on click');
+    gui.add(settings, 'randomize').name('New variation');
+    applyPalette();
+
+    // Manual view offsets are independent of every animated camera trajectory.
+    const canvas = renderer.domElement;
+    const pointers = new Map();
+    let gesture = null;
+    let suppressClick = false;
+    const clamp = THREE.MathUtils.clamp;
+    const wrapAngle = value => ((value + 180) % 360 + 360) % 360 - 180;
+    canvas.addEventListener('contextmenu', event => event.preventDefault());
+    canvas.addEventListener('pointerdown', event => {
+      if (event.button !== 0 && event.button !== 2) return;
+      canvas.setPointerCapture(event.pointerId);
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pointers.size === 1) {
+        suppressClick = false;
+        gesture = { x: event.clientX, y: event.clientY, lastX: event.clientX, lastY: event.clientY, rotate: event.button === 2 || event.shiftKey };
+      } else suppressClick = true;
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!pointers.has(event.pointerId)) return;
+      const before = [...pointers.values()];
+      const oldDistance = before.length === 2 ? Math.hypot(before[0].x - before[1].x, before[0].y - before[1].y) : 0;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        if (oldDistance > 0) settings.zoom = clamp(settings.zoom * Math.hypot(a.x - b.x, a.y - b.y) / oldDistance, 0.2, 6);
+        suppressClick = true;
+      } else if (gesture) {
+        const dx = event.clientX - gesture.lastX;
+        const dy = event.clientY - gesture.lastY;
+        if (Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) > 4) suppressClick = true;
+        if (gesture.rotate) {
+          settings.angle = wrapAngle(settings.angle + dx * 0.18);
+          settings.pitch = clamp(settings.pitch + dy * 0.15, -60, 60);
+        } else {
+          settings.panX = clamp(settings.panX + dx / innerWidth, -3, 3);
+          settings.panY = clamp(settings.panY + dy / innerHeight, -3, 3);
+        }
+        gesture.lastX = event.clientX;
+        gesture.lastY = event.clientY;
+      }
+      refreshPanel();
+    });
+    function endPointer(event) {
+      const active = pointers.has(event.pointerId);
+      pointers.delete(event.pointerId);
+      if (active && event.type === 'pointerup' && event.button === 0 && !suppressClick && settings.clickToRandomize) randomizeScene();
+      if (pointers.size === 0) gesture = null;
+      else {
+        const remaining = [...pointers.values()][0];
+        gesture = { ...remaining, lastX: remaining.x, lastY: remaining.y, rotate: false };
+        suppressClick = true;
+      }
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('lostpointercapture', endPointer);
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? innerHeight : 1);
+      settings.zoom = clamp(settings.zoom * Math.exp(-delta * 0.001), 0.2, 6);
+      refreshPanel();
+    }, { passive: false });
+    window.addEventListener('keydown', event => {
+      if (event.key.toLowerCase() !== 'h' || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.target instanceof HTMLElement && (event.target.matches('input, textarea, select') || event.target.isContentEditable)) return;
+      gui.show(gui._hidden);
+    });
+
+    function updateScene(phase) {
+      const u = artMaterial.uniforms;
+      const strength = settings.cameraMotion;
+      let x = 0, y = 0, rotation = 0, pitch = 0, yaw = 0, zoom = 1;
+      switch (settings.animation) {
+        case 'Slow drift': x = 0.07 * Math.sin(phase) * strength; y = 0.035 * Math.sin(phase * 2) * strength; break;
+        case 'Orbit':
+          x = 0.08 * Math.cos(phase) * strength; y = 0.04 * Math.sin(phase) * strength;
+          yaw = 0.18 * Math.sin(phase) * strength; pitch = 0.12 * Math.cos(phase) * strength;
+          rotation = 0.06 * Math.sin(phase) * strength; break;
+        case 'Pendulum': rotation = 0.16 * Math.sin(phase) * strength; break;
+        case 'Tidal sweep': y = 0.10 * Math.sin(phase) * strength; pitch = 0.12 * Math.sin(phase) * strength; break;
+        case 'Figure eight': x = 0.10 * Math.sin(phase) * strength; y = 0.045 * Math.sin(phase * 2) * strength; break;
+        case 'Breathing': zoom = 1 + 0.12 * Math.sin(phase) * strength; break;
+      }
+      u.uPhase.value = settings.animation === 'Static' ? 0 : phase;
+      u.uPan.value.set(settings.panX + x, settings.panY + y);
+      u.uZoom.value = settings.zoom * zoom;
+      u.uRotation.value = THREE.MathUtils.degToRad(settings.angle) + rotation;
+      u.uAngles.value.set(THREE.MathUtils.degToRad(settings.yaw) + yaw, THREE.MathUtils.degToRad(settings.pitch) + pitch);
+      u.uWidth.value = settings.width;
+      u.uBend.value = settings.bend;
+      u.uSpacing.value = settings.spacing;
+      u.uFlow.value = settings.flow;
+      u.uSeed.value = settings.seed;
+      compositeMaterial.uniforms.uBloomStrength.value = settings.bloom;
+      compositeMaterial.uniforms.uGreenscreen.value = settings.greenscreen;
+    }
+
+    function resize() {
+      const dpr = settings.pixelRatio;
+      renderer.setPixelRatio(dpr);
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      const size = new THREE.Vector2();
+      renderer.getDrawingBufferSize(size);
+      fullWidth = Math.max(1, Math.floor(size.x));
+      fullHeight = Math.max(1, Math.floor(size.y));
+      bloomWidth = Math.max(1, Math.floor(fullWidth * 0.5));
+      bloomHeight = Math.max(1, Math.floor(fullHeight * 0.5));
+      sceneTarget.setSize(fullWidth, fullHeight);
+      extractTarget.setSize(bloomWidth, bloomHeight);
+      blurTarget.setSize(bloomWidth, bloomHeight);
+      bloomTarget.setSize(bloomWidth, bloomHeight);
+      artMaterial.uniforms.uResolution.value.set(fullWidth, fullHeight);
+      compositeMaterial.uniforms.uResolution.value.set(fullWidth, fullHeight);
+    }
+    window.addEventListener('resize', resize, { passive: true });
+    resize();
+
+    function pass(material, target) {
+      quad.material = material;
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+    }
+
+    function animate(now) {
+      const delta = Math.min((now - lastTime) * 0.001, 0.1);
+      lastTime = now;
+      if (settings.animation !== 'Static') elapsed = (elapsed + delta * settings.speed) % LOOP_SECONDS;
+      updateScene(TAU * elapsed / LOOP_SECONDS);
+
+      pass(artMaterial, sceneTarget);
+
+      extractMaterial.uniforms.uTexture.value = sceneTarget.texture;
+      pass(extractMaterial, extractTarget);
+
+      blurMaterial.uniforms.uTexture.value = extractTarget.texture;
+      blurMaterial.uniforms.uDirection.value.set(1 / bloomWidth, 0);
+      pass(blurMaterial, blurTarget);
+
+      blurMaterial.uniforms.uTexture.value = blurTarget.texture;
+      blurMaterial.uniforms.uDirection.value.set(0, 1 / bloomHeight);
+      pass(blurMaterial, bloomTarget);
+
+      compositeMaterial.uniforms.uScene.value = sceneTarget.texture;
+      compositeMaterial.uniforms.uBloom.value = bloomTarget.texture;
+      pass(compositeMaterial, null);
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
