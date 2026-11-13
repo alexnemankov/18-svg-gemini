@@ -445,5 +445,1429 @@ DEALINGS IN THE SOFTWARE. -->
   }else request=requestAnimationFrame(frame);
 })();
 </script>
+<script type="module">
+import GUI from 'https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js';
+
+(() => {
+  'use strict';
+  const T = window.THREE || THREE;
+  const TAU = Math.PI * 2, H = 768, LOOP = 18000;
+  const canvas = document.querySelector('canvas');
+
+  // Master parameters
+  const params = {
+    antialias: true,
+    speed: 1.0,
+    dpr: Math.min(window.devicePixelRatio || 1, 2),
+    greenscreen: false,
+    bgColor: '#242d76',
+    colorScheme: 'Original',
+    animation: 'Static (Default)',
+    zoom: 1.0,
+    panX: 0,
+    panY: 0,
+    angleX: 0,
+    angleY: 0,
+    clickReroll: true,
+    // Custom color overrides
+    skyZenith: '#181d58',
+    skyHorizon: '#9978ba',
+    skyWarm: '#ffba8c',
+    waterSurface: '#3db8bf',
+    waterDeep: '#0c2e4d',
+    turbineAccent: '#f59e7d',
+    coralAccent: '#f76a54'
+  };
+
+  let renderer = new T.WebGLRenderer({
+    canvas,
+    antialias: params.antialias,
+    alpha: false,
+    powerPreference: 'high-performance'
+  });
+  renderer.outputColorSpace = T.SRGBColorSpace;
+  renderer.toneMapping = T.NoToneMapping;
+  renderer.getContext().disable(renderer.getContext().DITHER);
+
+  const scene = new T.Scene();
+  const camera = new T.OrthographicCamera(-512, 512, 384, -384, 0.1, 4000);
+  camera.position.set(512, 384, 1800);
+
+  const phase = { value: 0 };
+  const pixelRatio = { value: params.dpr };
+  const rotors = [], boats = [], satellites = [];
+  let seed = 811;
+  const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+  const mix = T.MathUtils.lerp;
+  const point = (x, y, z = 0) => new T.Vector3(x, H - y, z);
+  const finish = `gl_FragColor.rgb = pow(max(gl_FragColor.rgb, vec3(0.)), vec3(2.2));
+    #include <colorspace_fragment>
+  `;
+  const fields = `
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+    float noise(vec2 p) {
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+      return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+1.),f.x),f.y);
+    }
+    float flow(vec2 p, float t) {
+      return sin(p.x*.006+p.y*.009-t)*.57+sin(p.x*.011-p.y*.005+t*2.)*.24
+        +sin(p.x*.003-p.y*.013+t)*.19;
+    }
+  `;
+  const vertex = `varying vec3 vPosition, vNormal; varying vec2 vUv;
+    void main(){vUv=uv;vNormal=normalize(normalMatrix*normal);
+      vec4 w=modelMatrix*vec4(position,1.);vPosition=w.xyz;
+      gl_Position=projectionMatrix*viewMatrix*w;}`;
+
+  function shader(fragment, uniforms = {}, options = {}) {
+    return new T.ShaderMaterial({ vertexShader: vertex, fragmentShader: fragment,
+      uniforms: { uPhase: phase, ...uniforms }, transparent: true, depthWrite: false, depthTest: false,
+      side: T.DoubleSide, ...options });
+  }
+  function flat(hex) { return new T.MeshBasicMaterial({ color: hex, transparent: true, depthTest: false, depthWrite: false, side: T.DoubleSide }); }
+  function mesh(geometry, material, z = 0, parent = scene) {
+    const m = new T.Mesh(geometry, material); m.renderOrder = z; parent.add(m); return m;
+  }
+  function polygon(points, material, z = 0) {
+    const shape = new T.Shape();
+    points.forEach((p,i) => i ? shape.lineTo(p[0],H-p[1]) : shape.moveTo(p[0],H-p[1]));
+    shape.closePath(); return mesh(new T.ShapeGeometry(shape), material, z);
+  }
+  function path(build, material, z) {
+    const s = new T.Shape();
+    const pen = { move:(x,y)=>s.moveTo(x,H-y), line:(x,y)=>s.lineTo(x,H-y),
+      curve:(a,b,c,d,x,y)=>s.bezierCurveTo(a,H-b,c,H-d,x,H-y) };
+    build(pen); s.closePath(); return mesh(new T.ShapeGeometry(s,48),material,z);
+  }
+  function plane(x,y,w,h,material,z) {
+    const m=mesh(new T.PlaneGeometry(w,h),material,z);m.position.copy(point(x,y,z));return m;
+  }
+  function rod(a,b,r1,r2,material,z,parent=scene) {
+    const av=point(...a),bv=point(...b),d=bv.clone().sub(av);
+    const m=mesh(new T.CylinderGeometry(r2,r1,d.length(),16),material,z,parent);
+    m.position.copy(av.add(bv).multiplyScalar(.5));m.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),d.normalize());return m;
+  }
+
+  // --- Dynamic Uniforms ---
+  const uSkyZenith = { value: new T.Color('#181d58') };
+  const uSkyMid = { value: new T.Color('#4059a3') };
+  const uSkyHorizon = { value: new T.Color('#9978ba') };
+  const uSkyPeach = { value: new T.Color('#e891ad') };
+  const uSkyWarm = { value: new T.Color('#ffba8c') };
+  const uSkySunPos = { value: new T.Vector2(870, 220) };
+  const uGreenScreen = { value: 0.0 };
+  const uBgColor = { value: new T.Color('#242d76') };
+
+  const uMountBase = { value: new T.Color('#4a578a') };
+  const uMountPeak = { value: new T.Color('#212e59') };
+  const uMountRidge = { value: new T.Color('#08080d') };
+  const uSnowShadow = { value: new T.Color('#969cc9') };
+  const uSnowHighlight = { value: new T.Color('#e0c2d6') };
+  const uSnowMid = { value: new T.Color('#c9bfdc') };
+
+  const uWaterSurface = { value: new T.Color('#3db8bf') };
+  const uWaterDeep = { value: new T.Color('#0c2e4d') };
+  const uWaterReflection = { value: new T.Color('#a699b8') };
+  const uWaterSheen = { value: new T.Color('#4d80a6') };
+  const uWaterWaveSpeed = { value: 1.0 };
+
+  const uSubmergedDeep = { value: new T.Color('#10384a') };
+  const uSubmergedLight = { value: new T.Color('#296669') };
+  const uSubmergedAmbient = { value: new T.Color('#124052') };
+
+  const uRibbonColor1 = { value: new T.Color('#093d5c') };
+  const uRibbonColor2 = { value: new T.Color('#47bac0') };
+  const uRibbonHighlight = { value: new T.Color('#5eccce') };
+
+  const uSurfaceColor = { value: new T.Color('#9aebeb') };
+
+  const uMetalDark = { value: new T.Color('#103042') };
+  const uMetalLight = { value: new T.Color('#4d9687') };
+  const uMetalRim = { value: new T.Color('#f59e7d') };
+  const uMetalTip = { value: new T.Color('#e89175') };
+
+  const uNacelleDark = { value: new T.Color('#0e1f3b') };
+  const uNacelleLight = { value: new T.Color('#367a73') };
+
+  const uArcColor = { value: new T.Color('#61d4cf') };
+  const uMoteColor = { value: new T.Color('#8fe6dc') };
+  const uStarColor = { value: new T.Color('#d9e0ff') };
+
+  const uCoralBaseDark = { value: new T.Color('#092635') };
+  const uCoralBaseLight = { value: new T.Color('#244a40') };
+  const uCoralGlow = { value: new T.Color('#2b0c03') };
+  const uCoralSwayFactor = { value: 1.0 };
+
+  // --- Shaders and Scene Construction ---
+  const sky = shader(`
+    uniform float uPhase, uGreenScreen;
+    uniform vec3 uSkyZenith, uSkyMid, uSkyHorizon, uSkyPeach, uSkyWarm, uBgColor;
+    uniform vec2 uSkySunPos;
+    varying vec3 vPosition;
+    ${fields}
+    void main(){
+      if (uGreenScreen > 0.5) {
+        gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+        return;
+      }
+      vec2 p = vec2(vPosition.x, 768. - vPosition.y);
+      float y = p.y / 425.;
+      vec2 orbit = vec2(cos(uPhase), sin(uPhase));
+      float n = noise(vec2(p.x * .0018, y * 2.3) + orbit * .17);
+      float t = y + (n - .5) * .067;
+      vec3 c = mix(uSkyZenith, uSkyMid, smoothstep(-.04, .48, t));
+      c = mix(c, uSkyHorizon, smoothstep(.27, .73, t));
+      c = mix(c, uSkyPeach, smoothstep(.60, .94, t));
+      float warm = exp(-pow((p.x - uSkySunPos.x) / 830., 2.)) * smoothstep(.43, .91, t);
+      c = mix(c, uSkyWarm, warm * .88);
+      float lavender = exp(-pow((p.x - 250.) / 620., 2.) - pow((p.y - uSkySunPos.y) / 120., 2.));
+      c = mix(c, uSkyHorizon, lavender * .13);
+      c += uSkyWarm * 0.018 * sin(uPhase - .7) * smoothstep(.45, 1., t);
+      c += (hash(floor(p * 1.7)) - .5) * .016;
+      gl_FragColor = vec4(c, 1.);
+      ${finish}
+    }`, {
+      uSkyZenith, uSkyMid, uSkyHorizon, uSkyPeach, uSkyWarm, uSkySunPos, uGreenScreen, uBgColor
+    });
+  plane(512, 384, 6200, 2800, sky, -1000);
+
+  const starGeo = new T.BufferGeometry(), starPos = [], starData = [];
+  for(let i=0; i<145; i++) {
+    starPos.push(mix(-1800, 2800, random()), H - mix(12, 340, Math.pow(random(), 1.45)), 0);
+    starData.push(mix(.7, 1.45, random()), random() * TAU, mix(.23, .7, random()));
+  }
+  starGeo.setAttribute('position', new T.Float32BufferAttribute(starPos, 3));
+  starGeo.setAttribute('aStar', new T.Float32BufferAttribute(starData, 3));
+  const starMat = new T.ShaderMaterial({
+    uniforms: { uPhase: phase, uDpr: pixelRatio, uStarColor },
+    transparent: true, depthTest: false, depthWrite: false,
+    vertexShader: `attribute vec3 aStar; uniform float uPhase, uDpr; varying float vAlpha;
+      void main(){
+        vAlpha = aStar.z * (.92 + .08 * sin(uPhase + aStar.y));
+        gl_PointSize = aStar.x * uDpr;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+      }`,
+    fragmentShader: `varying float vAlpha; uniform vec3 uStarColor;
+      void main(){
+        float a = 1. - smoothstep(.15, .5, length(gl_PointCoord - .5));
+        gl_FragColor = vec4(uStarColor, a * vAlpha);
+        ${finish}
+      }`
+  });
+  const stars = new T.Points(starGeo, starMat);
+  stars.renderOrder = -900;
+  scene.add(stars);
+
+  const mountain = shader(`
+    varying vec3 vPosition;
+    uniform vec3 uMountBase, uMountPeak, uMountRidge, uSnowShadow, uSnowHighlight, uSnowMid;
+    ${fields}
+    void main(){
+      vec2 p = vec2(vPosition.x, 768. - vPosition.y);
+      float x = p.x, y = p.y;
+      float slope = (x - 511.) / max(12., y - 240.);
+      float ridge = sin(slope * 5.4 + .3 * sin(slope * 9.));
+      vec3 c = mix(uMountBase, uMountPeak, smoothstep(264., 422., y));
+      c += uMountRidge * ridge * smoothstep(262., 345., y);
+      float snowline = 298. + abs(x - 511.) * .15 + sin(x * .105) * 4. + sin(x * .237) * 2.2;
+      snowline += noise(vec2(x * .055, 2.7)) * 7.;
+      float snow = smoothstep(-1.9, 2.2, snowline - y);
+      float side = smoothstep(-1.4, 1.7, slope);
+      vec3 ice = mix(uSnowShadow, uSnowHighlight, side);
+      ice = mix(ice, uSnowMid, exp(-pow((x - 510.) / 21., 2.)) * .40);
+      float gullies = pow(.5 + .5 * sin(slope * 12.7 + sin(slope * 5.) * .4), 9.);
+      float fade = smoothstep(258., 300., y);
+      ice = mix(ice, uSnowShadow * 0.68, gullies * fade * .33);
+      ice -= vec3(.025, .023, .015) * noise(vec2(x * .05, y * .07));
+      c = mix(c, ice, snow);
+      c += (hash(floor(p * 1.5)) - .5) * .011;
+      gl_FragColor = vec4(c, 1.);
+      ${finish}
+    }`, {
+      uMountBase, uMountPeak, uMountRidge, uSnowShadow, uSnowHighlight, uSnowMid
+    });
+  path(p=>{p.move(-300,400);p.curve(185,386,350,331,449,278);
+    p.curve(474,265,492,251,502,249);p.curve(508,247,515,249,521,252);
+    p.curve(549,270,565,287,612,307);p.curve(758,365,996,385,1300,400);
+    p.line(1300,445);p.line(-300,445);},mountain,-700);
+
+  const matHill1 = flat('#28365f');
+  const matHill2 = flat('#202c53');
+  const matHill3 = flat('#19264a');
+  const matTrees = flat('#152442');
+  const matWaterPath = flat('#111f3b');
+  const distantInk = flat('#142c44');
+  const matBuoy = flat('#dd9290');
+
+  path(p=>{p.move(-2400,390);p.curve(-900,345,-100,381,170,365);p.curve(260,355,312,379,385,389);
+    p.curve(483,399,507,369,590,362);p.curve(730,341,797,351,905,353);
+    p.curve(1400,326,2100,371,3400,360);p.line(3400,445);p.line(-2400,445);},matHill1,-650);
+  path(p=>{p.move(-2400,408);p.curve(-1000,373,68,383,233,386);p.curve(345,389,389,414,490,404);
+    p.curve(628,369,676,375,762,371);p.curve(903,354,996,384,1150,377);
+    p.curve(1650,362,2400,398,3400,375);p.line(3400,449);p.line(-2400,449);},matHill2,-640);
+  path(p=>{p.move(-2400,407);p.curve(-1600,397,-180,409,68,402);p.curve(250,396,287,423,380,416);
+    p.curve(462,411,519,397,590,404);p.curve(715,415,792,385,905,382);
+    p.curve(1210,379,2400,405,3400,392);p.line(3400,451);p.line(-2400,451);},matHill3,-630);
+  for(let i=0;i<73;i++) {
+    const x=mix(-1400,2400,random()), y=376+9*Math.sin(x*.004), h=mix(6,22,random());
+    polygon([[x-1.8,y+4],[x-.8,y-h*.35],[x,y-h],[x+1.1,y-h*.3],[x+2.2,y+4]],matTrees,-620);
+  }
+
+  const water = shader(`
+    uniform float uPhase, uWaterWaveSpeed;
+    uniform vec3 uWaterSurface, uWaterDeep, uWaterReflection, uWaterSheen;
+    varying vec3 vPosition;
+    ${fields}
+    void main(){
+      vec2 p = vec2(vPosition.x, 768. - vPosition.y);
+      float d = clamp((p.y - 450.) / 260., 0., 1.);
+      vec3 c = mix(uWaterSurface, uWaterDeep, pow(d, .68));
+      float f = flow(p, uPhase * uWaterWaveSpeed);
+      c += vec3(.012, .027, .035) * f * (1. - d);
+      float reflection = exp(-pow((p.y - 428.) / 18., 2.));
+      c = mix(c, uWaterReflection, reflection * .46);
+      float sheen = sin(p.y * .18 + sin(p.x * .005 + uPhase * uWaterWaveSpeed) * 1.1);
+      c += uWaterSheen * pow(max(0., sheen), 14.) * exp(-pow((p.y - 435.) / 30., 2.));
+      c += (hash(floor(p * 1.8)) - .5) * .012;
+      gl_FragColor = vec4(c, 1.);
+      ${finish}
+    }`, {
+      uWaterSurface, uWaterDeep, uWaterReflection, uWaterSheen, uWaterWaveSpeed
+    });
+  plane(512, 805, 6200, 790, water, -500);
+
+  path(p=>{p.move(402,433);p.curve(485,414,512,413,574,418);p.curve(647,424,704,417,752,409);
+    p.curve(856,389,870,392,928,399);p.curve(1020,414,1140,400,1230,415);p.line(1230,435);p.line(402,435);},matWaterPath,-480);
+
+  const submerged = shader(`
+    uniform float uPhase;
+    uniform vec3 uSubmergedDeep, uSubmergedLight, uSubmergedAmbient;
+    varying vec3 vPosition, vNormal;
+    ${fields}
+    void main(){
+      float y = 768. - vPosition.y;
+      float d = clamp((y - 450.) / 175., 0., 1.);
+      float light = clamp(dot(normalize(vNormal), normalize(vec3(-.7, .4, .8))) * .5 + .5, 0., 1.);
+      vec3 c = mix(uSubmergedDeep, uSubmergedLight, light);
+      c = mix(c, uSubmergedAmbient, d * .42);
+      c += vec3(.015, .05, .04) * flow(vPosition.xy, uPhase);
+      gl_FragColor = vec4(c, .84);
+      ${finish}
+    }`, {
+      uSubmergedDeep, uSubmergedLight, uSubmergedAmbient
+    }, { transparent: true });
+
+  function foundation(x,y,scale,lean=0) {
+    const root=[x+lean,y],joint=[x+lean*1.3,y+74*scale],left=[x-82*scale,y+109*scale],right=[x+83*scale,y+111*scale];
+    rod(root,joint,6*scale,5*scale,submerged,-390);
+    rod(joint,left,4.3*scale,5.6*scale,submerged,-389);
+    rod(joint,right,4.3*scale,5.6*scale,submerged,-388);
+    rod([x+lean,y+6*scale],left,1.9*scale,2.4*scale,submerged,-387);
+    rod([x+lean,y+6*scale],right,1.9*scale,2.4*scale,submerged,-386);
+    rod(left,right,4.2*scale,4.2*scale,submerged,-385);
+    [left,right].forEach(a=>plane(a[0],a[1]+3*scale,24*scale,14*scale,submerged,-384));
+  }
+  foundation(344,454,1.04,-5);
+  foundation(672,453,.79,0);
+  foundation(163,453,.56,0);
+  foundation(886,453,.46,0);
+
+  function ribbon(index) {
+    const positions=[],uvs=[],indices=[],count=160;
+    for(let i=0;i<=count;i++) {
+      const x=mix(-2300,3300,i/count);
+      for(let j=0;j<2;j++){positions.push(x,0,0);uvs.push(i/count,j);}
+      if(i<count){const a=i*2;indices.push(a,a+1,a+2,a+1,a+3,a+2);}
+    }
+    const g=new T.BufferGeometry();
+    g.setAttribute('position',new T.Float32BufferAttribute(positions,3));
+    g.setAttribute('uv',new T.Float32BufferAttribute(uvs,2));
+    g.setIndex(indices);
+    const m=shader(`
+      uniform float uPhase, uIndex;
+      uniform vec3 uRibbonColor1, uRibbonColor2, uRibbonHighlight;
+      varying vec2 vUv; varying vec3 vPosition;
+      ${fields}
+      void main(){
+        float edge=sin(vUv.y*3.14159265);float x=vPosition.x;
+        float traveling=.5+.5*sin(x*.004-uPhase+uIndex*.75);
+        float hue=.5+.5*sin(uIndex*1.9);
+        vec3 c=mix(uRibbonColor1, uRibbonColor2, hue);
+        c=mix(c, uRibbonHighlight, pow(vUv.y,12.)*.4);
+        float a=(.14+.11*traveling)*pow(edge,.65);
+        a+=pow(vUv.y,22.)*(.035+.035*traveling);
+        gl_FragColor=vec4(c,a);
+        ${finish}
+      }`, {
+        uIndex:{value:index},
+        uRibbonColor1, uRibbonColor2, uRibbonHighlight
+      }, {transparent:true});
+    m.vertexShader=`
+      uniform float uPhase,uIndex;varying vec2 vUv;varying vec3 vPosition;
+      ${fields}
+      void main(){
+        vUv=uv;float x=position.x;
+        float crest=467.+uIndex*19.+sin(x*.005+uIndex*.62+sin(uPhase)*.17)*(15.+uIndex*4.)
+          +sin(x*.008-uIndex*.76-uPhase)*13.+flow(vec2(x,450.+uIndex*20.),uPhase)*5.;
+        float width=12.+uIndex*3.;float y=crest+(1.-uv.y)*width;
+        vec3 p=vec3(x,768.-y,0.);vPosition=p;gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.);
+      }`;
+    mesh(g,m,-350+index);
+  }
+  for(let i=0;i<9;i++)ribbon(i);
+
+  const surface=shader(`
+    uniform float uPhase;
+    uniform vec3 uSurfaceColor;
+    varying vec3 vPosition;
+    ${fields}
+    void main(){
+      float x=vPosition.x,y=768.-vPosition.y;
+      float line=453.+sin(x*.009+uPhase)*2.+sin(x*.017-uPhase*2.)*.85;
+      float d=abs(y-line);float a=exp(-d*d*.65)*.66+exp(-d*d*.019)*.10;
+      a*=.66+.24*sin(x*.007+uPhase)+.1*sin(x*.021-uPhase);
+      gl_FragColor=vec4(uSurfaceColor,a);
+      ${finish}
+    }`, { uSurfaceColor }, {transparent:true});
+  plane(512,453,6200,25,surface,100);
+
+  const metal=shader(`
+    uniform float uPhase;
+    uniform vec3 uMetalDark, uMetalLight, uMetalRim, uMetalTip;
+    varying vec3 vPosition,vNormal;varying vec2 vUv;
+    ${fields}
+    void main(){
+      vec3 n=normalize(vNormal);if(n.z<0.)n=-n;
+      float l=clamp(dot(n,normalize(vec3(-.68,.25,.8)))*.55+.48,0.,1.);
+      vec3 c=mix(uMetalDark, uMetalLight, smoothstep(.0,.95,l));
+      float edge=pow(max(0.,dot(n,normalize(vec3(-.82,.36,.44)))),3.);
+      c=mix(c, uMetalRim, edge*.93);
+      float paintedRim=exp(-pow((vUv.x-.65)/.047,2.));
+      c=mix(c, uMetalTip, paintedRim*.78);
+      c+=vec3(.025,.045,.035)*sin(uPhase+vPosition.y*.012)*l;
+      c+=(hash(floor(vPosition.xy*2.))-.5)*.009;
+      gl_FragColor=vec4(c,1.);
+      ${finish}
+    }`, { uMetalDark, uMetalLight, uMetalRim, uMetalTip });
+
+  const nacelleMat=shader(`
+    varying vec3 vNormal;
+    uniform vec3 uNacelleDark, uNacelleLight;
+    void main(){
+      float l=clamp(dot(normalize(vNormal),normalize(vec3(-.6,.6,.7)))*.5+.5,0.,1.);
+      vec3 c=mix(uNacelleDark, uNacelleLight, l);
+      gl_FragColor=vec4(c,1.);
+      ${finish}
+    }`, { uNacelleDark, uNacelleLight });
+
+  const bladeGeometry=(()=>{
+    const pos=[],norm=[],uv=[],idx=[],rings=40,sides=12;
+    for(let i=0;i<=rings;i++) {
+      const t=i/rings, w=(.023+.035*Math.sin(Math.PI*Math.pow(t,.64)))*Math.sqrt(Math.max(0,1-Math.pow(t,15)));
+      const bend=-.115*Math.pow(t,1.55)+.026*Math.sin(t*Math.PI);
+      const twist=.38-.72*t;
+      for(let j=0;j<=sides;j++) {
+        const a=j/sides*TAU,xx=Math.cos(a)*w,zz=Math.sin(a)*w*.35;
+        pos.push(bend+xx*Math.cos(twist)+zz*Math.sin(twist),.045+t*.955,-xx*Math.sin(twist)+zz*Math.cos(twist));
+        uv.push(j/sides,t);
+        if(i<rings&&j<sides){const k=i*(sides+1)+j;idx.push(k,k+sides+1,k+1,k+1,k+sides+1,k+sides+2);}
+      }
+    }
+    const g=new T.BufferGeometry();g.setAttribute('position',new T.Float32BufferAttribute(pos,3));g.setAttribute('uv',new T.Float32BufferAttribute(uv,2));
+    g.setIndex(idx);g.computeVertexNormals();return g;
+  })();
+
+  function turbine(x,y,r,bottom,orientation,offset,flatten=1) {
+    rod([x,y+4],[bottom,453],r*.043,r*.027,metal,40);
+    const housing=mesh(new T.SphereGeometry(r*.12,24,16),nacelleMat,41);
+    housing.scale.set(1.35,.8,.8);housing.position.copy(point(x-r*.11,y+5,0));
+    const assembly=new T.Group();assembly.position.copy(point(x,y,18));assembly.scale.x=flatten;scene.add(assembly);
+    for(let i=0;i<3;i++) {
+      const b=mesh(bladeGeometry,metal,45,assembly);b.scale.setScalar(r);b.rotation.z=i*TAU/3;
+    }
+    const hub=mesh(new T.SphereGeometry(r*.078,24,18),metal,47,assembly);hub.scale.z=.7;hub.position.z=r*.04;
+    rotors.push({assembly,orientation,offset,speedMult:1.0});
+    arcs(x,y,r,offset,flatten);
+  }
+
+  function arcs(x,y,r,offset,flatten) {
+    for(let a=0;a<3;a++) {
+      const pos=[],uv=[],indices=[],segments=144;
+      for(let i=0;i<=segments;i++) {
+        const t=i/segments,angle=t*TAU;
+        for(let j=0;j<2;j++){
+          const radius=r*(1.055+a*.084)+(j-.5)*(a===0?2.2:1.3);
+          pos.push(x+Math.cos(angle)*radius*flatten,H-y+Math.sin(angle)*radius,0);uv.push(t,j);
+        }
+        if(i<segments){const k=i*2;indices.push(k,k+1,k+2,k+1,k+3,k+2);}
+      }
+      const g=new T.BufferGeometry();g.setAttribute('position',new T.Float32BufferAttribute(pos,3));g.setAttribute('uv',new T.Float32BufferAttribute(uv,2));g.setIndex(indices);
+      const mat=shader(`
+        uniform float uPhase,uOffset,uArc;
+        uniform vec3 uArcColor;
+        varying vec2 vUv;varying vec3 vPosition;
+        void main(){
+          float t=vUv.x*6.2831853;
+          float broken=smoothstep(.05,.48,sin(t*2.+uArc*1.7+uOffset));
+          float envelope=pow(.5+.5*cos(t-uPhase-uOffset-uArc*.55),3.);
+          float a=broken*(.04+.20*envelope)*(1.-uArc*.19);
+          a*=mix(1.,.30,smoothstep(448.,475.,768.-vPosition.y));
+          gl_FragColor=vec4(uArcColor,a);
+          ${finish}
+        }`,{uOffset:{value:offset},uArc:{value:a},uArcColor},{transparent:true});
+      mesh(g,mat,15);
+    }
+  }
+
+  turbine(155,360,76,163,-.31,.9,.92);
+  turbine(676,359,96,672,-.72,2.3,1.0);
+  turbine(891,380,66,886,.12,3.9,.90);
+  turbine(367,315,173,344,.43,0,1);
+
+  function boat(x,y,s,style) {
+    const group=new T.Group();scene.add(group);
+    function shape(points,mat=distantInk) {const m=polygon(points,mat,-430);scene.remove(m);group.add(m);}
+    shape([[x-30*s,y],[x+34*s,y],[x+22*s,y+9*s],[x-21*s,y+9*s]]);
+    if(style===0){shape([[x-7*s,y],[x-7*s,y-12*s],[x+13*s,y-12*s],[x+13*s,y]]);
+      shape([[x+2*s,y-12*s],[x+2*s,y-27*s],[x+3.5*s,y-27*s],[x+3.5*s,y-12*s]]);}
+    else {shape([[x-15*s,y],[x-14*s,y-7*s],[x-12*s,y-7*s],[x-10*s,y]]);
+      shape([[x+11*s,y],[x+12*s,y-9*s],[x+14*s,y-9*s],[x+15*s,y]]);}
+    boats.push({group,offset:x*.01});
+  }
+  boat(230,423,.92,0);boat(398,421,.65,1);boat(811,430,.49,1);
+
+  [78,788].forEach((x,i)=>{
+    polygon([[x-7,439+i*5],[x+7,439+i*5],[x+3,435+i*5],[x-3,435+i*5]],distantInk,-420);
+    polygon([[x-3,435+i*5],[x+3,435+i*5],[x+1,425+i*5],[x-1,425+i*5]],distantInk,-419);
+    const b=mesh(new T.CircleGeometry(1.6,10),matBuoy,-418);b.position.copy(point(x,424+i*5));
+  });
+
+  function satellite(x,y,angle,s) {
+    const group=new T.Group();group.position.copy(point(x,y));group.rotation.z=angle;scene.add(group);
+    const panel=shader(`varying vec2 vUv;void main(){
+      float grid=step(.045,fract(vUv.x*3.))*step(.035,fract(vUv.y*2.));
+      vec3 c=mix(vec3(.28,.44,.57),vec3(.19,.33,.48),grid);gl_FragColor=vec4(c,.62);${finish}}`,{},{transparent:true});
+    for(const side of [-1,1]){const p=mesh(new T.PlaneGeometry(13*s,8*s),panel,-850,group);p.position.x=side*13*s;}
+    const body=mesh(new T.BoxGeometry(6*s,13*s,4*s),metal,-849,group);body.rotation.z=.25;
+    satellites.push({group,angle});
+  }
+  satellite(192,99,.51,.84);satellite(801,129,-.54,.84);
+
+  const moteGeo=new T.BufferGeometry(),motes=[],moteInfo=[];
+  for(let i=0;i<210;i++) {
+    const main=i<130,hub=main?[367,315,184]:[676,359,111];const a=random()*TAU,r=hub[2]+mix(-7,12,random());
+    motes.push(hub[0],hub[1],r);moteInfo.push(a,random(),main?0:1);
+  }
+  moteGeo.setAttribute('position',new T.Float32BufferAttribute(motes,3));moteGeo.setAttribute('aMote',new T.Float32BufferAttribute(moteInfo,3));
+  const moteMat=new T.ShaderMaterial({
+    uniforms:{uPhase:phase,uDpr:pixelRatio,uMoteColor},transparent:true,depthWrite:false,depthTest:false,
+    vertexShader:`attribute vec3 aMote;uniform float uPhase,uDpr;varying float vAlpha;
+      void main(){float a=aMote.x+uPhase;float r=position.z+sin(a*3.+aMote.y*6.28)*3.;
+        vec3 p=vec3(position.x+cos(a)*r,768.-position.y+sin(a)*r,0.);
+        vAlpha=(.12+.28*pow(.5+.5*sin(a*2.+uPhase+aMote.y*6.28),3.))*(.4+.6*aMote.y);
+        gl_PointSize=(.6+aMote.y*.8)*uDpr;gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.);}`,
+    fragmentShader:`varying float vAlpha; uniform vec3 uMoteColor;
+      void main(){float a=1.-smoothstep(.1,.5,length(gl_PointCoord-.5));
+        gl_FragColor=vec4(uMoteColor,a*vAlpha);${finish}}`});
+  const particles=new T.Points(moteGeo,moteMat);particles.renderOrder=17;particles.frustumCulled=false;scene.add(particles);
+
+  const coralBase=(()=>{
+    const pos=[],uv=[],idx=[],rings=48,sides=12;
+    for(let i=0;i<=rings;i++)for(let j=0;j<=sides;j++){
+      const t=i<=32?i/32*.9:.9+.1*Math.sin((i-32)/16*Math.PI/2);
+      const a=j/sides*TAU;pos.push(Math.cos(a),t,Math.sin(a));uv.push(j/sides,t);
+      if(i<rings&&j<sides){const k=i*(sides+1)+j;idx.push(k,k+1,k+sides+1,k+1,k+sides+2,k+sides+1);}
+    }
+    const g=new T.InstancedBufferGeometry();g.setAttribute('position',new T.Float32BufferAttribute(pos,3));g.setAttribute('uv',new T.Float32BufferAttribute(uv,2));g.setIndex(idx);return g;
+  })();
+  const roots=[],forms=[],tints=[],defaultCoralPalettes=[[.98,.39,.39],[.98,.47,.37],[1.,.56,.29],[.94,.35,.40],[1.,.62,.29],[.90,.40,.45]];
+  for(let row=0;row<5;row++) {
+    const step=16+row*5.4;
+    for(let x=-2300;x<3300;x+=step) {
+      const xx=x+mix(-10,10,random()),center=Math.exp(-Math.pow((xx-430)/185,2.));
+      const right=1/(1+Math.exp(-(xx-740)/90));
+      const top=552+66*center-65*right+18*Math.sin(xx*.006)+row*15+random()*54;
+      const base=738+row*26+random()*24,h=base-top;
+      const width=mix(9,16,random())*(.74+row*.16);
+      const lean=mix(14,72,random())*(.6+row*.2);
+      roots.push(xx,H-base,250+row*3);forms.push(h,width,lean,random()*TAU);
+      const c=defaultCoralPalettes[Math.floor(random()*defaultCoralPalettes.length)];const shade=.77+row*.055;
+      tints.push(c[0]*shade,c[1]*shade,c[2]*shade);
+    }
+  }
+  coralBase.setAttribute('aRoot',new T.InstancedBufferAttribute(new Float32Array(roots),3));
+  coralBase.setAttribute('aForm',new T.InstancedBufferAttribute(new Float32Array(forms),4));
+  coralBase.setAttribute('aTint',new T.InstancedBufferAttribute(new Float32Array(tints),3));coralBase.instanceCount=forms.length/4;
+  const coralMat=new T.ShaderMaterial({
+    uniforms:{uPhase:phase, uCoralBaseDark, uCoralBaseLight, uCoralGlow, uCoralSwayFactor},
+    transparent:true,side:T.DoubleSide,depthTest:true,depthWrite:true,
+    vertexShader:`attribute vec3 aRoot,aTint;attribute vec4 aForm;
+      uniform float uPhase, uCoralSwayFactor;
+      varying vec3 vTint,vNormal;varying float vHeight,vShade;${fields}
+      void main(){float t=position.y;float cap=sqrt(max(0.,1.-pow(max(0.,(t-.9)/.1),2.)));
+        float w=aForm.y*(.64+.36*sin(t*1.5708))*cap;
+        float delay=(aRoot.z-250.)*.13;
+        float f=flow(vec2(aRoot.x,768.-aRoot.y),uPhase-delay);
+        float sway=(f*5.+sin(uPhase*2.+aForm.w)*1.2)*pow(t,2.2)*(aForm.x/180.)*uCoralSwayFactor;
+        float bend=aForm.z*(.26*t+.74*t*t)+sway;
+        vec3 p=aRoot+vec3(position.x*w+bend,t*aForm.x,position.z*w*.52);
+        p.y-=(1.-smoothstep(0.,.23,t))*180.;
+        vNormal=normalize(vec3(position.x,-aForm.z/aForm.x*.5,position.z));
+        vTint=aTint;vHeight=t;vShade=f;
+        gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.);}`,
+    fragmentShader:`varying vec3 vTint,vNormal;varying float vHeight,vShade;
+      uniform vec3 uCoralBaseDark, uCoralBaseLight, uCoralGlow;
+      void main(){vec3 n=normalize(vNormal);float l=clamp(dot(n,normalize(vec3(-.5,.25,1.)))*.5+.5,0.,1.);
+        vec3 base=mix(uCoralBaseDark, uCoralBaseLight, l);
+        float warm=smoothstep(.18,.97,vHeight);
+        vec3 c=mix(base,vTint,warm);
+        c*=.58+.42*l;
+        c+=uCoralGlow*pow(l,4.)*warm;
+        c+=vec3(.008,.024,.023)*vShade*(1.-warm);
+        gl_FragColor=vec4(c,1.);${finish}}`});
+  const coral=mesh(coralBase,coralMat,250);coral.frustumCulled=false;
+
+  function updateCoralTints(pal) {
+    const tintAttr = coralBase.getAttribute('aTint');
+    if (!tintAttr) return;
+    const arr = tintAttr.array;
+    let idx = 0;
+    const totalInstances = coralBase.instanceCount;
+    let localSeed = 811;
+    const lrand = () => { localSeed = (Math.imul(localSeed, 1664525) + 1013904223) >>> 0; return localSeed / 4294967296; };
+    for (let row = 0; row < 5; row++) {
+      const step = 16 + row * 5.4;
+      for (let x = -2300; x < 3300; x += step) {
+        if (idx >= totalInstances) break;
+        const c = pal[Math.floor(lrand() * pal.length)];
+        const shade = 0.77 + row * 0.055;
+        arr[idx * 3] = c[0] * shade;
+        arr[idx * 3 + 1] = c[1] * shade;
+        arr[idx * 3 + 2] = c[2] * shade;
+        idx++;
+      }
+    }
+    tintAttr.needsUpdate = true;
+  }
+
+  // --- 19 Preconfigured Color Schemes ---
+  const COLOR_SCHEMES = {
+    'Original': {
+      bgColor: '#242d76',
+      skyZenith: '#181d58', skyMid: '#4059a3', skyHorizon: '#9978ba', skyPeach: '#e891ad', skyWarm: '#ffba8c',
+      mountBase: '#4a578a', mountPeak: '#212e59', mountRidge: '#08080d',
+      snowShadow: '#969cc9', snowHighlight: '#e0c2d6', snowMid: '#c9bfdc',
+      hills: ['#28365f', '#202c53', '#19264a', '#152442'],
+      waterSurface: '#3db8bf', waterDeep: '#0c2e4d', waterReflection: '#a699b8', waterSheen: '#4d80a6',
+      waterPath: '#111f3b',
+      submergedDeep: '#10384a', submergedLight: '#296669', submergedAmbient: '#124052',
+      ribbon1: '#093d5c', ribbon2: '#47bac0', ribbonHighlight: '#5eccce',
+      surfaceLine: '#9aebeb',
+      metalDark: '#103042', metalLight: '#4d9687', metalRim: '#f59e7d', metalTip: '#e89175',
+      nacelleDark: '#0e1f3b', nacelleLight: '#367a73',
+      arcColor: '#61d4cf', moteColor: '#8fe6dc', starColor: '#d9e0ff',
+      boatColor: '#142c44', buoyColor: '#dd9290',
+      coralBaseDark: '#092635', coralBaseLight: '#244a40', coralGlow: '#2b0c03',
+      coralPalettes: [[.98,.39,.39],[.98,.47,.37],[1.,.56,.29],[.94,.35,.40],[1.,.62,.29],[.90,.40,.45]]
+    },
+    'Monochromatic': {
+      bgColor: '#09152b',
+      skyZenith: '#060e1f', skyMid: '#122c54', skyHorizon: '#214e8c', skyPeach: '#3873c4', skyWarm: '#6ca7f5',
+      mountBase: '#1a3b6b', mountPeak: '#0d2242', mountRidge: '#050d1a',
+      snowShadow: '#5482bf', snowHighlight: '#9ec4f7', snowMid: '#7ca8e8',
+      hills: ['#0d2242', '#091a33', '#061224', '#040d1a'],
+      waterSurface: '#2463b8', waterDeep: '#081a38', waterReflection: '#4a7fc7', waterSheen: '#306cb8',
+      waterPath: '#07162e',
+      submergedDeep: '#071833', submergedLight: '#18447d', submergedAmbient: '#0d2852',
+      ribbon1: '#0d2d5c', ribbon2: '#2868c7', ribbonHighlight: '#599aff',
+      surfaceLine: '#75adff',
+      metalDark: '#0a1d38', metalLight: '#1e5296', metalRim: '#69aaff', metalTip: '#8dc1ff',
+      nacelleDark: '#061326', nacelleLight: '#16437d',
+      arcColor: '#4f96ff', moteColor: '#80b5ff', starColor: '#bde0ff',
+      boatColor: '#07162c', buoyColor: '#5498ff',
+      coralBaseDark: '#040d1a', coralBaseLight: '#0d2b54', coralGlow: '#0a2347',
+      coralPalettes: [[.2,.55,.95],[.3,.7,1.],[.15,.45,.85],[.4,.8,1.],[.1,.35,.75],[.25,.6,.9]]
+    },
+    'Analogous': {
+      bgColor: '#041c16',
+      skyZenith: '#021a15', skyMid: '#0a3d32', skyHorizon: '#166654', skyPeach: '#28947b', skyWarm: '#4ce0bc',
+      mountBase: '#105244', mountPeak: '#072e26', mountRidge: '#031410',
+      snowShadow: '#3ea890', snowHighlight: '#91f0da', snowMid: '#63dbbf',
+      hills: ['#093b30', '#062b23', '#041f19', '#021410'],
+      waterSurface: '#19997e', waterDeep: '#052920', waterReflection: '#3dbda1', waterSheen: '#28a387',
+      waterPath: '#04211a',
+      submergedDeep: '#062b22', submergedLight: '#146351', submergedAmbient: '#0a3d32',
+      ribbon1: '#0b4a3c', ribbon2: '#20a889', ribbonHighlight: '#59ffd7',
+      surfaceLine: '#52f7ce',
+      metalDark: '#083329', metalLight: '#197862', metalRim: '#45f0c6', metalTip: '#6efad7',
+      nacelleDark: '#04211a', nacelleLight: '#105e4d',
+      arcColor: '#36f0c2', moteColor: '#70ffdb', starColor: '#c2fff0',
+      boatColor: '#05241d', buoyColor: '#36f0c2',
+      coralBaseDark: '#021410', coralBaseLight: '#093d30', coralGlow: '#062920',
+      coralPalettes: [[.2,.85,.45],[.1,.75,.35],[.3,.95,.6],[.15,.7,.5],[.4,1.,.55],[.1,.8,.4]]
+    },
+    'Complementary': {
+      bgColor: '#120f26',
+      skyZenith: '#100b29', skyMid: '#24154a', skyHorizon: '#491b61', skyPeach: '#9e3a62', skyWarm: '#ff8a47',
+      mountBase: '#3b1c4a', mountPeak: '#1e0c29', mountRidge: '#0d0414',
+      snowShadow: '#854d80', snowHighlight: '#ffc7a8', snowMid: '#c77b94',
+      hills: ['#291238', '#1e0c2b', '#14071f', '#0d0414'],
+      waterSurface: '#0ea5b5', waterDeep: '#052633', waterReflection: '#9c546b', waterSheen: '#1db5c4',
+      waterPath: '#041f2b',
+      submergedDeep: '#062633', submergedLight: '#12576b', submergedAmbient: '#093647',
+      ribbon1: '#07364a', ribbon2: '#1692ad', ribbonHighlight: '#32cde8',
+      surfaceLine: '#45e1fa',
+      metalDark: '#092430', metalLight: '#16576b', metalRim: '#ff7733', metalTip: '#ff9955',
+      nacelleDark: '#071c26', nacelleLight: '#104554',
+      arcColor: '#ff8844', moteColor: '#ffaa66', starColor: '#ffe4cc',
+      boatColor: '#170c24', buoyColor: '#ff6622',
+      coralBaseDark: '#041821', coralBaseLight: '#0d3847', coralGlow: '#421606',
+      coralPalettes: [[1.,.4,.1],[1.,.55,.2],[.95,.3,.15],[1.,.65,.25],[.9,.25,.05],[1.,.48,.18]]
+    },
+    'Split-complementary': {
+      bgColor: '#0a1420',
+      skyZenith: '#07101c', skyMid: '#10273b', skyHorizon: '#1a445e', skyPeach: '#9e4a3b', skyWarm: '#fca338',
+      mountBase: '#1a364a', mountPeak: '#0d1e2b', mountRidge: '#060f17',
+      snowShadow: '#4a6f87', snowHighlight: '#fad498', snowMid: '#b89379',
+      hills: ['#132b3d', '#0e202e', '#091621', '#060f17'],
+      waterSurface: '#198596', waterDeep: '#082530', waterReflection: '#87534c', waterSheen: '#2ba4b5',
+      waterPath: '#061d26',
+      submergedDeep: '#072430', submergedLight: '#154e63', submergedAmbient: '#0c3545',
+      ribbon1: '#093a4a', ribbon2: '#1d889e', ribbonHighlight: '#4ec1d4',
+      surfaceLine: '#6adbed',
+      metalDark: '#09212b', metalLight: '#1a5466', metalRim: '#f24444', metalTip: '#f79928',
+      nacelleDark: '#061a21', nacelleLight: '#134657',
+      arcColor: '#f77731', moteColor: '#ffd152', starColor: '#fff0cc',
+      boatColor: '#0a1d29', buoyColor: '#f23838',
+      coralBaseDark: '#051821', coralBaseLight: '#0e3442', coralGlow: '#45100a',
+      coralPalettes: [[.95,.15,.25],[1.,.7,.1],[.9,.2,.3],[1.,.6,.05],[.8,.1,.2],[.98,.75,.2]]
+    },
+    'Triadic': {
+      bgColor: '#170a24',
+      skyZenith: '#10061c', skyMid: '#2d0e4a', skyHorizon: '#57187a', skyPeach: '#ab227b', skyWarm: '#ffc83b',
+      mountBase: '#3d1659', mountPeak: '#200933', mountRidge: '#0e0317',
+      snowShadow: '#794096', snowHighlight: '#ffd980', snowMid: '#c46cb8',
+      hills: ['#2e0f42', '#210930', '#160521', '#0e0317'],
+      waterSurface: '#0db3a5', waterDeep: '#042e30', waterReflection: '#8f3377', waterSheen: '#15cfc0',
+      waterPath: '#032426',
+      submergedDeep: '#052e30', submergedLight: '#116361', submergedAmbient: '#0a4242',
+      ribbon1: '#074240', ribbon2: '#169994', ribbonHighlight: '#3ae3dc',
+      surfaceLine: '#57f2eb',
+      metalDark: '#1a092b', metalLight: '#4d1e70', metalRim: '#ffbe26', metalTip: '#ff4d94',
+      nacelleDark: '#120521', nacelleLight: '#3a1357',
+      arcColor: '#ff4da6', moteColor: '#ffd447', starColor: '#ffe4f0',
+      boatColor: '#1a0729', buoyColor: '#ff2e8c',
+      coralBaseDark: '#0e0417', coralBaseLight: '#2b0b42', coralGlow: '#420833',
+      coralPalettes: [[.95,.2,.75],[1.,.8,.1],[.85,.15,.65],[.98,.25,.85],[1.,.7,.15],[.75,.1,.55]]
+    },
+    'Tetradic': {
+      bgColor: '#12091f',
+      skyZenith: '#0c0517', skyMid: '#250d3b', skyHorizon: '#4d1a66', skyPeach: '#a82069', skyWarm: '#ff9933',
+      mountBase: '#38164a', mountPeak: '#1c0829', mountRidge: '#0d0314',
+      snowShadow: '#75408a', snowHighlight: '#c9ff66', snowMid: '#a86196',
+      hills: ['#280f36', '#1d0929', '#14051c', '#0d0314'],
+      waterSurface: '#12a4d9', waterDeep: '#062638', waterReflection: '#853163', waterSheen: '#24bee8',
+      waterPath: '#041d2e',
+      submergedDeep: '#06283b', submergedLight: '#155b7d', submergedAmbient: '#0d3d57',
+      ribbon1: '#093d5c', ribbon2: '#1e8bbd', ribbonHighlight: '#52c6fc',
+      surfaceLine: '#6ed1ff',
+      metalDark: '#140c24', metalLight: '#371e5c', metalRim: '#ffaa2b', metalTip: '#99ff33',
+      nacelleDark: '#0e071c', nacelleLight: '#281445',
+      arcColor: '#77ff33', moteColor: '#ffc44d', starColor: '#fff5d6',
+      boatColor: '#120921', buoyColor: '#ff3388',
+      coralBaseDark: '#080312', coralBaseLight: '#1d0b30', coralGlow: '#1a4208',
+      coralPalettes: [[.65,1.,.1],[.55,.9,.05],[.75,1.,.2],[.8,1.,.3],[.45,.85,.0],[.6,1.,.15]]
+    },
+    'Double split-complementary': {
+      bgColor: '#140c24',
+      skyZenith: '#0d061c', skyMid: '#261142', skyHorizon: '#491f69', skyPeach: '#993d66', skyWarm: '#fca758',
+      mountBase: '#3d1c54', mountPeak: '#1f0c2e', mountRidge: '#0f0517',
+      snowShadow: '#784d8f', snowHighlight: '#ffe2a6', snowMid: '#b8708c',
+      hills: ['#2b123d', '#1e0b2c', '#150621', '#0f0517'],
+      waterSurface: '#13a8b5', waterDeep: '#062933', waterReflection: '#824761', waterSheen: '#22c2cf',
+      waterPath: '#041f26',
+      submergedDeep: '#062b36', submergedLight: '#16616e', submergedAmbient: '#0e434f',
+      ribbon1: '#0a424f', ribbon2: '#1f97a8', ribbonHighlight: '#4fd3e3',
+      surfaceLine: '#6be7f5',
+      metalDark: '#120c24', metalLight: '#2f204d', metalRim: '#ff6b4a', metalTip: '#f7af3e',
+      nacelleDark: '#0e081c', nacelleLight: '#24173d',
+      arcColor: '#ff8a54', moteColor: '#ffd166', starColor: '#fff3db',
+      boatColor: '#140b24', buoyColor: '#f74848',
+      coralBaseDark: '#080412', coralBaseLight: '#1f0d36', coralGlow: '#3d140a',
+      coralPalettes: [[1.,.45,.2],[.95,.3,.4],[1.,.6,.25],[.9,.2,.35],[1.,.52,.15],[.85,.25,.45]]
+    },
+    'Achromatic': {
+      bgColor: '#080808',
+      skyZenith: '#050505', skyMid: '#1c1c1c', skyHorizon: '#3d3d3d', skyPeach: '#757575', skyWarm: '#cccccc',
+      mountBase: '#474747', mountPeak: '#242424', mountRidge: '#0f0f0f',
+      snowShadow: '#8a8a8a', snowHighlight: '#f5f5f5', snowMid: '#cccccc',
+      hills: ['#303030', '#242424', '#171717', '#0f0f0f'],
+      waterSurface: '#7a7a7a', waterDeep: '#141414', waterReflection: '#5e5e5e', waterSheen: '#9e9e9e',
+      waterPath: '#121212',
+      submergedDeep: '#171717', submergedLight: '#424242', submergedAmbient: '#2b2b2b',
+      ribbon1: '#262626', ribbon2: '#616161', ribbonHighlight: '#a8a8a8',
+      surfaceLine: '#d6d6d6',
+      metalDark: '#1a1a1a', metalLight: '#4f4f4f', metalRim: '#e6e6e6', metalTip: '#ffffff',
+      nacelleDark: '#121212', nacelleLight: '#3d3d3d',
+      arcColor: '#d6d6d6', moteColor: '#f0f0f0', starColor: '#ffffff',
+      boatColor: '#1a1a1a', buoyColor: '#e0e0e0',
+      coralBaseDark: '#0d0d0d', coralBaseLight: '#292929', coralGlow: '#404040',
+      coralPalettes: [[.95,.95,.95],[.85,.85,.85],[.7,.7,.7],[1.,1.,1.],[.6,.6,.6],[.8,.8,.8]]
+    },
+    'Achromatic + Accent': {
+      bgColor: '#080808',
+      skyZenith: '#050505', skyMid: '#1a1a1a', skyHorizon: '#383838', skyPeach: '#636363', skyWarm: '#b0b0b0',
+      mountBase: '#3d3d3d', mountPeak: '#1f1f1f', mountRidge: '#0a0a0a',
+      snowShadow: '#7a7a7a', snowHighlight: '#f0f0f0', snowMid: '#bfbfbf',
+      hills: ['#2b2b2b', '#1f1f1f', '#141414', '#0a0a0a'],
+      waterSurface: '#616161', waterDeep: '#121212', waterReflection: '#4a4a4a', waterSheen: '#8c8c8c',
+      waterPath: '#0f0f0f',
+      submergedDeep: '#141414', submergedLight: '#3b3b3b', submergedAmbient: '#242424',
+      ribbon1: '#212121', ribbon2: '#525252', ribbonHighlight: '#8f8f8f',
+      surfaceLine: '#c4c4c4',
+      metalDark: '#171717', metalLight: '#3d3d3d', metalRim: '#ff173d', metalTip: '#ff3355',
+      nacelleDark: '#0f0f0f', nacelleLight: '#2e2e2e',
+      arcColor: '#ff264a', moteColor: '#ff4d6a', starColor: '#ffffff',
+      boatColor: '#141414', buoyColor: '#ff173d',
+      coralBaseDark: '#0a0a0a', coralBaseLight: '#1f1f1f', coralGlow: '#4a050f',
+      coralPalettes: [[1.,.05,.15],[.9,.0,.1],[1.,.2,.3],[.8,.0,.05],[1.,.1,.2],[.95,.05,.12]]
+    },
+    'Neutral + Accent': {
+      bgColor: '#171615',
+      skyZenith: '#121110', skyMid: '#2e2a27', skyHorizon: '#57504a', skyPeach: '#8c8177', skyWarm: '#d6c8b8',
+      mountBase: '#524b45', mountPeak: '#292522', mountRidge: '#141211',
+      snowShadow: '#8f857a', snowHighlight: '#faeee1', snowMid: '#c4baa9',
+      hills: ['#38332f', '#2b2724', '#1f1c1a', '#141211'],
+      waterSurface: '#4a6966', waterDeep: '#171e1d', waterReflection: '#6b645c', waterSheen: '#6e9491',
+      waterPath: '#141716',
+      submergedDeep: '#161c1b', submergedLight: '#3a4746', submergedAmbient: '#242d2c',
+      ribbon1: '#233331', ribbon2: '#476e6a', ribbonHighlight: '#00f5d4',
+      surfaceLine: '#57fcd8',
+      metalDark: '#1f1c1a', metalLight: '#47403a', metalRim: '#00f5d4', metalTip: '#52fce1',
+      nacelleDark: '#171412', nacelleLight: '#38322c',
+      arcColor: '#00f5d4', moteColor: '#52fce1', starColor: '#faeee1',
+      boatColor: '#171412', buoyColor: '#00f5d4',
+      coralBaseDark: '#12100e', coralBaseLight: '#2e2924', coralGlow: '#00332c',
+      coralPalettes: [[0.,.96,.83],[.1,.85,.75],[.25,1.,.9],[0.,.75,.65],[.35,1.,.92],[0.,.9,.8]]
+    },
+    'Sunset Bronze (F6AA1C)': {
+      bgColor: '#220901',
+      skyZenith: '#220901', skyMid: '#5c1409', skyHorizon: '#941b0c', skyPeach: '#bc3908', skyWarm: '#f6aa1c',
+      mountBase: '#6e170c', mountPeak: '#380c05', mountRidge: '#170501',
+      snowShadow: '#a63417', snowHighlight: '#ffd382', snowMid: '#d66729',
+      hills: ['#471008', '#360b05', '#260703', '#170501'],
+      waterSurface: '#941b0c', waterDeep: '#1f0701', waterReflection: '#bd4b1c', waterSheen: '#f6aa1c',
+      waterPath: '#1a0501',
+      submergedDeep: '#260902', submergedLight: '#61160a', submergedAmbient: '#3d0d04',
+      ribbon1: '#4a1107', ribbon2: '#9e2b0e', ribbonHighlight: '#f6aa1c',
+      surfaceLine: '#fca338',
+      metalDark: '#2b0a03', metalLight: '#69180b', metalRim: '#f6aa1c', metalTip: '#ffc966',
+      nacelleDark: '#1c0601', nacelleLight: '#4d1107',
+      arcColor: '#f6aa1c', moteColor: '#ffc559', starColor: '#ffe5b3',
+      boatColor: '#1f0701', buoyColor: '#f6aa1c',
+      coralBaseDark: '#170501', coralBaseLight: '#420e06', coralGlow: '#661505',
+      coralPalettes: [[.96,.67,.11],[.74,.22,.03],[.58,.11,.05],[.96,.67,.11],[.85,.35,.06],[1.,.75,.2]]
+    },
+    'Abyssal Mint (63D1CF)': {
+      bgColor: '#000000',
+      skyZenith: '#000000', skyMid: '#060a17', skyHorizon: '#0b132b', skyPeach: '#225e5b', skyWarm: '#63d1cf',
+      mountBase: '#1a3b3a', mountPeak: '#0b1624', mountRidge: '#020408',
+      snowShadow: '#368076', snowHighlight: '#b8faf8', snowMid: '#6ed1c6',
+      hills: ['#0f2429', '#0b1821', '#061017', '#02060a'],
+      waterSurface: '#4bad9e', waterDeep: '#051217', waterReflection: '#2e6b66', waterSheen: '#5bc0be',
+      waterPath: '#040d12',
+      submergedDeep: '#07171c', submergedLight: '#1e524d', submergedAmbient: '#0e2b29',
+      ribbon1: '#123b38', ribbon2: '#389487', ribbonHighlight: '#63d1cf',
+      surfaceLine: '#75e6e4',
+      metalDark: '#08171f', metalLight: '#1f4f4a', metalRim: '#63d1cf', metalTip: '#8cf7f5',
+      nacelleDark: '#050f14', nacelleLight: '#163b37',
+      arcColor: '#5bc0be', moteColor: '#80fffb', starColor: '#d6ffff',
+      boatColor: '#051014', buoyColor: '#63d1cf',
+      coralBaseDark: '#02080a', coralBaseLight: '#0d2927', coralGlow: '#0a3d36',
+      coralPalettes: [[.39,.82,.81],[.36,.75,.75],[.29,.68,.62],[.25,.6,.55],[.45,.9,.88],[.2,.55,.5]]
+    },
+    'Mystic Violet (AA60C8)': {
+      bgColor: '#0d001d',
+      skyZenith: '#0d001d', skyMid: '#24083b', skyHorizon: '#541f6e', skyPeach: '#aa60c8', skyWarm: '#d69ade',
+      mountBase: '#4d245c', mountPeak: '#1f0729', mountRidge: '#0a010d',
+      snowShadow: '#875894', snowHighlight: '#fae3fa', snowMid: '#c9a3c6',
+      hills: ['#30103b', '#21082b', '#17041f', '#0a010d'],
+      waterSurface: '#8c47a3', waterDeep: '#170524', waterReflection: '#63335e', waterSheen: '#d69ade',
+      waterPath: '#12031c',
+      submergedDeep: '#1c082b', submergedLight: '#57226b', submergedAmbient: '#331142',
+      ribbon1: '#2b0d3d', ribbon2: '#752d94', ribbonHighlight: '#d69ade',
+      surfaceLine: '#e6b5eb',
+      metalDark: '#1a0626', metalLight: '#4d1e66', metalRim: '#d69ade', metalTip: '#f0c7f5',
+      nacelleDark: '#12031c', nacelleLight: '#3a134f',
+      arcColor: '#d69ade', moteColor: '#f3c7fa', starColor: '#f7e6fa',
+      boatColor: '#12041c', buoyColor: '#d69ade',
+      coralBaseDark: '#0d0117', coralBaseLight: '#2d0e3b', coralGlow: '#420f4f',
+      coralPalettes: [[.67,.38,.78],[.84,.6,.87],[.79,.64,.78],[.81,.71,.76],[.55,.25,.68],[.9,.68,.92]]
+    },
+    'Solar Amber (FEF1BE)': {
+      bgColor: '#061210',
+      skyZenith: '#061210', skyMid: '#002629', skyHorizon: '#00474d', skyPeach: '#008189', skyWarm: '#ffba00',
+      mountBase: '#0d4a47', mountPeak: '#052422', mountRidge: '#020d0c',
+      snowShadow: '#267d7a', snowHighlight: '#fef1be', snowMid: '#a8c7b8',
+      hills: ['#072e2c', '#05211f', '#031716', '#020d0c'],
+      waterSurface: '#008189', waterDeep: '#021a1b', waterReflection: '#457a66', waterSheen: '#ffba00',
+      waterPath: '#021414',
+      submergedDeep: '#032121', submergedLight: '#0d5c58', submergedAmbient: '#083b38',
+      ribbon1: '#073d3b', ribbon2: '#0b7875', ribbonHighlight: '#ffba00',
+      surfaceLine: '#ffd24d',
+      metalDark: '#041c1c', metalLight: '#145c57', metalRim: '#ffba00', metalTip: '#fef1be',
+      nacelleDark: '#021414', nacelleLight: '#0c423f',
+      arcColor: '#ffba00', moteColor: '#fef1be', starColor: '#fef1be',
+      boatColor: '#031414', buoyColor: '#ffba00',
+      coralBaseDark: '#020d0c', coralBaseLight: '#093633', coralGlow: '#4a3500',
+      coralPalettes: [[1.,.73,0.],[1.,.95,.75],[.95,.65,0.],[.8,.5,0.],[1.,.82,.2],[1.,.9,.6]]
+    },
+    'Toxic Lime (D4FFB0)': {
+      bgColor: '#05140a',
+      skyZenith: '#05140a', skyMid: '#0a2618', skyHorizon: '#0a3322', skyPeach: '#00b894', skyWarm: '#7fff00',
+      mountBase: '#124730', mountPeak: '#082618', mountRidge: '#030f07',
+      snowShadow: '#227855', snowHighlight: '#d4ffb0', snowMid: '#75db8e',
+      hills: ['#0c3321', '#082618', '#051c11', '#030f07'],
+      waterSurface: '#00b894', waterDeep: '#031f16', waterReflection: '#388247', waterSheen: '#7fff00',
+      waterPath: '#021710',
+      submergedDeep: '#05291c', submergedLight: '#126b4c', submergedAmbient: '#0a422f',
+      ribbon1: '#08422e', ribbon2: '#128a65', ribbonHighlight: '#7fff00',
+      surfaceLine: '#a6ff4d',
+      metalDark: '#052418', metalLight: '#156145', metalRim: '#7fff00', metalTip: '#d4ffb0',
+      nacelleDark: '#031a11', nacelleLight: '#0e4530',
+      arcColor: '#7fff00', moteColor: '#d4ffb0', starColor: '#e8ffd4',
+      boatColor: '#04170e', buoyColor: '#7fff00',
+      coralBaseDark: '#020f07', coralBaseLight: '#0b3d28', coralGlow: '#294f05',
+      coralPalettes: [[.5,1.,0.],[.83,1.,.69],[0.,.72,.58],[.65,1.,.2],[.35,.9,.1],[.75,1.,.5]]
+    },
+    'Sunset Plum (FFE8CC)': {
+      bgColor: '#0e0618',
+      skyZenith: '#0e0618', skyMid: '#240a36', skyHorizon: '#3d1050', skyPeach: '#c7501a', skyWarm: '#ff8c00',
+      mountBase: '#4d1e47', mountPeak: '#240a2b', mountRidge: '#0a030d',
+      snowShadow: '#7a3857', snowHighlight: '#ffe8cc', snowMid: '#d67a5a',
+      hills: ['#2e0c33', '#210724', '#140417', '#0a030d'],
+      waterSurface: '#b84618', waterDeep: '#1c081f', waterReflection: '#6e2b45', waterSheen: '#ff8c00',
+      waterPath: '#140517',
+      submergedDeep: '#1f0924', submergedLight: '#592040', submergedAmbient: '#381230',
+      ribbon1: '#360f2b', ribbon2: '#8c2e28', ribbonHighlight: '#ff8c00',
+      surfaceLine: '#ffa633',
+      metalDark: '#1c0724', metalLight: '#4d1c3b', metalRim: '#ff8c00', metalTip: '#ffe8cc',
+      nacelleDark: '#120417', nacelleLight: '#38122d',
+      arcColor: '#ff8c00', moteColor: '#ffd199', starColor: '#ffe8cc',
+      boatColor: '#140517', buoyColor: '#ff8c00',
+      coralBaseDark: '#0a030d', coralBaseLight: '#290b26', coralGlow: '#4f1a05',
+      coralPalettes: [[1.,.55,0.],[1.,.91,.8],[.78,.31,.1],[1.,.68,.2],[.9,.4,.05],[1.,.8,.5]]
+    },
+    'Cosmic Lavender (E8E0FF)': {
+      bgColor: '#090612',
+      skyZenith: '#090612', skyMid: '#120c36', skyHorizon: '#1a1250', skyPeach: '#6a3de8', skyWarm: '#b38fff',
+      mountBase: '#35216b', mountPeak: '#140d38', mountRidge: '#070414',
+      snowShadow: '#5c4299', snowHighlight: '#e8e0ff', snowMid: '#9e85d9',
+      hills: ['#201445', '#170e33', '#100924', '#070414'],
+      waterSurface: '#542ec9', waterDeep: '#0f0a2e', waterReflection: '#4f3a7a', waterSheen: '#b38fff',
+      waterPath: '#0d0724',
+      submergedDeep: '#130d36', submergedLight: '#3b2578', submergedAmbient: '#23164d',
+      ribbon1: '#20134f', ribbon2: '#562ed4', ribbonHighlight: '#b38fff',
+      surfaceLine: '#cbb3ff',
+      metalDark: '#120a2e', metalLight: '#371e75', metalRim: '#b38fff', metalTip: '#e8e0ff',
+      nacelleDark: '#0b061c', nacelleLight: '#271457',
+      arcColor: '#b38fff', moteColor: '#d6c4ff', starColor: '#e8e0ff',
+      boatColor: '#0e0724', buoyColor: '#b38fff',
+      coralBaseDark: '#070414', coralBaseLight: '#1c1042', coralGlow: '#28135c',
+      coralPalettes: [[.7,.56,1.],[.91,.88,1.],[.42,.24,.91],[.8,.68,1.],[.55,.35,1.],[.85,.75,1.]]
+    },
+    'Cyberpunk Neon (E0FBFF)': {
+      bgColor: '#05020f',
+      skyZenith: '#05020f', skyMid: '#140629', skyHorizon: '#1e0a3d', skyPeach: '#d40078', skyWarm: '#00f0ff',
+      mountBase: '#420f47', mountPeak: '#1b072e', mountRidge: '#08010f',
+      snowShadow: '#7a195f', snowHighlight: '#e0fbff', snowMid: '#ab187e',
+      hills: ['#2b0c3d', '#1e072b', '#13041c', '#08010f'],
+      waterSurface: '#00c7d4', waterDeep: '#120424', waterReflection: '#801058', waterSheen: '#00f0ff',
+      waterPath: '#0f031c',
+      submergedDeep: '#170629', submergedLight: '#4d0d57', submergedAmbient: '#2b083b',
+      ribbon1: '#26063b', ribbon2: '#7d0d6b', ribbonHighlight: '#00f0ff',
+      surfaceLine: '#47f7ff',
+      metalDark: '#140426', metalLight: '#3a0d4f', metalRim: '#d40078', metalTip: '#00f0ff',
+      nacelleDark: '#0d021c', nacelleLight: '#2b073d',
+      arcColor: '#00f0ff', moteColor: '#ff2ebd', starColor: '#e0fbff',
+      boatColor: '#12031f', buoyColor: '#d40078',
+      coralBaseDark: '#080112', coralBaseLight: '#210530', coralGlow: '#54002f',
+      coralPalettes: [[.83,0.,.47],[0.,.94,1.],[.88,.98,1.],[1.,.1,.6],[.2,.85,1.],[.95,.2,.7]]
+    }
+  };
+
+  function applyColorScheme(name) {
+    const s = COLOR_SCHEMES[name];
+    if (!s) return;
+
+    params.bgColor = s.bgColor;
+    params.skyZenith = s.skyZenith;
+    params.skyHorizon = s.skyHorizon;
+    params.skyWarm = s.skyWarm;
+    params.waterSurface = s.waterSurface;
+    params.waterDeep = s.waterDeep;
+    params.turbineAccent = s.metalRim;
+    params.coralAccent = s.coralPalettes[0] ? `#${Math.round(s.coralPalettes[0][0]*255).toString(16).padStart(2,'0')}${Math.round(s.coralPalettes[0][1]*255).toString(16).padStart(2,'0')}${Math.round(s.coralPalettes[0][2]*255).toString(16).padStart(2,'0')}` : '#f59e7d';
+
+    uSkyZenith.value.set(s.skyZenith);
+    uSkyMid.value.set(s.skyMid);
+    uSkyHorizon.value.set(s.skyHorizon);
+    uSkyPeach.value.set(s.skyPeach);
+    uSkyWarm.value.set(s.skyWarm);
+
+    uMountBase.value.set(s.mountBase);
+    uMountPeak.value.set(s.mountPeak);
+    uMountRidge.value.set(s.mountRidge);
+    uSnowShadow.value.set(s.snowShadow);
+    uSnowHighlight.value.set(s.snowHighlight);
+    uSnowMid.value.set(s.snowMid);
+
+    matHill1.color.set(s.hills[0]);
+    matHill2.color.set(s.hills[1]);
+    matHill3.color.set(s.hills[2]);
+    matTrees.color.set(s.hills[3]);
+
+    uWaterSurface.value.set(s.waterSurface);
+    uWaterDeep.value.set(s.waterDeep);
+    uWaterReflection.value.set(s.waterReflection);
+    uWaterSheen.value.set(s.waterSheen);
+    matWaterPath.color.set(s.waterPath);
+
+    uSubmergedDeep.value.set(s.submergedDeep);
+    uSubmergedLight.value.set(s.submergedLight);
+    uSubmergedAmbient.value.set(s.submergedAmbient);
+
+    uRibbonColor1.value.set(s.ribbon1);
+    uRibbonColor2.value.set(s.ribbon2);
+    uRibbonHighlight.value.set(s.ribbonHighlight);
+
+    uSurfaceColor.value.set(s.surfaceLine);
+
+    uMetalDark.value.set(s.metalDark);
+    uMetalLight.value.set(s.metalLight);
+    uMetalRim.value.set(s.metalRim);
+    uMetalTip.value.set(s.metalTip);
+
+    uNacelleDark.value.set(s.nacelleDark);
+    uNacelleLight.value.set(s.nacelleLight);
+
+    uArcColor.value.set(s.arcColor);
+    uMoteColor.value.set(s.moteColor);
+    uStarColor.value.set(s.starColor);
+
+    distantInk.color.set(s.boatColor);
+    matBuoy.color.set(s.buoyColor);
+
+    uCoralBaseDark.value.set(s.coralBaseDark);
+    uCoralBaseLight.value.set(s.coralBaseLight);
+    uCoralGlow.value.set(s.coralGlow);
+
+    updateCoralTints(s.coralPalettes);
+    updateBackgroundAndSky();
+
+    if (gui) {
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+  }
+
+  function updateBackgroundAndSky() {
+    if (params.greenscreen) {
+      document.body.style.background = '#00ff00';
+      document.documentElement.style.background = '#00ff00';
+      uGreenScreen.value = 1.0;
+    } else {
+      document.body.style.background = params.bgColor;
+      document.documentElement.style.background = params.bgColor;
+      uGreenScreen.value = 0.0;
+      uBgColor.value.set(params.bgColor);
+    }
+  }
+
+  // --- 8 Preconfigured Cinematic Animations + Static ---
+  const ANIMATIONS = {
+    'Static (Default)': () => ({ x: 0, y: 0, zoom: 1.0, pitch: 0, yaw: 0, roll: 0 }),
+    'Ocean Breeze Orbit': t => ({
+      x: Math.sin(t * 0.5) * 130,
+      y: Math.cos(t * 0.5) * 25,
+      zoom: 1.0 + 0.08 * Math.sin(t * 0.5),
+      pitch: Math.sin(t * 0.25) * 0.05,
+      yaw: Math.sin(t * 0.5) * 0.18,
+      roll: 0
+    }),
+    'Breathing Tide': t => ({
+      x: Math.cos(t * 0.5) * 45,
+      y: Math.sin(t) * 90,
+      zoom: 1.0 + 0.14 * Math.sin(t),
+      pitch: Math.sin(t) * 0.08,
+      yaw: 0,
+      roll: 0
+    }),
+    'Twilight Horizon': t => ({
+      x: Math.sin(t * 0.5) * 280,
+      y: 50 + Math.cos(t * 0.5) * 35,
+      zoom: 0.92 + 0.05 * Math.cos(t * 0.5),
+      pitch: 0.04,
+      yaw: -Math.sin(t * 0.5) * 0.08,
+      roll: 0
+    }),
+    'Deep Abyssal Drift': t => ({
+      x: -60 + Math.cos(t * 0.5) * 95,
+      y: -130 + Math.sin(t * 0.5) * 42,
+      zoom: 1.25 + 0.08 * Math.cos(t * 0.5),
+      pitch: -0.10 + 0.04 * Math.sin(t * 0.5),
+      yaw: Math.sin(t * 0.5) * 0.12,
+      roll: 0
+    }),
+    'Turbine Sentinel Sweep': t => ({
+      x: -150 + Math.sin(t * 0.5) * 280,
+      y: 20 + Math.sin(t) * 25,
+      zoom: 1.1 + 0.12 * Math.sin(t * 0.5),
+      pitch: 0.03 * Math.sin(t),
+      yaw: -Math.cos(t * 0.5) * 0.14,
+      roll: 0
+    }),
+    'Cosmic Starlight Glide': t => ({
+      x: Math.sin(t * 0.5) * 160,
+      y: 150 + Math.cos(t * 0.5) * 60,
+      zoom: 0.88 + 0.06 * Math.cos(t * 0.5),
+      pitch: 0.08 + 0.03 * Math.sin(t * 0.5),
+      yaw: 0,
+      roll: 0
+    }),
+    'Panoramic Archipelago': t => ({
+      x: Math.sin(t * 0.5) * 240,
+      y: Math.sin(t) * 55,
+      zoom: 0.95 + 0.12 * Math.cos(t * 0.5),
+      pitch: Math.sin(t) * 0.06,
+      yaw: Math.cos(t * 0.5) * 0.15,
+      roll: 0
+    }),
+    'Vortices & Currents': t => ({
+      x: Math.cos(t * 0.5) * 110,
+      y: Math.sin(t * 0.5) * 70,
+      zoom: 1.15 + 0.12 * Math.sin(t),
+      pitch: -Math.cos(t * 0.5) * 0.07,
+      yaw: Math.sin(t * 0.5) * 0.12,
+      roll: Math.sin(t * 0.5) * 0.03
+    })
+  };
+
+  // --- Procedural Re-roll ---
+  function rerollScene() {
+    const keys = Object.keys(COLOR_SCHEMES);
+    const chosen = keys[Math.floor(Math.random() * keys.length)];
+    params.colorScheme = chosen;
+    applyColorScheme(chosen);
+
+    params.speed = +(0.4 + Math.random() * 2.2).toFixed(2);
+    uSkySunPos.value.set(400 + Math.random() * 800, 140 + Math.random() * 160);
+
+    for (let i = 0; i < rotors.length; i++) {
+      rotors[i].speedMult = 0.7 + Math.random() * 0.6;
+      rotors[i].offset = Math.random() * TAU;
+    }
+
+    uCoralSwayFactor.value = 0.5 + Math.random() * 1.5;
+    const formAttr = coralBase.getAttribute('aForm');
+    if (formAttr) {
+      const arr = formAttr.array;
+      for (let i = 0; i < arr.length; i += 4) {
+        arr[i + 2] = (14 + Math.random() * 58) * (Math.random() > 0.5 ? 1 : -1);
+        arr[i + 3] = Math.random() * TAU;
+      }
+      formAttr.needsUpdate = true;
+    }
+
+    uWaterWaveSpeed.value = 0.6 + Math.random() * 1.2;
+
+    if (gui) {
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+  }
+
+  // --- Antialiasing Toggle ---
+  function setAntialiasing(enable) {
+    params.antialias = enable;
+    const oldCanvas = renderer.domElement;
+    renderer.dispose();
+    renderer = new T.WebGLRenderer({
+      canvas: oldCanvas,
+      antialias: enable,
+      alpha: false,
+      powerPreference: 'high-performance'
+    });
+    renderer.outputColorSpace = T.SRGBColorSpace;
+    renderer.toneMapping = T.NoToneMapping;
+    renderer.getContext().disable(renderer.getContext().DITHER);
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    scene.traverse(obj => {
+      if (obj.material) {
+        if (Array.isArray(obj.material)) obj.material.forEach(m => m.needsUpdate = true);
+        else obj.material.needsUpdate = true;
+      }
+    });
+  }
+
+  // --- Responsive Resize ---
+  let baseCenterX = 512, baseCenterY = 384;
+  function resize() {
+    const w = innerWidth, h = innerHeight, aspect = w / h;
+    const viewHeight = Math.max(768, 430 / aspect), viewWidth = viewHeight * aspect;
+    camera.left = -viewWidth / 2;
+    camera.right = viewWidth / 2;
+    camera.top = viewHeight / 2;
+    camera.bottom = -viewHeight / 2;
+    baseCenterX = aspect < 0.85 ? 400 : aspect < 1.1 ? 440 : 512;
+    baseCenterY = 384;
+    camera.updateProjectionMatrix();
+    pixelRatio.value = params.dpr;
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(w, h, false);
+  }
+  window.addEventListener('resize', resize, { passive: true });
+  resize();
+
+  // --- Pointer & Wheel Interaction ---
+  let userZoom = 1.0;
+  const userPan = new T.Vector2(0, 0);
+  const userAngle = new T.Vector3(0, 0, 0); // x: pitch, y: yaw, z: roll
+
+  let isDragging = false;
+  let dragButton = 0;
+  let lastX = 0, lastY = 0;
+  let startX = 0, startY = 0, startTime = 0;
+
+  let ctrlZoom, ctrlPanX, ctrlPanY, ctrlAngleX, ctrlAngleY;
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.08 : 0.92;
+    userZoom = Math.max(0.1, Math.min(15.0, userZoom * factor));
+    params.zoom = +userZoom.toFixed(2);
+    if (ctrlZoom) ctrlZoom.updateDisplay();
+  }, { passive: false });
+
+  canvas.addEventListener('pointerdown', (e) => {
+    isDragging = true;
+    dragButton = e.button;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    startX = e.clientX;
+    startY = e.clientY;
+    startTime = performance.now();
+    try { canvas.setPointerCapture(e.pointerId); } catch(_) {}
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+
+    if (dragButton === 2 || e.shiftKey || e.altKey) {
+      // Orbit / angle change
+      userAngle.y -= dx * 0.003;
+      userAngle.x += dy * 0.003;
+      userAngle.x = Math.max(-0.65, Math.min(0.65, userAngle.x));
+      userAngle.y = Math.max(-0.85, Math.min(0.85, userAngle.y));
+      params.angleX = +(userAngle.x * 180 / Math.PI).toFixed(1);
+      params.angleY = +(userAngle.y * 180 / Math.PI).toFixed(1);
+      if (ctrlAngleX) ctrlAngleX.updateDisplay();
+      if (ctrlAngleY) ctrlAngleY.updateDisplay();
+    } else {
+      // Pan across screen
+      const factor = (camera.right - camera.left) / window.innerWidth / (camera.zoom || 1);
+      userPan.x -= dx * factor;
+      userPan.y += dy * factor;
+      params.panX = +userPan.x.toFixed(1);
+      params.panY = +userPan.y.toFixed(1);
+      if (ctrlPanX) ctrlPanX.updateDisplay();
+      if (ctrlPanY) ctrlPanY.updateDisplay();
+    }
+  });
+
+  canvas.addEventListener('pointerup', (e) => {
+    if (!isDragging) return;
+    isDragging = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch(_) {}
+
+    const dist = Math.hypot(e.clientX - startX, e.clientY - startY);
+    const dt = performance.now() - startTime;
+    if (dist < 5 && dt < 350 && dragButton === 0) {
+      if (params.clickReroll) {
+        rerollScene();
+      }
+    }
+  });
+
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  function resetView() {
+    userZoom = 1.0;
+    userPan.set(0, 0);
+    userAngle.set(0, 0, 0);
+    params.zoom = 1.0;
+    params.panX = 0;
+    params.panY = 0;
+    params.angleX = 0;
+    params.angleY = 0;
+    if (ctrlZoom) ctrlZoom.updateDisplay();
+    if (ctrlPanX) ctrlPanX.updateDisplay();
+    if (ctrlPanY) ctrlPanY.updateDisplay();
+    if (ctrlAngleX) ctrlAngleX.updateDisplay();
+    if (ctrlAngleY) ctrlAngleY.updateDisplay();
+  }
+
+  // --- Render Loop ---
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+  let lastTime = performance.now();
+  let accumulatedTime = 0;
+  let request;
+
+  function renderAt(milliseconds) {
+    const t = ((milliseconds % LOOP) + LOOP) % LOOP / LOOP * TAU;
+    phase.value = t;
+
+    for (const r of rotors) {
+      const mult = r.speedMult || 1.0;
+      r.assembly.rotation.z = r.orientation + t * mult + 0.065 * (Math.sin(t * mult + r.offset) - Math.sin(r.offset));
+    }
+    for (const b of boats) {
+      b.group.position.x = Math.sin(t + b.offset) * 2.3;
+      b.group.position.y = Math.sin(t * 2.0 + b.offset) * 0.7;
+    }
+    for (const s of satellites) {
+      s.group.rotation.z = s.angle + Math.sin(t) * 0.025;
+    }
+
+    // Camera animation
+    let animCamX = 0, animCamY = 0, animCamZoom = 1.0;
+    let animPitch = 0, animYaw = 0, animRoll = 0;
+
+    const animFn = ANIMATIONS[params.animation] || ANIMATIONS['Static (Default)'];
+    const animRes = animFn(t);
+    animCamX = animRes.x || 0;
+    animCamY = animRes.y || 0;
+    animCamZoom = animRes.zoom || 1.0;
+    animPitch = animRes.pitch || 0;
+    animYaw = animRes.yaw || 0;
+    animRoll = animRes.roll || 0;
+
+    // Combine user zoom and camera animation zoom without reset
+    camera.zoom = userZoom * animCamZoom;
+    camera.updateProjectionMatrix();
+
+    const targetX = baseCenterX + userPan.x + animCamX;
+    const targetY = baseCenterY + userPan.y + animCamY;
+    const targetZ = 0;
+
+    const currentPitch = animPitch + userAngle.x;
+    const currentYaw = animYaw + userAngle.y;
+    const currentRoll = animRoll + userAngle.z;
+
+    const camDist = 1800;
+    camera.position.x = targetX + camDist * Math.sin(currentYaw) * Math.cos(currentPitch);
+    camera.position.y = targetY + camDist * Math.sin(currentPitch);
+    camera.position.z = targetZ + camDist * Math.cos(currentYaw) * Math.cos(currentPitch);
+
+    camera.lookAt(targetX, targetY, targetZ);
+    camera.rotation.z += currentRoll;
+
+    renderer.render(scene, camera);
+  }
+
+  function frame(now) {
+    const delta = now - lastTime;
+    lastTime = now;
+    accumulatedTime += delta * params.speed;
+    renderAt(reduced.matches ? 0 : accumulatedTime);
+    if (!reduced.matches) request = requestAnimationFrame(frame);
+  }
+
+  reduced.addEventListener('change', () => {
+    cancelAnimationFrame(request);
+    request = requestAnimationFrame(frame);
+  });
+  document.addEventListener('visibilitychange', () => {
+    cancelAnimationFrame(request);
+    if (!document.hidden) request = requestAnimationFrame(frame);
+  });
+
+  // --- GUI Construction (lil-gui) ---
+  let gui;
+  try {
+    gui = new GUI({ title: 'Breathing Ocean Settings' });
+
+    // Display & Rendering
+    const fDisplay = gui.addFolder('Display & Rendering');
+    fDisplay.add(params, 'antialias').name('Antialiasing').onChange(v => setAntialiasing(v));
+    fDisplay.add(params, 'dpr', 0.25, 3.0, 0.25).name('Pixel Ratio (DPR)').onChange(v => {
+      pixelRatio.value = v;
+      starMat.uniforms.uDpr.value = v;
+      moteMat.uniforms.uDpr.value = v;
+      renderer.setPixelRatio(v);
+      resize();
+    });
+    fDisplay.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => updateBackgroundAndSky());
+    fDisplay.addColor(params, 'bgColor').name('Background Color').onChange(() => updateBackgroundAndSky());
+
+    // Animation & Motion
+    const fAnim = gui.addFolder('Animation & Camera');
+    fAnim.add(params, 'animation', Object.keys(ANIMATIONS)).name('Animation Mode');
+    fAnim.add(params, 'speed', 0.2, 10.0, 0.1).name('Animation Speed');
+    ctrlZoom = fAnim.add(params, 'zoom', 0.1, 10.0, 0.05).name('Zoom').onChange(v => userZoom = v);
+    ctrlPanX = fAnim.add(params, 'panX', -2000, 2000, 5).name('Pan X').onChange(v => userPan.x = v);
+    ctrlPanY = fAnim.add(params, 'panY', -1500, 1500, 5).name('Pan Y').onChange(v => userPan.y = v);
+    ctrlAngleX = fAnim.add(params, 'angleX', -35, 35, 0.5).name('Angle X (Pitch)').onChange(v => userAngle.x = v * Math.PI / 180);
+    ctrlAngleY = fAnim.add(params, 'angleY', -45, 45, 0.5).name('Angle Y (Yaw)').onChange(v => userAngle.y = v * Math.PI / 180);
+    fAnim.add({ reset: resetView }, 'reset').name('Reset View');
+
+    // Color Scheme & Procedural Variation
+    const fTheme = gui.addFolder('Themes & Procedural');
+    fTheme.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Color Scheme').onChange(v => applyColorScheme(v));
+    fTheme.add(params, 'clickReroll').name('Click Scene to Re-roll');
+    fTheme.add({ reroll: rerollScene }, 'reroll').name('🎲 Re-roll Procedural Scene');
+
+    // Custom Color Overrides
+    const fCustom = gui.addFolder('Custom Color Tweaks').close();
+    fCustom.addColor(params, 'skyZenith').name('Sky Zenith').onChange(v => uSkyZenith.value.set(v));
+    fCustom.addColor(params, 'skyHorizon').name('Sky Horizon').onChange(v => uSkyHorizon.value.set(v));
+    fCustom.addColor(params, 'skyWarm').name('Sky Twilight Glow').onChange(v => uSkyWarm.value.set(v));
+    fCustom.addColor(params, 'waterSurface').name('Water Surface').onChange(v => uWaterSurface.value.set(v));
+    fCustom.addColor(params, 'waterDeep').name('Water Deep').onChange(v => uWaterDeep.value.set(v));
+    fCustom.addColor(params, 'turbineAccent').name('Turbine Accent').onChange(v => {
+      uMetalRim.value.set(v);
+      uMetalTip.value.set(v);
+    });
+    fCustom.addColor(params, 'coralAccent').name('Coral Base Accent').onChange(v => {
+      const c = new T.Color(v);
+      updateCoralTints([[c.r, c.g, c.b]]);
+    });
+
+  } catch(e) {
+    console.warn('lil-gui initialization:', e);
+  }
+
+  // Key 'H' toggles UI visibility
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'h' || e.key === 'H') {
+      if (gui) {
+        gui._hidden = !gui._hidden;
+        gui.domElement.style.display = gui._hidden ? 'none' : '';
+      }
+    }
+  });
+
+  // Capture hook compatibility
+  if (new URLSearchParams(location.search).has('capture')) {
+    window.oceanCapture = { renderAt, loopDuration: LOOP, renderer, scene, camera, rotors, coralCount: coralBase.instanceCount };
+    renderAt(0);
+  } else {
+    request = requestAnimationFrame(frame);
+  }
+})();
+</script>
 </body>
 </html>
