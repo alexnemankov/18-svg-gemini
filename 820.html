@@ -44,21 +44,94 @@ DEALINGS IN THE SOFTWARE. -->
   const T = window.THREE;
   const W = 1920, H = 1080, TAU = Math.PI * 2, DURATION = 16;
   const query = new URLSearchParams(location.search);
-  const canvas = document.querySelector('canvas');
-  const renderer = new T.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
+  let canvas = document.querySelector('canvas');
+  canvas.style.touchAction = 'none';
+  canvas.style.cursor = 'grab';
+
+  let renderer = new T.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
   renderer.outputColorSpace = T.SRGBColorSpace;
   renderer.toneMapping = T.NoToneMapping;
   renderer.setClearColor('#00d3ce', 1);
+
   const scene = new T.Scene();
   const camera = new T.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, .1, 5000);
   camera.position.set(W / 2, H / 2, 2300);
   camera.lookAt(W / 2, H / 2, 0);
+
   const phase = { value: 0 };
   const C = color => new T.Color(color);
   const P = (x, y, z = 0) => new T.Vector3(x, H - y, z);
-  let seed = 820;
-  const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
   const mix = T.MathUtils.lerp;
+
+  // Helpers for sRGB shader uniforms & color manipulation
+  const _tmpCol = new T.Color();
+  function hexToSrgbVec3(hex) {
+    const clean = String(hex).replace('#', '');
+    const full = clean.length === 3 ? clean.split('').map(ch => ch + ch).join('') : clean;
+    const n = parseInt(full, 16) || 0;
+    return new T.Vector3(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+  }
+  function setSrgbVec3(vec, hex) {
+    const v = hexToSrgbVec3(hex);
+    vec.copy(v);
+  }
+  function srgbVec3ToHex(vec) {
+    const r = Math.round(T.MathUtils.clamp(vec.x, 0, 1) * 255);
+    const g = Math.round(T.MathUtils.clamp(vec.y, 0, 1) * 255);
+    const b = Math.round(T.MathUtils.clamp(vec.z, 0, 1) * 255);
+    return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+  }
+  function hslToHex(h, s, l) {
+    const hh = ((h % 360) + 360) % 360 / 360;
+    const ss = T.MathUtils.clamp(s, 0, 1);
+    const ll = T.MathUtils.clamp(l, 0, 1);
+    const hue2rgb = (p, q, t) => {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    };
+    let r, g, b;
+    if (ss === 0) { r = g = b = ll; }
+    else {
+      const q = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss;
+      const p = 2 * ll - q;
+      r = hue2rgb(p, q, hh + 1 / 3);
+      g = hue2rgb(p, q, hh);
+      b = hue2rgb(p, q, hh - 1 / 3);
+    }
+    const toHex = x => Math.round(x * 255).toString(16).padStart(2, '0');
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+  }
+  function hexToHsl(hex) {
+    const v = hexToSrgbVec3(hex);
+    const r = v.x, g = v.y, b = v.z;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0, l = (max + min) / 2;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        case b: h = (r - g) / d + 4; break;
+      }
+      h *= 60;
+    }
+    return { h, s, l };
+  }
+  function mixHex(hexA, hexB, t) {
+    const a = hexToSrgbVec3(hexA), b = hexToSrgbVec3(hexB);
+    return srgbVec3ToHex(a.clone().lerp(b, t));
+  }
+  function shiftHex(hex, dh = 0, sScale = 1, lTarget = null) {
+    const hsl = hexToHsl(hex);
+    const l = lTarget === null ? hsl.l : T.MathUtils.clamp(lTarget, 0, 1);
+    return hslToHex(hsl.h + dh, T.MathUtils.clamp(hsl.s * sScale, 0, 1), l);
+  }
+
   const finish = '\n#include <tonemapping_fragment>\n#include <colorspace_fragment>\n';
   const common = `
     float hash(vec2 p) { return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -87,10 +160,8 @@ DEALINGS IN THE SOFTWARE. -->
     return new T.ShaderMaterial({ vertexShader: vertex, fragmentShader: fragment,
       uniforms: { uPhase: phase, ...uniforms }, side: T.DoubleSide, ...options });
   }
-  const flats = new Map();
-  function flat(color) {
-    if (!flats.has(color)) flats.set(color, new T.MeshBasicMaterial({ color, side: T.DoubleSide }));
-    return flats.get(color);
+  function flatMat(color) {
+    return new T.MeshBasicMaterial({ color, side: T.DoubleSide });
   }
   function mesh(geometry, material, parent = scene) {
     const object = new T.Mesh(geometry, material); parent.add(object); return object;
@@ -99,6 +170,9 @@ DEALINGS IN THE SOFTWARE. -->
     const object = mesh(new T.PlaneGeometry(width, height), material);
     object.position.copy(P(x, y, z)); return object;
   }
+  const hillGradients = [];
+  const fgHillGradients = [];
+  const bushHillGradients = [];
   function pathShape(commands, material, z, parent = scene) {
     const shape = new T.Shape();
     for (const [op, ...a] of commands) {
@@ -125,93 +199,150 @@ DEALINGS IN THE SOFTWARE. -->
       }`, {uTop:{value:C(top)},uBottom:{value:C(bottom)},uLow:{value:H-maxY},uHigh:{value:H-minY},uMotion:{value:motion}});
   }
 
-  // The sky is larger than the camera at every aspect ratio. All motion is periodic.
+  // Sky uniforms (defaults match Original bit-for-bit)
+  const skyUniforms = {
+    uSkyCyan: { value: new T.Vector3(0.0, 0.82, 0.81) },
+    uSkyMint: { value: new T.Vector3(0.40, 0.94, 0.83) },
+    uSkySun: { value: new T.Vector3(1.0, 0.975, 0.68) },
+    uSkyBand: { value: new T.Vector3(0.75, 0.98, 0.80) },
+    uSunGlow: { value: 1.0 },
+    uSunShift: { value: new T.Vector2(0.0, 0.0) }
+  };
   const sky = shader(`
-    varying vec3 vWorld; uniform float uPhase; ${common}
+    varying vec3 vWorld; uniform float uPhase,uSunGlow;
+    uniform vec3 uSkyCyan,uSkyMint,uSkySun,uSkyBand;
+    uniform vec2 uSunShift;
+    ${common}
     void main() {
       vec2 p=vec2(vWorld.x/1920.,1.-vWorld.y/1080.);
-      vec3 cyan=vec3(.0,.82,.81), mint=vec3(.40,.94,.83),sun=vec3(1.,.975,.68);
-      float warm=exp(-pow(length((p-vec2(-.015,.55))*vec2(1.32,1.10)),2.)*4.5);
-      warm=max(warm,smoothstep(.22,.60,p.y)*exp(-p.x*p.x*4.9)*.95);
+      vec2 sp=p-uSunShift;
+      vec3 cyan=uSkyCyan, mint=uSkyMint, sun=uSkySun;
+      float glowScale=max(uSunGlow,0.25);
+      float warm=exp(-pow(length((sp-vec2(-.015,.55))*vec2(1.32,1.10))/glowScale,2.)*4.5);
+      warm=max(warm,smoothstep(.22,.60,sp.y)*exp(-sp.x*sp.x*4.9/(glowScale*glowScale))*.95);
       float low=smoothstep(.06,.61,p.y)*.58;
-      vec3 c=mix(cyan,mint,low); c=mix(c,sun,warm);
-      float a=.27-.25*sin(p.x*2.1)+.003*sin(uPhase);
+      vec3 c=mix(cyan,mint,low); c=mix(c,sun,sat(warm));
+      float a=.27-.25*sin((p.x-uSunShift.x*.4)*2.1)+.003*sin(uPhase)+uSunShift.y*.3;
       float band=exp(-pow((p.y-a)/.024,2.))*(1.-smoothstep(.48,.73,p.x));
-      float b=.55-.16*sin((p.x-.30)*2.1)+.004*cos(uPhase);
+      float b=.55-.16*sin((p.x-.30-uSunShift.x*.3)*2.1)+.004*cos(uPhase)+uSunShift.y*.2;
       band+=.52*exp(-pow((p.y-b)/.035,2.));
-      c=mix(c,vec3(.75,.98,.80),band*.52);
+      c=mix(c,uSkyBand,band*.52);
       c+=(hash(gl_FragCoord.xy)-.5)/520.;
       gl_FragColor=vec4(linearColor(c),1.); ${finish}
     }
-  `);
-  plane(7000, 4000, sky, W/2, H/2, -400);
+  `, skyUniforms);
+  const skyPlane = plane(16000, 10000, sky, W/2, H/2, -400);
 
-  // Carefully drawn, overlapping hill silhouettes, from sunrise to deep violet.
-  pathShape([['M',-150,635],['C',120,540,225,640,390,646],['C',600,652,705,609,890,634],['C',1170,670,1410,593,2090,610],['L',2200,5000],['L',-300,5000],['Z']],gradient('#eddf90','#aaa1cf',580,850),-220);
-  pathShape([['M',-100,721],['C',275,655,590,675,790,637],['C',1037,598,1116,529,1330,573],['C',1480,611,1578,584,1697,618],['C',1850,645,1958,576,2090,605],['L',2250,5000],['L',-250,5000],['Z']],gradient('#00bbe6','#9ab9f1',565,790,1),-205);
-  pathShape([['M',-120,748],['C',140,640,225,652,353,677],['C',534,714,658,646,802,673],['C',1075,702,1168,634,1340,650],['C',1555,677,1612,590,1753,572],['C',1909,551,1980,616,2100,575],['L',2200,5000],['L',-200,5000],['Z']],gradient('#8550df','#bd92ec',566,805,1),-190);
-  pathShape([['M',-120,772],['C',94,722,189,683,370,718],['C',583,765,685,696,821,719],['C',972,744,996,665,1116,686],['C',1294,730,1357,652,1492,690],['C',1647,722,1696,662,1795,672],['C',1950,684,1997,727,2100,687],['L',2250,5000],['L',-200,5000],['Z']],gradient('#6743cd','#7448c5',665,925),-170);
-  pathShape([['M',-120,821],['C',166,748,337,773,513,779],['C',705,780,751,741,887,744],['C',1011,747,1076,705,1185,731],['C',1328,764,1496,725,1648,731],['C',1836,740,1987,704,2110,742],['L',2250,5000],['L',-200,5000],['Z']],gradient('#5152c2','#6843ba',710,1090),-145);
+  // Overlapping hill silhouettes
+  const h0Mat = gradient('#eddf90','#aaa1cf',580,850); hillGradients.push(h0Mat);
+  pathShape([['M',-150,635],['C',120,540,225,640,390,646],['C',600,652,705,609,890,634],['C',1170,670,1410,593,2090,610],['L',2200,5000],['L',-300,5000],['Z']],h0Mat,-220);
+  const h1Mat = gradient('#00bbe6','#9ab9f1',565,790,1); hillGradients.push(h1Mat);
+  pathShape([['M',-100,721],['C',275,655,590,675,790,637],['C',1037,598,1116,529,1330,573],['C',1480,611,1578,584,1697,618],['C',1850,645,1958,576,2090,605],['L',2250,5000],['L',-250,5000],['Z']],h1Mat,-205);
+  const h2Mat = gradient('#8550df','#bd92ec',566,805,1); hillGradients.push(h2Mat);
+  pathShape([['M',-120,748],['C',140,640,225,652,353,677],['C',534,714,658,646,802,673],['C',1075,702,1168,634,1340,650],['C',1555,677,1612,590,1753,572],['C',1909,551,1980,616,2100,575],['L',2200,5000],['L',-200,5000],['Z']],h2Mat,-190);
+  const h3Mat = gradient('#6743cd','#7448c5',665,925); hillGradients.push(h3Mat);
+  pathShape([['M',-120,772],['C',94,722,189,683,370,718],['C',583,765,685,696,821,719],['C',972,744,996,665,1116,686],['C',1294,730,1357,652,1492,690],['C',1647,722,1696,662,1795,672],['C',1950,684,1997,727,2100,687],['L',2250,5000],['L',-200,5000],['Z']],h3Mat,-170);
+  const h4Mat = gradient('#5152c2','#6843ba',710,1090); hillGradients.push(h4Mat);
+  pathShape([['M',-120,821],['C',166,748,337,773,513,779],['C',705,780,751,741,887,744],['C',1011,747,1076,705,1185,731],['C',1328,764,1496,725,1648,731],['C',1836,740,1987,704,2110,742],['L',2250,5000],['L',-200,5000],['Z']],h4Mat,-145);
+
+  const waterUniforms = {
+    uWaterDeep: { value: new T.Vector3(0.01, 0.82, 0.86) },
+    uWaterLight: { value: new T.Vector3(0.48, 0.99, 0.85) },
+    uWaterReflect: { value: new T.Vector3(0.88, 1.0, 0.78) }
+  };
   const water = shader(`
-    uniform float uPhase; varying vec3 vWorld; ${common}
+    uniform float uPhase; varying vec3 vWorld;
+    uniform vec3 uWaterDeep,uWaterLight,uWaterReflect;
+    ${common}
     void main() {
       vec2 p=vec2(vWorld.x,1080.-vWorld.y);
       float bands=.5+.5*sin(p.x*.013+p.y*.050-uPhase*2.+.5*sin(p.x*.005+uPhase));
-      vec3 c=mix(vec3(.01,.82,.86),vec3(.48,.99,.85),smoothstep(.2,1.,bands));
+      vec3 c=mix(uWaterDeep,uWaterLight,smoothstep(.2,1.,bands));
       float reflection=pow(.5+.5*sin(p.y*.18+p.x*.008-uPhase),12.);
-      c=mix(c,vec3(.88,1.,.78),reflection*.28);
+      c=mix(c,uWaterReflect,reflection*.28);
       gl_FragColor=vec4(linearColor(c),1.); ${finish}
     }
-  `);
+  `, waterUniforms);
   const river = [ ['M',1510,752],['C',1615,736,1729,745,1763,754],['C',1796,766,1631,772,1603,784],['C',1569,797,1737,798,1787,806],['C',1841,813,1873,797,2000,797],['L',2080,846],['C',1932,834,1783,842,1686,825],['C',1579,808,1554,794,1589,782],['C',1607,775,1697,768,1682,764],['C',1651,754,1558,759,1510,756],['Z'] ];
-  const bank = pathShape(river,flat('#f5dfaa'),-130); bank.scale.y=1.014; bank.position.y=-2;
+  const bankMat = flatMat('#f5dfaa');
+  const bank = pathShape(river,bankMat,-130); bank.scale.y=1.014; bank.position.y=-2;
   pathShape(river,water,-127);
   pathShape([['M',1392,758],['C',1522,740,1544,750,1590,747],['C',1619,746,1611,750,1585,753],['C',1522,751,1451,763,1392,758],['Z']],water,-125);
-  pathShape([['M',-120,899],['C',126,823,233,817,387,838],['C',539,865,600,829,734,850],['C',878,873,985,809,1106,824],['C',1265,846,1355,801,1513,832],['C',1754,873,1881,785,2120,833],['L',2250,5000],['L',-200,5000],['Z']],gradient('#367fce','#39238e',805,1120),-100);
-  pathShape([['M',568,913],['C',849,851,1072,884,1246,867],['C',1459,853,1542,905,1725,883],['C',1883,861,1984,879,2130,937],['L',2150,5000],['L',946,5000],['C',973,1105,756,1028,568,913],['Z']],gradient('#e9a4bd','#7133ae',853,1160),-65);
-  pathShape([['M',568,913],['C',833,875,1038,899,1238,882],['C',1435,868,1508,912,1670,902],['C',1577,956,1347,955,1166,949],['C',960,941,775,933,568,913],['Z']],gradient('#f7c498','#cf7fbd',878,958),-60);
 
-  // Stylized anisotropic metal: ivory-gold light, lavender reflections, blue shadows.
+  const fg0Mat = gradient('#367fce','#39238e',805,1120); fgHillGradients.push(fg0Mat);
+  pathShape([['M',-120,899],['C',126,823,233,817,387,838],['C',539,865,600,829,734,850],['C',878,873,985,809,1106,824],['C',1265,846,1355,801,1513,832],['C',1754,873,1881,785,2120,833],['L',2250,5000],['L',-200,5000],['Z']],fg0Mat,-100);
+  const fg1Mat = gradient('#e9a4bd','#7133ae',853,1160); fgHillGradients.push(fg1Mat);
+  pathShape([['M',568,913],['C',849,851,1072,884,1246,867],['C',1459,853,1542,905,1725,883],['C',1883,861,1984,879,2130,937],['L',2150,5000],['L',946,5000],['C',973,1105,756,1028,568,913],['Z']],fg1Mat,-65);
+  const fg2Mat = gradient('#f7c498','#cf7fbd',878,958); fgHillGradients.push(fg2Mat);
+  pathShape([['M',568,913],['C',833,875,1038,899,1238,882],['C',1435,868,1508,912,1670,902],['C',1577,956,1347,955,1166,949],['C',960,941,775,933,568,913],['Z']],fg2Mat,-60);
+
+  // Stylized anisotropic metal, darkMetal, concrete
+  const metalUniforms = {
+    uMetalShadow: { value: new T.Vector3(0.24, 0.15, 0.48) },
+    uMetalMid: { value: new T.Vector3(0.74, 0.50, 0.72) },
+    uMetalLit: { value: new T.Vector3(1.0, 0.79, 0.49) },
+    uMetalSpec: { value: new T.Vector3(1.0, 0.96, 0.77) },
+    uMetalCool: { value: new T.Vector3(0.25, 0.69, 0.83) }
+  };
   const metal = shader(`
-    uniform float uPhase; varying vec3 vNormal,vWorld,vLocal; varying vec2 vUv; ${common}
+    uniform float uPhase; varying vec3 vNormal,vWorld,vLocal; varying vec2 vUv;
+    uniform vec3 uMetalShadow,uMetalMid,uMetalLit,uMetalSpec,uMetalCool;
+    ${common}
     void main() {
       vec3 n=normalize(vNormal);
       float diffuse=dot(n,normalize(vec3(-.68,.62,.65)));
-      vec3 c=mix(vec3(.24,.15,.48),vec3(.74,.50,.72),smoothstep(-.65,.16,diffuse));
-      c=mix(c,vec3(1.,.79,.49),smoothstep(.04,.73,diffuse));
+      vec3 c=mix(uMetalShadow,uMetalMid,smoothstep(-.65,.16,diffuse));
+      c=mix(c,uMetalLit,smoothstep(.04,.73,diffuse));
       float spec=pow(max(0.,dot(n,normalize(vec3(-.4,.49,.77)))),22.);
-      c=mix(c,vec3(1.,.96,.77),spec*.93);
+      c=mix(c,uMetalSpec,spec*.93);
       float cool=pow(max(0.,dot(n,normalize(vec3(.8,.1,.6)))),10.);
-      c=mix(c,vec3(.25,.69,.83),cool*.28);
+      c=mix(c,uMetalCool,cool*.28);
       float flow=pow(.5+.5*cos(vWorld.x*.004-vWorld.y*.002-uPhase+1.1),12.);
       c+=vec3(.065,.045,.015)*flow*(.35+.65*max(0.,n.y));
       c+=(hash(gl_FragCoord.xy)-.5)/700.;
       gl_FragColor=vec4(linearColor(c),1.); ${finish}
     }
-  `);
+  `, metalUniforms);
+
+  const darkMetalUniforms = {
+    uDarkShadow: { value: new T.Vector3(0.16, 0.09, 0.36) },
+    uDarkLit: { value: new T.Vector3(0.94, 0.72, 0.46) }
+  };
   const darkMetal = shader(`
-    uniform float uPhase; varying vec3 vNormal,vWorld; ${common}
+    uniform float uPhase; varying vec3 vNormal,vWorld;
+    uniform vec3 uDarkShadow,uDarkLit;
+    ${common}
     void main(){
       vec3 n=normalize(vNormal); float light=pow(max(0.,dot(n,normalize(vec3(-.6,.7,.7)))),5.);
-      vec3 c=mix(vec3(.16,.09,.36),vec3(.94,.72,.46),light*.84);
+      vec3 c=mix(uDarkShadow,uDarkLit,light*.84);
       c+=vec3(.025,.025,.045)*sin(uPhase+vWorld.y*.015);
       gl_FragColor=vec4(linearColor(c),1.); ${finish}
     }
-  `);
+  `, darkMetalUniforms);
+
+  const concreteUniforms = {
+    uConcShadow: { value: new T.Vector3(0.30, 0.20, 0.73) },
+    uConcMid: { value: new T.Vector3(0.76, 0.52, 0.81) },
+    uConcLit: { value: new T.Vector3(1.0, 0.88, 0.56) },
+    uConcTint: { value: new T.Vector3(0.96, 0.74, 0.70) }
+  };
   const concrete = shader(`
-    uniform float uPhase; varying vec3 vNormal,vLocal; varying vec2 vUv; ${common}
+    uniform float uPhase; varying vec3 vNormal,vLocal; varying vec2 vUv;
+    uniform vec3 uConcShadow,uConcMid,uConcLit,uConcTint;
+    ${common}
     void main(){
       float light=dot(normalize(vNormal),normalize(vec3(-.83,.25,.57)));
-      vec3 c=mix(vec3(.30,.20,.73),vec3(.76,.52,.81),smoothstep(-.7,.48,light));
-      c=mix(c,vec3(1.,.88,.56),smoothstep(.10,.98,light));
-      c=mix(c,vec3(.96,.74,.70),.12*sin(vUv.y*3.14159));
+      vec3 c=mix(uConcShadow,uConcMid,smoothstep(-.7,.48,light));
+      c=mix(c,uConcLit,smoothstep(.10,.98,light));
+      c=mix(c,uConcTint,.12*sin(vUv.y*3.14159));
       float panel=pow(.5+.5*cos(vUv.x*6.283185*34.),30.);
       c*=1.-panel*.10;
       c+=vec3(.02,.011,.005)*sin(uPhase+vUv.x*6.283185);
       c*=.90+.10*smoothstep(0.,.26,vUv.y);
       gl_FragColor=vec4(linearColor(c),1.); ${finish}
     }
-  `);
+  `, concreteUniforms);
+
   const cylinderGeo = new T.CylinderGeometry(1,1,1,40,1);
   const sphereGeo = new T.SphereGeometry(1,24,16);
   function cylinder(parent,x,y,z,radius,height,material=metal,topRadius=radius) {
@@ -264,28 +395,27 @@ DEALINGS IN THE SOFTWARE. -->
     torus(group,0,210,0,80,1.3,metal);
     return group;
   }
-  // Clear gaps between the two tower foundations and the service building.
   const rearTower=tower(700,754,.83,0);
   const frontTower=tower(430,782,1.02,45);
 
-  // Industrial architecture, reservoir tanks, and roof-mounted return pipes.
   function box(parent,x,y,z,w,h,d,material) {
     const o=mesh(new T.BoxGeometry(w,h,d),material,parent); o.position.set(x,y,z); return o;
   }
   const building=new T.Group(); building.position.copy(P(928,780,54)); building.rotation.x=.10; scene.add(building);
-  box(building,0,25,0,210,50,34,gradient('#8173bd','#59539a',719,784));
+  const buildingWallMat = gradient('#8173bd','#59539a',719,784);
+  box(building,0,25,0,210,50,34,buildingWallMat);
   box(building,0,52,0,220,6,40,metal);
   box(building,0,55,0,222,2,41,darkMetal);
+  const winMatA = flatMat('#ffe8aa'), winMatB = flatMat('#fff3b3'), mullionMat = flatMat('#d9b28f'), doorMat = flatMat('#ffdeaa');
   for(let i=0;i<12;i++){
-    box(building,-86+i*10.1,30,18,8,17,1,flat(i%4===0?'#ffe8aa':'#fff3b3'));
-    box(building,-86+i*10.1,30,19,1,18,1,flat('#d9b28f'));
+    box(building,-86+i*10.1,30,18,8,17,1,i%4===0?winMatA:winMatB);
+    box(building,-86+i*10.1,30,19,1,18,1,mullionMat);
   }
   box(building,76,13,18,20,26,1,metal);
   box(building,76,13,19,12,22,1,darkMetal);
-  box(building,76,13,20,2,21,1,flat('#ffdeaa'));
+  box(building,76,13,20,2,21,1,doorMat);
+
   const pipeNetwork={tubes:[],ports:[],joins:[]};
-  // Straight runs and circular-style fillets share their end tangents. This
-  // prevents the overshoot, swollen bends and drifting ends of a global spline.
   function roundedRoute(points,bend){
     const vertices=points.map(p=>p.clone());
     const path=new T.CurvePath();
@@ -333,7 +463,6 @@ DEALINGS IN THE SOFTWARE. -->
     const face=object.localToWorld(new T.Vector3(...localPosition));
     const axis=new T.Vector3(...localNormal).transformDirection(object.matrixWorld);
     const at=distance=>face.clone().addScaledVector(axis,distance);
-    // A solid socket and flange share the same axis and centre as the pipe.
     rod(scene,at(-5).toArray(),at(11).toArray(),radius+1.1,metal);
     rod(scene,at(1).toArray(),at(5).toArray(),radius+4.2,metal);
     axialRing(at(5.4),axis,radius+3.5,.8,darkMetal);
@@ -347,7 +476,6 @@ DEALINGS IN THE SOFTWARE. -->
     }
     const connection={face,axis,radius,label,at};pipeNetwork.ports.push(connection);return connection;
   }
-  // Roof loops use constant-width elbows, with both feet embedded in the roof.
   for(const [x,height]of [[860,34],[912,43],[964,31]]){
     pipe([[x,730],[x,726-height],[x+25,726-height],[x+25,730]],3,58);
   }
@@ -359,8 +487,6 @@ DEALINGS IN THE SOFTWARE. -->
   }
   function buildPipeNetwork(){
     scene.updateMatrixWorld(true);
-    // Connections are derived from the actual transformed surfaces, including
-    // the tilt of the building and wellhead. No screen-space stand-in sockets.
     const towerA=port(frontTower,[124,7,0],[1,0,0],5.5,'Front tower outlet');
     const towerB=port(rearTower,[0,3.5,0],[0,-1,0],4.5,'Rear tower outlet');
     const inletA=port(building,[-48,12,17],[0,0,1],5.5,'Front tower receiver');
@@ -376,7 +502,6 @@ DEALINGS IN THE SOFTWARE. -->
       inletB.at(38),inletB.at(-8)],4.5,23,'Rear tower collector');
 
     const teeA=P(1165,850,depth),teeB=P(1165,880,depth);
-    // Continuous main riser: both branches meet its exact centreline in 3D.
     const supplyTop=P(1165,H-wellInlet.face.y,depth);
     pipeWorld([P(1165,921,depth),supplyTop,wellInlet.at(-7)],13,39,'Main supply riser');
     function tee(center,radius,label){
@@ -397,14 +522,11 @@ DEALINGS IN THE SOFTWARE. -->
     }
     transfer(feedA,850,branchA,7,'Main transfer line');
     transfer(feedB,880,branchB,4.5,'Secondary transfer line');
-    // The riser foot is seated on a small pad; its open end stays inside it.
     const foot=new T.Group();foot.position.copy(P(1165,921,depth));scene.add(foot);
     cylinder(foot,0,-1,0,20,5,metal);cylinder(foot,0,5,0,15.5,5,darkMetal);
     axialRing(P(1165,914,depth),new T.Vector3(0,1,0),14.4,1.2,metal);
     axialRing(P(1218,H-wellInlet.face.y,depth),new T.Vector3(1,0,0),14.4,1.2,darkMetal);
 
-    // Export pipes also start on actual cylinder surfaces and continue under the
-    // corner vegetation, so no exposed, dangling tube end is left in the scene.
     const exportA=port(wellhead,[47,87,0],[1,0,0],7,'Upper export outlet');
     const exportB=port(wellhead,[58,48,0],[1,0,0],4.5,'Lower export outlet');
     pipeWorld([exportA.at(-6),exportA.at(30),P(1535,1080-exportA.face.y,exportA.face.z),P(1850,873,exportA.face.z)],7,25,'Upper export line');
@@ -432,7 +554,6 @@ DEALINGS IN THE SOFTWARE. -->
     pipeNetwork.joins.push({label:'Main riser inlet',center:wellInlet.face.clone(),branch:wellInlet.face.clone(),radius:13});
   }
 
-  // A static Christmas-tree wellhead assembled from brass flanges and pressure vessels.
   const wellhead=new T.Group();wellhead.position.copy(P(1352,925,205));wellhead.rotation.x=.18;scene.add(wellhead);
   cylinder(wellhead,0,4,0,87,10,darkMetal);
   cylinder(wellhead,0,16,0,83,18);
@@ -457,7 +578,6 @@ DEALINGS IN THE SOFTWARE. -->
     const housing=new T.Group();housing.position.set(side*(length-16),y,0);housing.rotation.z=Math.PI/2;wellhead.add(housing);
     flange(housing,0,radius+7,6);
   }
-  // Two large, stationary wheels; only their material reflections move.
   function wheel(x,y,radius){
     const g=new T.Group();g.position.set(x,y,13);g.rotation.y=-.23;wellhead.add(g);
     torus(g,0,0,0,radius,2.25,darkMetal,'front');
@@ -471,18 +591,18 @@ DEALINGS IN THE SOFTWARE. -->
   }
   const upperWheel=wheel(100,218,27);
   const lowerWheel=wheel(140,137,30);
-  // The two main valves have separate, aligned shafts and unobstructed rims.
   rod(wellhead,[-43,181,0],[-43,208,0],2.5,darkMetal);
   const dial=mesh(new T.CylinderGeometry(10,10,4,32),darkMetal,wellhead);dial.position.set(-22,209,22);dial.rotation.x=Math.PI/2;
-  const face=mesh(new T.CircleGeometry(7.6,32),flat('#fce2ae'),wellhead);face.position.set(-22,209,24.3);
-  rod(wellhead,[-22,209,25],[-18,213,25],.65,darkMetal);
+  const dialFaceMat = flatMat('#fce2ae');
+  const face=mesh(new T.CircleGeometry(7.6,32),dialFaceMat,wellhead);face.position.set(-22,209,24.3);
+  const gaugePivot=new T.Group();gaugePivot.position.set(-22,209,25);wellhead.add(gaugePivot);
+  rod(gaugePivot,[0,0,0],[4,4,0],.65,darkMetal);
   for(let i=0;i<9;i++){
     const a=TAU*i/9;box(wellhead,Math.cos(a)*72,8,Math.sin(a)*72,4,12,4,darkMetal);
   }
 
   buildPipeNetwork();
 
-  // Fine mesh fencing gives the foreground a sense of scale.
   const fence=new T.Group();scene.add(fence);
   const fenceMat=new T.LineBasicMaterial({color:'#7e62b2',transparent:true,opacity:.16});
   function fenceRun(x1,y1,x2,y2,z,postCount){
@@ -503,14 +623,17 @@ DEALINGS IN THE SOFTWARE. -->
     fence.add(new T.LineSegments(geo,fenceMat));
     rod(fence,[x1,H-y1+42,z],[x2,H-y2+42,z],.8,metal);
   }
-  // Leave the well foundation and supply elbow completely free of foreground mesh.
   fenceRun(1504,940,1666,932,142,3);
 
-  // A connected SDF ribbon follows an authored centerline. Smooth unions of its
-  // cross sections resolve tight turns without the folded triangles of a wide
-  // conventional strip. The contour and its internal layers breathe together.
+  // Shared SDF Steam color uniforms
+  const steamColorUniforms = {
+    uSteamCream: { value: new T.Vector3(1.0, 0.982, 0.82) },
+    uSteamMint: { value: new T.Vector3(0.72, 0.96, 0.86) },
+    uSteamCyan: { value: new T.Vector3(0.40, 0.87, 0.91) },
+    uSteamLavender: { value: new T.Vector3(0.72, 0.77, 0.94) }
+  };
   const steamSystems=[];
-  function plume(points,widths,z,opacity=1,offset=0){
+  function plume(points,widths,z,opacity=1,offset=0,tag='other'){
     const curve=new T.CatmullRomCurve3(points.map(p=>new T.Vector3(p[0],p[1],0)),false,'catmullrom',.48);
     const count=points.length>15?80:points.length>8?54:36;
     const nodes=[],baseNodes=[];
@@ -526,6 +649,7 @@ DEALINGS IN THE SOFTWARE. -->
     const material=shader(`
       uniform vec4 uNodes[${count}];
       uniform float uPhase,uOffset,uOpacity;
+      uniform vec3 uSteamCream,uSteamMint,uSteamCyan,uSteamLavender;
       varying vec3 vWorld; ${common}
       void main(){
         vec2 p=vec2(vWorld.x,1080.-vWorld.y);
@@ -547,10 +671,9 @@ DEALINGS IN THE SOFTWARE. -->
         float alpha=1.-smoothstep(-aa,aa,d);
         if(alpha<.002)discard;
         float side=relative.x*.78+relative.y*.38;
-        vec3 cream=vec3(1.,.982,.82),mint=vec3(.72,.96,.86),cyan=vec3(.40,.87,.91),lavender=vec3(.72,.77,.94);
+        vec3 cream=uSteamCream,mint=uSteamMint,cyan=uSteamCyan,lavender=uSteamLavender;
         vec3 c=mix(cream,mint,smoothstep(-.77,.37,side));
         c=mix(c,cyan,smoothstep(-.02,.92,side)*.67);
-        // Contour fullness and inner pastel folds travel from source to sky.
         float transport=arc*31.415926-uPhase*4.+uOffset;
         float fold=pow(.5+.5*sin(transport+side*3.1),2.);
         float billow=.5+.5*cos(transport+relative.x*2.4);
@@ -565,30 +688,34 @@ DEALINGS IN THE SOFTWARE. -->
         float fade=1.-smoothstep(.62,1.,arc)*.95;
         gl_FragColor=vec4(linearColor(c),alpha*fade*uOpacity); ${finish}
       }
-    `,{uNodes:{value:nodes},uOffset:{value:offset},uOpacity:{value:opacity*.96}},
-      {transparent:true,depthWrite:false,extensions:{derivatives:true}});
-    const o=plane(maxX-minX,maxY-minY,material,(minX+maxX)/2,(minY+maxY)/2,z);
+    `,{
+      uNodes:{value:nodes},uOffset:{value:offset},uOpacity:{value:opacity*.96},
+      uSteamCream: steamColorUniforms.uSteamCream,
+      uSteamMint: steamColorUniforms.uSteamMint,
+      uSteamCyan: steamColorUniforms.uSteamCyan,
+      uSteamLavender: steamColorUniforms.uSteamLavender
+    },{transparent:true,depthWrite:false,extensions:{derivatives:true}});
+    // Add generous padding to SDF quad so steamWidth scaling never clips
+    const padX = (maxX - minX) * 0.45 + 90;
+    const padY = (maxY - minY) * 0.45 + 90;
+    const o=plane((maxX-minX)+padX,(maxY-minY)+padY,material,(minX+maxX)/2,(minY+maxY)/2,z);
     o.renderOrder=20+z*.01;
-    steamSystems.push({nodes,baseNodes,offset});
+    steamSystems.push({nodes,baseNodes,offset,mesh:o,basePosY:o.position.y,tag});
     return o;
   }
-  // Each tower has its own steam corridor. Sources sit inside the openings;
-  // the front rims occlude the base naturally while the vapor rises above them.
   const frontSteam=plume([[430,570],[443,531],[454,489],[482,455],[501,412],[537,378],[574,343],[622,319],[689,288],[770,269],[853,250]],
-    [22,27,31,35,39,42,44,47,49,51,52],94,.87,.2);
+    [22,27,31,35,39,42,44,47,49,51,52],94,.87,.2,'frontTower');
   const rearSteam=plume([[700,581],[718,549],[733,520],[768,493],[786,458],[825,436],[852,409],[899,390],[953,366],[1014,353],[1091,339]],
-    [18,22,25,29,32,35,38,40,42,44,46],61,.77,1.1);
+    [18,22,25,29,32,35,38,40,42,44,46],61,.77,1.1,'rearTower');
   plume([[1490,355],[1543,309],[1593,253],[1612,214],[1681,233],[1753,267],[1840,259],[1973,225]],
-    [17,36,49,62,71,78,87,94],127,.25,.7);
+    [17,36,49,62,71,78,87,94],127,.25,.7,'high');
   const mainSteamPath=[[1240,620],[1234,589],[1250,562],[1278,541],[1298,512],[1290,482],[1324,465],[1381,482],[1433,462],[1451,423],[1426,381],[1443,337],[1510,312],[1568,283],[1634,290],[1687,328],[1755,344],[1814,317],[1871,274],[1960,267],[2075,249]];
   const mainSteam=plume(mainSteamPath.map((p,i)=>[p[0]+112*(1-i/20),p[1]+14*(1-i/20)]),
-    [4,9,15,22,28,35,43,50,64,70,79,85,89,96,104,106,112,116,119,124,130],128,1,0);
-  plume([[1570,728],[1575,710],[1587,700],[1588,685],[1603,677],[1609,659],[1625,650]], [2,3,4,5,7,9,11],-90,.66,2.2);
-  plume([[1772,734],[1777,710],[1792,693],[1791,672],[1811,656],[1819,633],[1844,623],[1871,599]], [2,5,8,10,13,16,21,26],-89,.70,.6);
-  plume([[1885,780],[1902,758],[1923,749],[1931,731],[1956,725],[1987,711],[2031,707]], [2,8,12,16,21,27,34],-88,.39,1.8);
+    [4,9,15,22,28,35,43,50,64,70,79,85,89,96,104,106,112,116,119,124,130],128,1,0,'well');
+  plume([[1570,728],[1575,710],[1587,700],[1588,685],[1603,677],[1609,659],[1625,650]], [2,3,4,5,7,9,11],-90,.66,2.2,'distant');
+  plume([[1772,734],[1777,710],[1792,693],[1791,672],[1811,656],[1819,633],[1844,623],[1871,599]], [2,5,8,10,13,16,21,26],-89,.70,.6,'distant');
+  plume([[1885,780],[1902,758],[1923,749],[1931,731],[1956,725],[1987,711],[2031,707]], [2,8,12,16,21,27,34],-88,.39,1.8,'distant');
 
-  // Varied rounded crowns, curved tapering trunks, and low, trunkless bushes.
-  // Foliage frames the corners; a clear central opening preserves the facility.
   const crownGeometries=[];
   for(let variant=0;variant<7;variant++){
     const outline=[];
@@ -602,6 +729,7 @@ DEALINGS IN THE SOFTWARE. -->
     crownGeometries.push(new T.ShapeGeometry(shape));
   }
   const leafMaterials=[];
+  const windUniform = { value: 1.0 };
   for(const [index,base,lit]of [[0,'#24104e','#70409b'],[1,'#391263','#9444ab'],[2,'#21114f','#514398'],[3,'#130a35','#33205f']]){
     const material=shader(`
       uniform float uPhase,uSeed;uniform vec3 uBase,uLit;
@@ -614,13 +742,13 @@ DEALINGS IN THE SOFTWARE. -->
         c+=.005*sin(uPhase+uSeed+vWorld.x*.003);
         gl_FragColor=vec4(c,1.); ${finish}
       }
-    `,{uSeed:{value:index*1.7},uBase:{value:C(base)},uLit:{value:C(lit)}});
+    `,{uSeed:{value:index*1.7},uBase:{value:C(base)},uLit:{value:C(lit)},uWind:windUniform});
     material.vertexShader=`
-      uniform float uPhase,uSeed;varying vec3 vLocal,vWorld;
+      uniform float uPhase,uSeed,uWind;varying vec3 vLocal,vWorld;
       void main(){
         vLocal=position;vec3 p=position;
-        p.x+=.009*sin(uPhase+uSeed+p.y*1.4)*(p.y+1.)*.5;
-        p.y+=.004*sin(uPhase*2.+uSeed+p.x*2.);
+        p.x+=.009*uWind*sin(uPhase+uSeed+p.y*1.4)*(p.y+1.)*.5;
+        p.y+=.004*uWind*sin(uPhase*2.+uSeed+p.x*2.);
         vec4 w=modelMatrix*vec4(p,1.);vWorld=w.xyz;
         gl_Position=projectionMatrix*viewMatrix*w;
       }
@@ -642,6 +770,7 @@ DEALINGS IN THE SOFTWARE. -->
   trunkShape.bezierCurveTo(.09,.34,.04,.16,.035,0);
   trunkShape.closePath();
   const trunkGeo=new T.ShapeGeometry(trunkShape,28);
+  const trunkMat = flatMat('#28204b'), trunkDarkMat = flatMat('#190d38'), trunkSliverMat = flatMat('#9c7199');
   const trees=[],bushes=[];
   function crown(parent,x,y,z,rx,ry,index,variant,angle=0){
     const o=mesh(crownGeometries[variant%7],leafMaterials[index%4],parent);
@@ -649,11 +778,10 @@ DEALINGS IN THE SOFTWARE. -->
   }
   function tree(x,y,height,width,z,index,variant){
     const group=new T.Group();group.position.copy(P(x,y,z));scene.add(group);
-    const trunk=mesh(trunkGeo,flat(index===3?'#190d38':'#28204b'),group);
+    const trunk=mesh(trunkGeo,index===3?trunkDarkMat:trunkMat,group);
     trunk.scale.set(width,height,1);
-    // Sun-facing sliver follows the trunk curve, below the crown rather than on it.
     const branchCurve=new T.CatmullRomCurve3([new T.Vector3(-width*.018,0,1),new T.Vector3(width*.012,height*.25,1),new T.Vector3(width*.07,height*.48,1),new T.Vector3(width*.12,height*.62,1)]);
-    mesh(new T.TubeGeometry(branchCurve,22,.9,5,false),flat('#9c7199'),group);
+    mesh(new T.TubeGeometry(branchCurve,22,.9,5,false),trunkSliverMat,group);
     crown(group,-width*.28,height*.71,2,width*.38,width*.23,index,variant,.12);
     crown(group,width*.29,height*.76,3,width*.39,width*.25,index,variant+2,-.15);
     crown(group,width*.02,height*.92,4,width*.45,width*.30,index,variant+4,.04);
@@ -666,8 +794,10 @@ DEALINGS IN THE SOFTWARE. -->
     crown(group,-width*.02,height*.50,2,width*.41,height*.59,index,variant+1,0);
     bushes.push(group);return group;
   }
-  pathShape([['M',-140,989],['C',110,907,338,885,512,939],['C',716,998,805,1008,1016,1088],['L',1060,5000],['L',-200,5000],['Z']],gradient('#35339d','#1e1054',888,1170),310);
-  pathShape([['M',899,1100],['C',1135,983,1255,991,1403,1028],['C',1583,1071,1720,952,1954,925],['L',2220,5000],['L',800,5000],['Z']],gradient('#56309a','#20124b',965,1260),315);
+  const bh0Mat = gradient('#35339d','#1e1054',888,1170); bushHillGradients.push(bh0Mat);
+  pathShape([['M',-140,989],['C',110,907,338,885,512,939],['C',716,998,805,1008,1016,1088],['L',1060,5000],['L',-200,5000],['Z']],bh0Mat,310);
+  const bh1Mat = gradient('#56309a','#20124b',965,1260); bushHillGradients.push(bh1Mat);
+  pathShape([['M',899,1100],['C',1135,983,1255,991,1403,1028],['C',1583,1071,1720,952,1954,925],['L',2220,5000],['L',800,5000],['Z']],bh1Mat,315);
   tree(-24,1133,465,224,350,2,0);
   tree(134,1158,424,202,360,1,2);
   tree(53,1188,340,200,380,0,4);
@@ -683,8 +813,10 @@ DEALINGS IN THE SOFTWARE. -->
     [1921,1155,278,193,458,3,5]
   ])bush(x,y,w,h,z,index,variant);
 
-  // Tapered gull wings flex around a stable body, with offset beats and banking.
+  // Birds
   const birdGroups=[];
+  const birdWingMaterials=[];
+  const birdBodyMat = flatMat('#79709d'), birdHeadMat = flatMat('#9183ac');
   const wingShape=new T.Shape();
   wingShape.moveTo(0,0);
   wingShape.bezierCurveTo(.25,.15,.67,.37,1,.20);
@@ -715,111 +847,1173 @@ DEALINGS IN THE SOFTWARE. -->
         void main(){gl_FragColor=vec4(uColor*(.90+.13*abs(vLocal.x)),1.);${finish}}
       `
     });
+    birdWingMaterials.push(material);
     const left=mesh(wingGeo,material,group);left.scale.x=-1;
     const right=mesh(wingGeo,material,group);
-    sphere(group,0,-.015,.02,.065,.145,.045,flat('#79709d'));
-    sphere(group,0,.115,.03,.055,.065,.04,flat('#9183ac'));
-    const tail=mesh(tailGeo,flat('#79709d'),group);tail.position.z=-.02;
+    sphere(group,0,-.015,.02,.065,.145,.045,birdBodyMat);
+    sphere(group,0,.115,.03,.055,.065,.04,birdHeadMat);
+    const tail=mesh(tailGeo,birdBodyMat,group);tail.position.z=-.02;
     birdGroups.push({group,left,right,x,y,i,size});
   }
-  const sparkles=[];
+
+  const sparkles=[], sparkleCoreMats=[], sparkleHaloMats=[];
   for(const [i,x,y]of [[0,1020,186],[1,1327,99],[2,1726,136]]){
     const material=new T.MeshBasicMaterial({color:'#fff4c0',transparent:true,opacity:.8,depthWrite:false});
+    sparkleCoreMats.push(material);
     const o=mesh(new T.CircleGeometry(i===1?2.8:1.9,16),material);o.position.copy(P(x,y,-30));sparkles.push({o,x,y,i});
-    const halo=mesh(new T.CircleGeometry(6,20),new T.MeshBasicMaterial({color:'#d5f5ca',transparent:true,opacity:.045,depthWrite:false}),o);
+    const haloMat = new T.MeshBasicMaterial({color:'#d5f5ca',transparent:true,opacity:.045,depthWrite:false});
+    sparkleHaloMats.push(haloMat);
+    const halo=mesh(new T.CircleGeometry(6,20),haloMat,o);
     halo.position.z=-.1;
   }
 
-  let pixelRatio=1, resizePending=true, frameId=0, lastFrame=0, slowFrames=0, disposed=false;
-  const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)');
-  function resize(){
-    const width=window.innerWidth,height=window.innerHeight,aspect=width/Math.max(1,height);
-    // Cover framing at wide ratios; a taller orthographic frustum on phones keeps
-    // both towers and the wellhead visible while the art remains edge to edge.
-    let viewW,viewH;
-    if(aspect>=W/H){viewW=W;viewH=W/aspect;}
-    else if(aspect>=1.12){viewH=H;viewW=H*aspect;}
-    else {viewW=1320;viewH=viewW/aspect;}
-    const centerX=aspect<1.12?930:W/2;
-    const centerY=aspect<1.12?590:H/2;
-    camera.left=-viewW/2;camera.right=viewW/2;camera.top=viewH/2;camera.bottom=-viewH/2;
-    camera.position.set(centerX,H-centerY,2300);camera.lookAt(centerX,H-centerY,0);camera.updateProjectionMatrix();
-    pixelRatio=Math.min(window.devicePixelRatio||1,query.get('quality')==='low'?1:1.8,Math.sqrt(4200000/(width*height)));
-    renderer.setPixelRatio(pixelRatio);renderer.setSize(width,height,false);resizePending=false;
+  // =========================================================================
+  // 19 Preconfigured Color Schemes
+  // =========================================================================
+  function makeHarmonyTheme({
+    bg, skyCyan, skyMint, skySun, skyBand,
+    hills, fgHills, bushHills,
+    waterDeep, waterLight, waterReflect, bank,
+    metalShadow, metalMid, metalLit, metalSpec, metalCool,
+    darkShadow, darkLit,
+    concShadow, concMid, concLit, concTint,
+    buildingTop, buildingBot, windowA, windowB, mullion, door, dialFace, fence,
+    steamCream, steamMint, steamCyan, steamLavender,
+    leaves, trunk, trunkDark, trunkSliver,
+    birdWing, birdBody, birdHead,
+    sparkleCore, sparkleHalo
+  }) {
+    return {
+      bg, skyCyan, skyMint, skySun, skyBand,
+      hills, fgHills, bushHills,
+      waterDeep, waterLight, waterReflect, bank,
+      metalShadow, metalMid, metalLit, metalSpec, metalCool,
+      darkShadow, darkLit,
+      concShadow, concMid, concLit, concTint,
+      buildingTop, buildingBot, windowA, windowB, mullion, door, dialFace, fence,
+      steamCream, steamMint, steamCyan, steamLavender,
+      leaves, trunk, trunkDark, trunkSliver,
+      birdWing, birdBody, birdHead,
+      sparkleCore, sparkleHalo
+    };
   }
-  function renderAt(seconds){
-    if(disposed)return;
-    if(resizePending)resize();
-    const time=((seconds%DURATION)+DURATION)%DURATION;
-    phase.value=time/DURATION*TAU;
-    for(const system of steamSystems){
-      for(let i=0;i<system.nodes.length;i++){
-        const base=system.baseNodes[i],s=base.w,offset=system.offset;
-        const transport=s*TAU*5-phase.value*4+offset;
-        const weight=T.MathUtils.smoothstep(s,0,.12);
-        const pressure=.105*Math.sin(transport)+.030*Math.sin(transport*2+.6);
-        const drift=Math.sin(transport-.8)*base.z*.048*weight;
-        system.nodes[i].set(base.x+drift+Math.sin(phase.value-s*6+offset)*s*2.5,
-          base.y+Math.cos(transport)*base.z*.025*weight,base.z*(1+pressure*weight),s);
+
+  // Build cohesive theme from 5-6 palette colors [highlight, accentA, midAccent, deepMid, darkShadow, deepest]
+  function buildFromPalette(cLight, cBright, cMid, cDeep, cDark, cVoid = cDark) {
+    return makeHarmonyTheme({
+      bg: mixHex(cMid, cLight, 0.25),
+      skyCyan: mixHex(cMid, cDeep, 0.25),
+      skyMint: mixHex(cBright, cLight, 0.35),
+      skySun: cLight,
+      skyBand: mixHex(cLight, cBright, 0.45),
+      hills: [
+        [mixHex(cLight, cBright, 0.45), mixHex(cMid, cDeep, 0.2)],
+        [mixHex(cBright, cMid, 0.35), mixHex(cMid, cDeep, 0.45)],
+        [cMid, mixHex(cDeep, cDark, 0.3)],
+        [mixHex(cMid, cDeep, 0.55), cDeep],
+        [cDeep, mixHex(cDeep, cDark, 0.55)]
+      ],
+      fgHills: [
+        [mixHex(cMid, cDeep, 0.4), cDark],
+        [mixHex(cBright, cMid, 0.35), mixHex(cDeep, cDark, 0.45)],
+        [mixHex(cLight, cBright, 0.4), mixHex(cMid, cDeep, 0.3)]
+      ],
+      bushHills: [
+        [mixHex(cDeep, cDark, 0.35), cVoid],
+        [mixHex(cDeep, cMid, 0.2), cVoid]
+      ],
+      waterDeep: cMid,
+      waterLight: cBright,
+      waterReflect: cLight,
+      bank: mixHex(cLight, cBright, 0.3),
+      metalShadow: cDark,
+      metalMid: mixHex(cMid, cBright, 0.55),
+      metalLit: mixHex(cBright, cLight, 0.5),
+      metalSpec: cLight,
+      metalCool: mixHex(cMid, cBright, 0.3),
+      darkShadow: cVoid,
+      darkLit: mixHex(cBright, cLight, 0.35),
+      concShadow: mixHex(cDeep, cDark, 0.35),
+      concMid: mixHex(cMid, cBright, 0.45),
+      concLit: mixHex(cLight, cBright, 0.35),
+      concTint: mixHex(cBright, cLight, 0.45),
+      buildingTop: mixHex(cMid, cDeep, 0.35),
+      buildingBot: cDeep,
+      windowA: mixHex(cLight, cBright, 0.2),
+      windowB: cLight,
+      mullion: mixHex(cBright, cMid, 0.5),
+      door: cLight,
+      dialFace: cLight,
+      fence: mixHex(cMid, cLight, 0.3),
+      steamCream: mixHex(cLight, '#ffffff', 0.3),
+      steamMint: mixHex(cLight, cBright, 0.35),
+      steamCyan: mixHex(cBright, cMid, 0.35),
+      steamLavender: mixHex(cMid, cLight, 0.45),
+      leaves: [
+        [cDark, mixHex(cDeep, cMid, 0.4)],
+        [mixHex(cDark, cDeep, 0.45), mixHex(cMid, cBright, 0.25)],
+        [cDark, cDeep],
+        [cVoid, mixHex(cDark, cDeep, 0.5)]
+      ],
+      trunk: cDark,
+      trunkDark: cVoid,
+      trunkSliver: mixHex(cMid, cLight, 0.4),
+      birdWing: mixHex(cDeep, cLight, 0.35),
+      birdBody: mixHex(cDeep, cDark, 0.25),
+      birdHead: mixHex(cMid, cLight, 0.45),
+      sparkleCore: cLight,
+      sparkleHalo: cBright
+    });
+  }
+
+  function buildProceduralHarmony(harmonyType, baseHue) {
+    const h = ((baseHue % 360) + 360) % 360;
+    let hSky, hHill, hMetal, hFoliage, hWater;
+    let satSky = 0.62, satHill = 0.55, satMetal = 0.72, satFol = 0.52;
+    switch (harmonyType) {
+      case 'Monochromatic':
+        hSky = h; hHill = h; hMetal = h; hFoliage = h; hWater = h;
+        satSky = 0.65; satHill = 0.55; satMetal = 0.62; satFol = 0.58;
+        break;
+      case 'Analogous':
+        hSky = h; hWater = h + 15; hHill = h + 32; hMetal = h - 28; hFoliage = h + 48;
+        break;
+      case 'Complementary':
+        hSky = h; hWater = h + 10; hHill = h + 18; hMetal = h + 180; hFoliage = h - 14;
+        break;
+      case 'Split-complementary':
+        hSky = h; hWater = h + 12; hHill = h + 150; hMetal = h + 205; hFoliage = h - 18;
+        break;
+      case 'Triadic':
+        hSky = h; hWater = h + 12; hHill = h + 120; hMetal = h + 240; hFoliage = h + 135;
+        break;
+      case 'Tetradic':
+        hSky = h; hWater = h + 60; hHill = h + 180; hMetal = h + 240; hFoliage = h + 195;
+        break;
+      case 'Double split-complementary':
+        hSky = h; hWater = h + 30; hHill = h + 150; hMetal = h + 210; hFoliage = h + 180;
+        break;
+      case 'Neutral + Accent':
+        hSky = h; hWater = h; hHill = h + 10; hMetal = h + 165; hFoliage = h;
+        satSky = 0.14; satHill = 0.12; satMetal = 0.78; satFol = 0.10;
+        break;
+      default:
+        hSky = h; hWater = h + 20; hHill = h + 120; hMetal = h + 240; hFoliage = h + 150;
+    }
+    const bgHex = hslToHex(hSky, satSky * 0.85, 0.48);
+    return makeHarmonyTheme({
+      bg: bgHex,
+      skyCyan: hslToHex(hSky, satSky * 0.9, 0.44),
+      skyMint: hslToHex(hSky + 12, satSky * 0.85, 0.66),
+      skySun: hslToHex(hMetal, Math.min(1, satMetal * 0.85), 0.88),
+      skyBand: hslToHex(hSky + 8, satSky * 0.7, 0.80),
+      hills: [
+        [hslToHex(hMetal, satMetal * 0.65, 0.74), hslToHex(hHill, satHill * 0.6, 0.64)],
+        [hslToHex(hSky + 10, satSky * 0.8, 0.50), hslToHex(hHill, satHill * 0.7, 0.68)],
+        [hslToHex(hHill, satHill * 0.85, 0.56), hslToHex(hHill + 8, satHill * 0.75, 0.70)],
+        [hslToHex(hHill + 6, satHill * 0.82, 0.46), hslToHex(hHill + 12, satHill * 0.75, 0.52)],
+        [hslToHex(hHill + 10, satHill * 0.78, 0.40), hslToHex(hHill + 15, satHill * 0.75, 0.46)]
+      ],
+      fgHills: [
+        [hslToHex(hWater, satSky * 0.75, 0.44), hslToHex(hFoliage, satFol * 0.85, 0.24)],
+        [hslToHex(hMetal, satMetal * 0.6, 0.68), hslToHex(hHill, satHill * 0.7, 0.36)],
+        [hslToHex(hMetal, satMetal * 0.75, 0.74), hslToHex(hHill, satHill * 0.6, 0.56)]
+      ],
+      bushHills: [
+        [hslToHex(hFoliage, satFol * 0.8, 0.32), hslToHex(hFoliage, satFol * 0.9, 0.14)],
+        [hslToHex(hFoliage + 12, satFol * 0.75, 0.34), hslToHex(hFoliage, satFol * 0.88, 0.13)]
+      ],
+      waterDeep: hslToHex(hWater, Math.max(0.25, satSky * 0.9), 0.45),
+      waterLight: hslToHex(hWater + 10, Math.max(0.3, satSky * 0.85), 0.72),
+      waterReflect: hslToHex(hMetal, satMetal * 0.7, 0.88),
+      bank: hslToHex(hMetal, satMetal * 0.65, 0.80),
+      metalShadow: hslToHex(hFoliage, satFol * 0.8, 0.24),
+      metalMid: hslToHex(hMetal - 10, satMetal * 0.65, 0.56),
+      metalLit: hslToHex(hMetal, satMetal, 0.70),
+      metalSpec: hslToHex(hMetal, satMetal * 0.75, 0.90),
+      metalCool: hslToHex(hSky, satSky * 0.8, 0.56),
+      darkShadow: hslToHex(hFoliage, satFol * 0.85, 0.15),
+      darkLit: hslToHex(hMetal, satMetal * 0.85, 0.64),
+      concShadow: hslToHex(hHill, satHill * 0.8, 0.38),
+      concMid: hslToHex(hMetal - 12, satMetal * 0.58, 0.60),
+      concLit: hslToHex(hMetal, satMetal * 0.85, 0.76),
+      concTint: hslToHex(hMetal + 8, satMetal * 0.65, 0.74),
+      buildingTop: hslToHex(hHill, satHill * 0.65, 0.52),
+      buildingBot: hslToHex(hHill, satHill * 0.7, 0.38),
+      windowA: hslToHex(hMetal, satMetal * 0.85, 0.82),
+      windowB: hslToHex(hMetal, satMetal * 0.85, 0.88),
+      mullion: hslToHex(hMetal, satMetal * 0.5, 0.68),
+      door: hslToHex(hMetal, satMetal * 0.8, 0.84),
+      dialFace: hslToHex(hMetal, satMetal * 0.75, 0.85),
+      fence: hslToHex(hHill, satHill * 0.5, 0.52),
+      steamCream: hslToHex(hMetal, satMetal * 0.45, 0.93),
+      steamMint: hslToHex(hSky + 12, satSky * 0.55, 0.86),
+      steamCyan: hslToHex(hSky, satSky * 0.65, 0.70),
+      steamLavender: hslToHex(hHill, satHill * 0.5, 0.78),
+      leaves: [
+        [hslToHex(hFoliage, satFol * 0.9, 0.16), hslToHex(hFoliage, satFol * 0.7, 0.38)],
+        [hslToHex(hFoliage + 14, satFol * 0.88, 0.20), hslToHex(hFoliage + 14, satFol * 0.68, 0.44)],
+        [hslToHex(hFoliage - 10, satFol * 0.88, 0.15), hslToHex(hFoliage - 10, satFol * 0.65, 0.36)],
+        [hslToHex(hFoliage, satFol * 0.92, 0.10), hslToHex(hFoliage, satFol * 0.72, 0.24)]
+      ],
+      trunk: hslToHex(hFoliage, satFol * 0.65, 0.18),
+      trunkDark: hslToHex(hFoliage, satFol * 0.8, 0.11),
+      trunkSliver: hslToHex(hMetal, satMetal * 0.45, 0.56),
+      birdWing: hslToHex(hHill, satHill * 0.45, 0.58),
+      birdBody: hslToHex(hHill, satHill * 0.45, 0.48),
+      birdHead: hslToHex(hHill, satHill * 0.4, 0.64),
+      sparkleCore: hslToHex(hMetal, satMetal * 0.8, 0.92),
+      sparkleHalo: hslToHex(hSky + 15, satSky * 0.7, 0.88)
+    });
+  }
+
+  const COLOR_SCHEMES = {
+    'Original': makeHarmonyTheme({
+      bg: '#00d3ce',
+      skyCyan: '#00d1cf', skyMint: '#66f0d4', skySun: '#fff9ad', skyBand: '#bffacc',
+      hills: [
+        ['#eddf90','#aaa1cf'], ['#00bbe6','#9ab9f1'], ['#8550df','#bd92ec'], ['#6743cd','#7448c5'], ['#5152c2','#6843ba']
+      ],
+      fgHills: [ ['#367fce','#39238e'], ['#e9a4bd','#7133ae'], ['#f7c498','#cf7fbd'] ],
+      bushHills: [ ['#35339d','#1e1054'], ['#56309a','#20124b'] ],
+      waterDeep: '#03d1db', waterLight: '#7afcd9', waterReflect: '#e0ffc7', bank: '#f5dfaa',
+      metalShadow: '#3d267a', metalMid: '#bd80b8', metalLit: '#ffc97d', metalSpec: '#fff5c4', metalCool: '#40b0d4',
+      darkShadow: '#29175c', darkLit: '#f0b875',
+      concShadow: '#4d33ba', concMid: '#c285cf', concLit: '#ffe08f', concTint: '#f5bdb3',
+      buildingTop: '#8173bd', buildingBot: '#59539a',
+      windowA: '#ffe8aa', windowB: '#fff3b3', mullion: '#d9b28f', door: '#ffdeaa', dialFace: '#fce2ae', fence: '#7e62b2',
+      steamCream: '#fffae0', steamMint: '#b8f5db', steamCyan: '#66dee8', steamLavender: '#b8c4f0',
+      leaves: [ ['#24104e','#70409b'], ['#391263','#9444ab'], ['#21114f','#514398'], ['#130a35','#33205f'] ],
+      trunk: '#28204b', trunkDark: '#190d38', trunkSliver: '#9c7199',
+      birdWing: '#8d80ac', birdBody: '#79709d', birdHead: '#9183ac',
+      sparkleCore: '#fff4c0', sparkleHalo: '#d5f5ca'
+    }),
+    'Monochromatic': buildProceduralHarmony('Monochromatic', 202),
+    'Analogous': buildProceduralHarmony('Analogous', 172),
+    'Complementary': buildProceduralHarmony('Complementary', 210),
+    'Split-complementary': buildProceduralHarmony('Split-complementary', 188),
+    'Triadic': buildProceduralHarmony('Triadic', 195),
+    'Tetradic': buildProceduralHarmony('Tetradic', 205),
+    'Double split-complementary': buildProceduralHarmony('Double split-complementary', 190),
+    'Achromatic': makeHarmonyTheme({
+      bg: '#b8b8b8',
+      skyCyan: '#a6a6a6', skyMint: '#e3e3e3', skySun: '#ffffff', skyBand: '#f2f2f2',
+      hills: [
+        ['#e6e6e6','#9e9e9e'], ['#c9c9c9','#8c8c8c'], ['#9e9e9e','#757575'], ['#737373','#545454'], ['#545454','#3b3b3b']
+      ],
+      fgHills: [ ['#4a4a4a','#242424'], ['#bababa','#454545'], ['#e0e0e0','#8f8f8f'] ],
+      bushHills: [ ['#2b2b2b','#0d0d0d'], ['#363636','#121212'] ],
+      waterDeep: '#666666', waterLight: '#e6e6e6', waterReflect: '#ffffff', bank: '#dcdcdc',
+      metalShadow: '#1f1f1f', metalMid: '#8a8a8a', metalLit: '#ededed', metalSpec: '#ffffff', metalCool: '#b5b5b5',
+      darkShadow: '#0d0d0d', darkLit: '#cfcfcf',
+      concShadow: '#383838', concMid: '#969696', concLit: '#f2f2f2', concTint: '#d6d6d6',
+      buildingTop: '#6e6e6e', buildingBot: '#404040',
+      windowA: '#ffffff', windowB: '#e8e8e8', mullion: '#9c9c9c', door: '#ffffff', dialFace: '#f5f5f5', fence: '#666666',
+      steamCream: '#ffffff', steamMint: '#ebebeb', steamCyan: '#cccccc', steamLavender: '#b0b0b0',
+      leaves: [ ['#141414','#454545'], ['#1f1f1f','#575757'], ['#0f0f0f','#363636'], ['#080808','#242424'] ],
+      trunk: '#1a1a1a', trunkDark: '#0a0a0a', trunkSliver: '#9e9e9e',
+      birdWing: '#404040', birdBody: '#242424', birdHead: '#545454',
+      sparkleCore: '#ffffff', sparkleHalo: '#e0e0e0'
+    }),
+    'Achromatic + Accent': makeHarmonyTheme({
+      bg: '#b0b2b8',
+      skyCyan: '#9ea1a8', skyMint: '#dfe1e6', skySun: '#ffe5e8', skyBand: '#f5f5f7',
+      hills: [
+        ['#ebebed','#999ba1'], ['#c7c9cf','#858891'], ['#92959e','#6d7078'], ['#656870','#484a52'], ['#474952','#2f3138']
+      ],
+      fgHills: [ ['#3d3f47','#1b1c21'], ['#e3424c','#383940'], ['#ff5c66','#999ca3'] ],
+      bushHills: [ ['#24252b','#0a0a0c'], ['#2c2d33','#0d0d10'] ],
+      waterDeep: '#b81d2b', waterLight: '#ff4f5e', waterReflect: '#ffd6da', bank: '#e5e5e8',
+      metalShadow: '#18181c', metalMid: '#7d8087', metalLit: '#eb3443', metalSpec: '#ffffff', metalCool: '#a8abb3',
+      darkShadow: '#0a0a0d', darkLit: '#e62e3d',
+      concShadow: '#2b2c33', concMid: '#8a8d94', concLit: '#f2f2f5', concTint: '#ff6b77',
+      buildingTop: '#595b63', buildingBot: '#323338',
+      windowA: '#ff3b4e', windowB: '#ffffff', mullion: '#8f9199', door: '#ff3b4e', dialFace: '#ff4254', fence: '#686a73',
+      steamCream: '#ffffff', steamMint: '#f2f2f5', steamCyan: '#d4d6dc', steamLavender: '#f0b6bc',
+      leaves: [ ['#121214','#3d3e45'], ['#1a1a1f','#4f5159'], ['#0e0e10','#303138'], ['#070708','#202126'] ],
+      trunk: '#17171a', trunkDark: '#09090b', trunkSliver: '#e62e3d',
+      birdWing: '#2b2c30', birdBody: '#16161a', birdHead: '#e62e3d',
+      sparkleCore: '#ff384b', sparkleHalo: '#ffb3ba'
+    }),
+    'Neutral + Accent': makeHarmonyTheme({
+      bg: '#cbc5ba',
+      skyCyan: '#bfb8ac', skyMint: '#e8e3d9', skySun: '#fff4dc', skyBand: '#f4efe6',
+      hills: [
+        ['#ede5d5','#ada69a'], ['#d4cdc0','#969086'], ['#a39d93','#827c73'], ['#78736b','#5e5952'], ['#59554e','#423f3a']
+      ],
+      fgHills: [ ['#4a6b6e','#26282a'], ['#e08955','#4a4540'], ['#f5b87a','#b39a84'] ],
+      bushHills: [ ['#33312e','#1a1917'], ['#3d3934','#1c1a18'] ],
+      waterDeep: '#2e7d7b', waterLight: '#6cc4bd', waterReflect: '#fff0d4', bank: '#e6decb',
+      metalShadow: '#2e2b27', metalMid: '#b58d6b', metalLit: '#f08c42', metalSpec: '#fff2db', metalCool: '#6ea3a1',
+      darkShadow: '#1a1816', darkLit: '#e37636',
+      concShadow: '#4d4944', concMid: '#a89f94', concLit: '#f5e6cf', concTint: '#ebaa7d',
+      buildingTop: '#78726a', buildingBot: '#4f4b46',
+      windowA: '#ffb870', windowB: '#ffe6c2', mullion: '#9e9589', door: '#ff9d4d', dialFace: '#ffe4bd', fence: '#7d776e',
+      steamCream: '#fcfaf5', steamMint: '#ebe6dc', steamCyan: '#d4cfc5', steamLavender: '#cfc9be',
+      leaves: [ ['#242220','#4f4b46'], ['#2e2a26','#615a52'], ['#1f1d1b','#423f3b'], ['#141312','#302d2a'] ],
+      trunk: '#292623', trunkDark: '#171513', trunkSliver: '#d98a52',
+      birdWing: '#59544e', birdBody: '#3b3733', birdHead: '#736c64',
+      sparkleCore: '#ffae5c', sparkleHalo: '#ffe0bd'
+    }),
+    'Ember Forge (F6AA1C · BC3908 · 941B0C · 220901)': buildFromPalette('#F6AA1C', '#F6AA1C', '#BC3908', '#941B0C', '#220901', '#140500'),
+    'Abyssal Teal (63D1CF · 5BC0BE · 4BAD9E · 0B132B · 000000)': buildFromPalette('#63D1CF', '#5BC0BE', '#4BAD9E', '#0B132B', '#050814', '#000000'),
+    'Velvet Orchid (AA60C8 · D69ADE · C9A3C6 · CFB5C2 · 0D001D · 120A12)': buildFromPalette('#CFB5C2', '#D69ADE', '#AA60C8', '#3c1654', '#120A12', '#0D001D'),
+    'Sunlit Lagoon (FEF1BE · FFBA00 · 008189 · 00474D · 061210)': buildFromPalette('#FEF1BE', '#FFBA00', '#008189', '#00474D', '#061210', '#030a09'),
+    'Bioluminescent (D4FFB0 · 7FFF00 · 00B894 · 0A3322 · 05140A)': buildFromPalette('#D4FFB0', '#7FFF00', '#00B894', '#0A3322', '#05140A', '#020a05'),
+    'Dusk Reactor (FFE8CC · FF8C00 · C7501A · 3D1050 · 0E0618)': buildFromPalette('#FFE8CC', '#FF8C00', '#C7501A', '#3D1050', '#0E0618', '#08030f'),
+    'Astral Violet (E8E0FF · B38FFF · 6A3DE8 · 1A1250 · 090612)': buildFromPalette('#E8E0FF', '#B38FFF', '#6A3DE8', '#1A1250', '#090612', '#05030a'),
+    'Cyber Synth (E0FBFF · 00F0FF · D40078 · 1E0A3D · 05020F)': buildFromPalette('#E0FBFF', '#00F0FF', '#D40078', '#1E0A3D', '#05020F', '#020108')
+  };
+
+  // =========================================================================
+  // Application State & Parameters
+  // =========================================================================
+  const ANIMATION_MODES = [
+    'Static (No Camera)',
+    'Gentle Orbit',
+    'Steam Ascent',
+    'Bird Flight',
+    'Sun & Sky Drift',
+    'Wellhead & Pipes',
+    'Valley Panorama',
+    'Breathing Earth'
+  ];
+
+  const defaultDpr = Number(Math.min(window.devicePixelRatio || 1, query.get('quality') === 'low' ? 1 : 1.8).toFixed(2));
+  const params = {
+    colorScheme: 'Original',
+    bgColor: '#00d3ce',
+    greenscreen: false,
+    metalColor: '#ffc97d',
+    hillColor: '#8550df',
+    foliageColor: '#391263',
+    steamColor: '#fffae0',
+    waterColor: '#03d1db',
+
+    cameraAnimation: 'Static (No Camera)',
+    speed: 1.0,
+
+    antialias: 'MSAA',
+    dpr: defaultDpr,
+
+    clickToRandomize: true,
+
+    // Procedural Geometry & Motion Parameters
+    towerScale: 1.0,
+    foliageScale: 1.0,
+    steamWidth: 1.0,
+    steamTurbulence: 1.0,
+    birdScale: 1.0,
+    birdRange: 1.0,
+    windSway: 1.0,
+    sunGlow: 1.0,
+    sunOffsetX: 0.0,
+    valveSpin: 0.0,
+
+    // Camera interaction (never reset by animation)
+    zoom: 1.0,
+    cameraYaw: 0.0,
+    cameraPitch: 0.0,
+    resetView: () => {
+      params.zoom = 1.0;
+      params.cameraYaw = 0.0;
+      params.cameraPitch = 0.0;
+      userPanX = 0;
+      userPanY = 0;
+      camera.zoom = 1.0;
+      camera.updateProjectionMatrix();
+      syncGuiDisplays();
+    },
+    randomizeNow: () => randomizeScene(),
+    resetDefaults: () => resetAllDefaults()
+  };
+
+  let currentTheme = COLOR_SCHEMES['Original'];
+  let bgCustomized = false;
+  let userDprOverride = false;
+  let gui = null;
+  let uiVisible = true;
+  let userPanX = 0, userPanY = 0;
+  let viewW = W, viewH = H, centerX = W / 2, centerY = H / 2;
+
+  function syncGuiDisplays() {
+    if (!gui) return;
+    for (const c of gui.controllersRecursive()) c.updateDisplay();
+  }
+
+  function applyBackgroundAndGreenscreen() {
+    const activeBg = params.greenscreen ? '#00ff00' : params.bgColor;
+    skyPlane.visible = !params.greenscreen;
+    renderer.setClearColor(activeBg, 1);
+    document.documentElement.style.background = activeBg;
+    document.body.style.background = activeBg;
+  }
+
+  function applyTheme(theme, preserveBgCustom = false) {
+    currentTheme = theme;
+    if (!preserveBgCustom) {
+      params.bgColor = theme.bg;
+      bgCustomized = false;
+    }
+
+    // Sky
+    if (bgCustomized && !params.greenscreen) {
+      setSrgbVec3(skyUniforms.uSkyCyan.value, params.bgColor);
+      setSrgbVec3(skyUniforms.uSkyMint.value, mixHex(params.bgColor, theme.skySun, 0.38));
+    } else {
+      setSrgbVec3(skyUniforms.uSkyCyan.value, theme.skyCyan);
+      setSrgbVec3(skyUniforms.uSkyMint.value, theme.skyMint);
+    }
+    setSrgbVec3(skyUniforms.uSkySun.value, theme.skySun);
+    setSrgbVec3(skyUniforms.uSkyBand.value, theme.skyBand);
+
+    // Hills
+    theme.hills.forEach((pair, idx) => {
+      hillGradients[idx].uniforms.uTop.value.set(pair[0]);
+      hillGradients[idx].uniforms.uBottom.value.set(pair[1]);
+    });
+    theme.fgHills.forEach((pair, idx) => {
+      fgHillGradients[idx].uniforms.uTop.value.set(pair[0]);
+      fgHillGradients[idx].uniforms.uBottom.value.set(pair[1]);
+    });
+    theme.bushHills.forEach((pair, idx) => {
+      bushHillGradients[idx].uniforms.uTop.value.set(pair[0]);
+      bushHillGradients[idx].uniforms.uBottom.value.set(pair[1]);
+    });
+
+    // Water & bank
+    setSrgbVec3(waterUniforms.uWaterDeep.value, theme.waterDeep);
+    setSrgbVec3(waterUniforms.uWaterLight.value, theme.waterLight);
+    setSrgbVec3(waterUniforms.uWaterReflect.value, theme.waterReflect);
+    bankMat.color.set(theme.bank);
+
+    // Metal, darkMetal, concrete
+    setSrgbVec3(metalUniforms.uMetalShadow.value, theme.metalShadow);
+    setSrgbVec3(metalUniforms.uMetalMid.value, theme.metalMid);
+    setSrgbVec3(metalUniforms.uMetalLit.value, theme.metalLit);
+    setSrgbVec3(metalUniforms.uMetalSpec.value, theme.metalSpec);
+    setSrgbVec3(metalUniforms.uMetalCool.value, theme.metalCool);
+
+    setSrgbVec3(darkMetalUniforms.uDarkShadow.value, theme.darkShadow);
+    setSrgbVec3(darkMetalUniforms.uDarkLit.value, theme.darkLit);
+
+    setSrgbVec3(concreteUniforms.uConcShadow.value, theme.concShadow);
+    setSrgbVec3(concreteUniforms.uConcMid.value, theme.concMid);
+    setSrgbVec3(concreteUniforms.uConcLit.value, theme.concLit);
+    setSrgbVec3(concreteUniforms.uConcTint.value, theme.concTint);
+
+    // Building & fence
+    buildingWallMat.uniforms.uTop.value.set(theme.buildingTop);
+    buildingWallMat.uniforms.uBottom.value.set(theme.buildingBot);
+    winMatA.color.set(theme.windowA);
+    winMatB.color.set(theme.windowB);
+    mullionMat.color.set(theme.mullion);
+    doorMat.color.set(theme.door);
+    dialFaceMat.color.set(theme.dialFace);
+    fenceMat.color.set(theme.fence);
+
+    // Steam
+    setSrgbVec3(steamColorUniforms.uSteamCream.value, theme.steamCream);
+    setSrgbVec3(steamColorUniforms.uSteamMint.value, theme.steamMint);
+    setSrgbVec3(steamColorUniforms.uSteamCyan.value, theme.steamCyan);
+    setSrgbVec3(steamColorUniforms.uSteamLavender.value, theme.steamLavender);
+
+    // Foliage
+    theme.leaves.forEach((pair, idx) => {
+      leafMaterials[idx].uniforms.uBase.value.set(pair[0]);
+      leafMaterials[idx].uniforms.uLit.value.set(pair[1]);
+    });
+    trunkMat.color.set(theme.trunk);
+    trunkDarkMat.color.set(theme.trunkDark);
+    trunkSliverMat.color.set(theme.trunkSliver);
+
+    // Birds & sparkles
+    birdWingMaterials.forEach(m => m.uniforms.uColor.value.set(theme.birdWing));
+    birdBodyMat.color.set(theme.birdBody);
+    birdHeadMat.color.set(theme.birdHead);
+    sparkleCoreMats.forEach(m => m.color.set(theme.sparkleCore));
+    sparkleHaloMats.forEach(m => m.color.set(theme.sparkleHalo));
+
+    // Sync color pickers
+    params.metalColor = theme.metalLit;
+    params.hillColor = theme.hills[2][0];
+    params.foliageColor = theme.leaves[1][0];
+    params.steamColor = theme.steamCream;
+    params.waterColor = theme.waterDeep;
+
+    applyBackgroundAndGreenscreen();
+  }
+
+  function applyColorScheme(name) {
+    const theme = COLOR_SCHEMES[name] || COLOR_SCHEMES['Original'];
+    applyTheme(theme, false);
+    syncGuiDisplays();
+  }
+
+  function applyCustomSlot(slot, hex) {
+    if (slot === 'bgColor') {
+      bgCustomized = true;
+      setSrgbVec3(skyUniforms.uSkyCyan.value, hex);
+      setSrgbVec3(skyUniforms.uSkyMint.value, mixHex(hex, '#ffffff', 0.35));
+      applyBackgroundAndGreenscreen();
+      return;
+    }
+    if (slot === 'metalColor') {
+      const dark = shiftHex(hex, -15, 0.85, 0.22);
+      const mid = mixHex(hex, dark, 0.42);
+      const spec = mixHex(hex, '#ffffff', 0.65);
+      setSrgbVec3(metalUniforms.uMetalLit.value, hex);
+      setSrgbVec3(metalUniforms.uMetalMid.value, mid);
+      setSrgbVec3(metalUniforms.uMetalShadow.value, dark);
+      setSrgbVec3(metalUniforms.uMetalSpec.value, spec);
+      setSrgbVec3(darkMetalUniforms.uDarkLit.value, mixHex(hex, dark, 0.22));
+      setSrgbVec3(darkMetalUniforms.uDarkShadow.value, shiftHex(hex, -10, 0.85, 0.14));
+      setSrgbVec3(concreteUniforms.uConcLit.value, mixHex(hex, '#ffffff', 0.25));
+      setSrgbVec3(concreteUniforms.uConcMid.value, mid);
+      setSrgbVec3(concreteUniforms.uConcTint.value, mixHex(hex, '#ffffff', 0.35));
+      winMatA.color.set(mixHex(hex, '#ffffff', 0.4));
+      winMatB.color.set(spec);
+      doorMat.color.set(mixHex(hex, '#ffffff', 0.3));
+      dialFaceMat.color.set(mixHex(hex, '#ffffff', 0.4));
+      return;
+    }
+    if (slot === 'hillColor') {
+      const h = hexToHsl(hex);
+      hillGradients.forEach((g, idx) => {
+        const lTop = T.MathUtils.clamp(0.72 - idx * 0.08, 0.28, 0.82);
+        const lBot = T.MathUtils.clamp(0.62 - idx * 0.06, 0.22, 0.76);
+        g.uniforms.uTop.value.set(hslToHex(h.h + (idx - 2) * 8, h.s * 0.9, lTop));
+        g.uniforms.uBottom.value.set(hslToHex(h.h + (idx - 1) * 8, h.s * 0.8, lBot));
+      });
+      fgHillGradients[0].uniforms.uTop.value.set(hslToHex(h.h - 10, h.s * 0.85, 0.42));
+      fgHillGradients[0].uniforms.uBottom.value.set(hslToHex(h.h, h.s * 0.9, 0.22));
+      buildingWallMat.uniforms.uTop.value.set(hslToHex(h.h, h.s * 0.7, 0.50));
+      buildingWallMat.uniforms.uBottom.value.set(hslToHex(h.h, h.s * 0.75, 0.35));
+      return;
+    }
+    if (slot === 'foliageColor') {
+      const h = hexToHsl(hex);
+      leafMaterials.forEach((m, idx) => {
+        const baseL = T.MathUtils.clamp(h.l * (idx === 3 ? 0.55 : 0.9 + idx * 0.08), 0.04, 0.42);
+        const litL = T.MathUtils.clamp(baseL + 0.20, 0.14, 0.65);
+        m.uniforms.uBase.value.set(hslToHex(h.h + idx * 6, h.s, baseL));
+        m.uniforms.uLit.value.set(hslToHex(h.h + idx * 6, Math.max(0.15, h.s * 0.82), litL));
+      });
+      trunkMat.color.set(hslToHex(h.h, h.s * 0.7, Math.max(0.06, h.l * 0.8)));
+      trunkDarkMat.color.set(hslToHex(h.h, h.s * 0.85, Math.max(0.04, h.l * 0.5)));
+      bushHillGradients.forEach((g, idx) => {
+        g.uniforms.uTop.value.set(hslToHex(h.h + idx * 8, h.s * 0.85, Math.min(0.45, h.l + 0.12)));
+        g.uniforms.uBottom.value.set(hslToHex(h.h, h.s * 0.9, Math.max(0.06, h.l * 0.6)));
+      });
+      return;
+    }
+    if (slot === 'steamColor') {
+      setSrgbVec3(steamColorUniforms.uSteamCream.value, hex);
+      setSrgbVec3(steamColorUniforms.uSteamMint.value, mixHex(hex, params.bgColor, 0.25));
+      setSrgbVec3(steamColorUniforms.uSteamCyan.value, mixHex(hex, params.waterColor, 0.45));
+      setSrgbVec3(steamColorUniforms.uSteamLavender.value, mixHex(hex, params.hillColor, 0.35));
+      setSrgbVec3(skyUniforms.uSkySun.value, mixHex(hex, '#ffffff', 0.25));
+      sparkleCoreMats.forEach(m => m.color.set(hex));
+      return;
+    }
+    if (slot === 'waterColor') {
+      setSrgbVec3(waterUniforms.uWaterDeep.value, hex);
+      setSrgbVec3(waterUniforms.uWaterLight.value, mixHex(hex, '#ffffff', 0.42));
+      setSrgbVec3(waterUniforms.uWaterReflect.value, mixHex(hex, '#ffffff', 0.75));
+      bankMat.color.set(mixHex(hex, params.metalColor, 0.65));
+    }
+  }
+
+  function applyGeometryParams() {
+    frontTower.scale.set(1.02, 1.02 * params.towerScale, 1.02);
+    rearTower.scale.set(0.83, 0.83 * params.towerScale, 0.83);
+    const frontRimShift = 208 * 1.02 * Math.cos(0.16) * (params.towerScale - 1);
+    const rearRimShift = 208 * 0.83 * Math.cos(0.16) * (params.towerScale - 1);
+    for (const sys of steamSystems) {
+      if (sys.tag === 'frontTower') sys.mesh.position.y = sys.basePosY + frontRimShift;
+      if (sys.tag === 'rearTower') sys.mesh.position.y = sys.basePosY + rearRimShift;
+    }
+    for (const t of trees) t.scale.setScalar(params.foliageScale);
+    for (const b of bushes) b.scale.setScalar(params.foliageScale);
+    for (const b of birdGroups) b.group.scale.setScalar(b.size * params.birdScale);
+    skyUniforms.uSunGlow.value = params.sunGlow;
+    windUniform.value = params.windSway;
+  }
+
+  function randomizeScene() {
+    const harmonyChoices = [
+      'Monochromatic', 'Analogous', 'Complementary', 'Split-complementary',
+      'Triadic', 'Tetradic', 'Double split-complementary', 'Neutral + Accent'
+    ];
+    const pickedHarmony = harmonyChoices[Math.floor(Math.random() * harmonyChoices.length)];
+    const randomHue = Math.floor(Math.random() * 360);
+    const proceduralTheme = buildProceduralHarmony(pickedHarmony, randomHue);
+    params.colorScheme = pickedHarmony;
+    applyTheme(proceduralTheme, false);
+
+    // Re-roll geometric and motion parameters
+    params.towerScale = Number((0.84 + Math.random() * 0.34).toFixed(2));
+    params.foliageScale = Number((0.82 + Math.random() * 0.42).toFixed(2));
+    params.steamWidth = Number((0.72 + Math.random() * 0.66).toFixed(2));
+    params.steamTurbulence = Number((0.55 + Math.random() * 1.35).toFixed(2));
+    params.birdScale = Number((0.75 + Math.random() * 0.78).toFixed(2));
+    params.birdRange = Number((0.65 + Math.random() * 1.35).toFixed(2));
+    params.windSway = Number((0.40 + Math.random() * 1.65).toFixed(2));
+    params.sunGlow = Number((0.65 + Math.random() * 1.00).toFixed(2));
+    params.sunOffsetX = Number((-0.18 + Math.random() * 0.56).toFixed(2));
+    params.valveSpin = Number((Math.random() * 1.6).toFixed(2));
+    params.speed = Number((0.55 + Math.random() * 1.85).toFixed(2));
+
+    applyGeometryParams();
+    syncGuiDisplays();
+  }
+
+  function resetAllDefaults() {
+    params.colorScheme = 'Original';
+    params.greenscreen = false;
+    params.cameraAnimation = 'Static (No Camera)';
+    params.speed = 1.0;
+    params.towerScale = 1.0;
+    params.foliageScale = 1.0;
+    params.steamWidth = 1.0;
+    params.steamTurbulence = 1.0;
+    params.birdScale = 1.0;
+    params.birdRange = 1.0;
+    params.windSway = 1.0;
+    params.sunGlow = 1.0;
+    params.sunOffsetX = 0.0;
+    params.valveSpin = 0.0;
+    applyColorScheme('Original');
+    applyGeometryParams();
+    params.resetView();
+    syncGuiDisplays();
+  }
+
+  // =========================================================================
+  // Post-processing FXAA pass (for 'FXAA' and 'MSAA + FXAA' antialiasing modes)
+  // =========================================================================
+  let fxaaTarget = null;
+  const fxaaScene = new T.Scene();
+  const fxaaCamera = new T.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const fxaaUniforms = {
+    tDiffuse: { value: null },
+    uResolution: { value: new T.Vector2(1920, 1080) }
+  };
+  const fxaaMaterial = new T.ShaderMaterial({
+    uniforms: fxaaUniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: `
+      uniform sampler2D tDiffuse;
+      uniform vec2 uResolution;
+      varying vec2 vUv;
+      float luma(vec3 c) { return dot(sqrt(max(c, vec3(0.0))), vec3(0.299, 0.587, 0.114)); }
+      void main() {
+        vec2 texel = 1.0 / max(uResolution, vec2(1.0));
+        vec3 rgbM = texture2D(tDiffuse, vUv).rgb;
+        float lM = luma(rgbM);
+        float lNW = luma(texture2D(tDiffuse, vUv + vec2(-1.0, -1.0) * texel).rgb);
+        float lNE = luma(texture2D(tDiffuse, vUv + vec2( 1.0, -1.0) * texel).rgb);
+        float lSW = luma(texture2D(tDiffuse, vUv + vec2(-1.0,  1.0) * texel).rgb);
+        float lSE = luma(texture2D(tDiffuse, vUv + vec2( 1.0,  1.0) * texel).rgb);
+        float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+        float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+        vec2 dir = vec2(
+          -((lNW + lNE) - (lSW + lSE)),
+           ((lNW + lSW) - (lNE + lSE))
+        );
+        float dirReduce = max((lNW + lNE + lSW + lSE) * (0.25 * (1.0 / 8.0)), 1.0 / 128.0);
+        float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+        dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * texel;
+        vec3 rgbA = 0.5 * (
+          texture2D(tDiffuse, vUv + dir * (1.0 / 3.0 - 0.5)).rgb +
+          texture2D(tDiffuse, vUv + dir * (2.0 / 3.0 - 0.5)).rgb
+        );
+        vec3 rgbB = rgbA * 0.5 + 0.25 * (
+          texture2D(tDiffuse, vUv + dir * -0.5).rgb +
+          texture2D(tDiffuse, vUv + dir *  0.5).rgb
+        );
+        float lB = luma(rgbB);
+        vec3 finalRgb = (lB < lMin || lB > lMax) ? rgbA : rgbB;
+        gl_FragColor = vec4(finalRgb, 1.0);
+        ${finish}
+      }
+    `
+  });
+  fxaaScene.add(new T.Mesh(new T.PlaneGeometry(2, 2), fxaaMaterial));
+
+  function ensureFxaaTarget() {
+    const width = Math.max(1, Math.floor(window.innerWidth * pixelRatio));
+    const height = Math.max(1, Math.floor(window.innerHeight * pixelRatio));
+    const wantSamples = params.antialias === 'MSAA + FXAA' && renderer.capabilities.isWebGL2
+      ? Math.min(4, renderer.capabilities.maxSamples || 4)
+      : 0;
+    if (!fxaaTarget || fxaaTarget.samples !== wantSamples) {
+      if (fxaaTarget) fxaaTarget.dispose();
+      fxaaTarget = new T.WebGLRenderTarget(width, height, {
+        type: T.HalfFloatType,
+        minFilter: T.LinearFilter,
+        magFilter: T.LinearFilter,
+        samples: wantSamples
+      });
+    } else if (fxaaTarget.width !== width || fxaaTarget.height !== height) {
+      fxaaTarget.setSize(width, height);
+    }
+  }
+
+  let pixelRatio = defaultDpr, resizePending = true, frameId = 0, lastFrame = 0, slowFrames = 0, disposed = false;
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const fixedTimeVal = Number(query.get('t'));
+  const fixedTime = query.has('t') ? (Number.isFinite(fixedTimeVal) ? fixedTimeVal : 0) : null;
+  let elapsed = 0, previousTime = null;
+
+  // =========================================================================
+  // Pointer, Wheel, Orbit & Drag Controls
+  // =========================================================================
+  let dragState = null;
+  function isOrbitMode(mode) {
+    return mode === 'Gentle Orbit' || mode === 'Breathing Earth';
+  }
+  function attachCanvasEvents(targetCanvas) {
+    targetCanvas.addEventListener('contextmenu', e => e.preventDefault());
+    targetCanvas.addEventListener('pointerdown', e => {
+      if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
+      targetCanvas.setPointerCapture(e.pointerId);
+      targetCanvas.style.cursor = 'grabbing';
+      const orbitGesture = e.button === 2 || e.shiftKey || (isOrbitMode(params.cameraAnimation) && e.button === 0 && !e.ctrlKey && !e.altKey);
+      dragState = {
+        id: e.pointerId,
+        lastX: e.clientX,
+        lastY: e.clientY,
+        totalDist: 0,
+        button: e.button,
+        orbit: orbitGesture
+      };
+    });
+    targetCanvas.addEventListener('pointermove', e => {
+      if (!dragState || e.pointerId !== dragState.id) return;
+      const dx = e.clientX - dragState.lastX;
+      const dy = e.clientY - dragState.lastY;
+      dragState.lastX = e.clientX;
+      dragState.lastY = e.clientY;
+      dragState.totalDist += Math.hypot(dx, dy);
+      if (dragState.orbit) {
+        params.cameraYaw = T.MathUtils.clamp(params.cameraYaw - dx * 0.0026, -0.75, 0.75);
+        params.cameraPitch = T.MathUtils.clamp(params.cameraPitch + dy * 0.0022, -0.45, 0.45);
+        syncGuiDisplays();
+      } else {
+        const cw = Math.max(1, targetCanvas.clientWidth || window.innerWidth);
+        const ch = Math.max(1, targetCanvas.clientHeight || window.innerHeight);
+        const worldPerPxX = (viewW / params.zoom) / cw;
+        const worldPerPxY = (viewH / params.zoom) / ch;
+        userPanX -= dx * worldPerPxX;
+        userPanY += dy * worldPerPxY;
+      }
+      if (fixedTime !== null || reducedMotion.matches) renderAt(elapsed);
+    });
+    const endDrag = e => {
+      if (!dragState || e.pointerId !== dragState.id) return;
+      const wasClick = dragState.totalDist < 5 && dragState.button === 0;
+      dragState = null;
+      targetCanvas.style.cursor = 'grab';
+      if (targetCanvas.hasPointerCapture(e.pointerId)) {
+        targetCanvas.releasePointerCapture(e.pointerId);
+      }
+      if (wasClick && params.clickToRandomize) {
+        randomizeScene();
+        if (fixedTime !== null || reducedMotion.matches) renderAt(elapsed);
+      }
+    };
+    targetCanvas.addEventListener('pointerup', endDrag);
+    targetCanvas.addEventListener('pointercancel', endDrag);
+    targetCanvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      const cw = Math.max(1, targetCanvas.clientWidth || window.innerWidth);
+      const ch = Math.max(1, targetCanvas.clientHeight || window.innerHeight);
+      const rect = targetCanvas.getBoundingClientRect();
+      const nx = ((e.clientX - rect.left) / cw) * 2 - 1;
+      const ny = -((e.clientY - rect.top) / ch) * 2 + 1;
+      const zOld = params.zoom;
+      const factor = Math.exp(-e.deltaY * 0.0011);
+      const zNew = T.MathUtils.clamp(zOld * factor, 0.25, 8.0);
+      // Zoom smoothly toward pointer without resetting on camera animation
+      userPanX += nx * (viewW * 0.5) * (1 / zOld - 1 / zNew);
+      userPanY += ny * (viewH * 0.5) * (1 / zOld - 1 / zNew);
+      params.zoom = Number(zNew.toFixed(3));
+      camera.zoom = params.zoom;
+      camera.updateProjectionMatrix();
+      syncGuiDisplays();
+      if (fixedTime !== null || reducedMotion.matches) renderAt(elapsed);
+    }, { passive: false });
+    targetCanvas.addEventListener('webglcontextlost', event => {
+      event.preventDefault();
+      cancelAnimationFrame(frameId);
+      frameId = 0;
+    });
+    targetCanvas.addEventListener('webglcontextrestored', () => {
+      resizePending = true;
+      renderAt(elapsed);
+      if (fixedTime === null && !reducedMotion.matches) start();
+    });
+  }
+  attachCanvasEvents(canvas);
+
+  function rebuildRenderer(useHardwareAA) {
+    const newCanvas = document.createElement('canvas');
+    newCanvas.setAttribute('role', canvas.getAttribute('role') || 'img');
+    newCanvas.setAttribute('aria-label', canvas.getAttribute('aria-label') || '');
+    newCanvas.style.touchAction = 'none';
+    newCanvas.style.cursor = 'grab';
+    canvas.parentNode.replaceChild(newCanvas, canvas);
+    canvas = newCanvas;
+
+    if (fxaaTarget) { fxaaTarget.dispose(); fxaaTarget = null; }
+    renderer.dispose();
+
+    renderer = new T.WebGLRenderer({ canvas, antialias: useHardwareAA, alpha: false, powerPreference: 'high-performance' });
+    renderer.outputColorSpace = T.SRGBColorSpace;
+    renderer.toneMapping = T.NoToneMapping;
+    applyBackgroundAndGreenscreen();
+    attachCanvasEvents(canvas);
+    if (window.geothermal) window.geothermal.renderer = renderer;
+    resizePending = true;
+  }
+
+  let currentHardwareAA = true;
+  function setAntialiasingMode(mode) {
+    params.antialias = mode;
+    const wantHardwareAA = mode === 'MSAA' || mode === 'MSAA + FXAA';
+    if (wantHardwareAA !== currentHardwareAA) {
+      currentHardwareAA = wantHardwareAA;
+      rebuildRenderer(wantHardwareAA);
+    }
+    resizePending = true;
+  }
+
+  function resize() {
+    const width = window.innerWidth, height = window.innerHeight, aspect = width / Math.max(1, height);
+    if (aspect >= W / H) { viewW = W; viewH = W / aspect; }
+    else if (aspect >= 1.12) { viewH = H; viewW = H * aspect; }
+    else { viewW = 1320; viewH = viewW / aspect; }
+    centerX = aspect < 1.12 ? 930 : W / 2;
+    centerY = aspect < 1.12 ? 590 : H / 2;
+    camera.left = -viewW / 2; camera.right = viewW / 2;
+    camera.top = viewH / 2; camera.bottom = -viewH / 2;
+    camera.zoom = params.zoom;
+    camera.updateProjectionMatrix();
+
+    if (!userDprOverride) {
+      pixelRatio = Math.min(window.devicePixelRatio || 1, query.get('quality') === 'low' ? 1 : 1.8, Math.sqrt(4200000 / Math.max(1, width * height)));
+      params.dpr = Number(pixelRatio.toFixed(2));
+      syncGuiDisplays();
+    } else {
+      pixelRatio = params.dpr;
+    }
+    renderer.setPixelRatio(pixelRatio);
+    renderer.setSize(width, height, false);
+    if (params.antialias === 'FXAA' || params.antialias === 'MSAA + FXAA') {
+      ensureFxaaTarget();
+    }
+    resizePending = false;
+  }
+
+  // Smoothly blended camera animation state
+  const camState = { x: 0, y: 0, yaw: 0, pitch: 0 };
+  let lastRenderSeconds = null;
+
+  function computeAnimationTargets(seconds) {
+    const camPhase = (seconds / (DURATION * 2)) * TAU;
+    let ax = 0, ay = 0, ayaw = 0, apitch = 0;
+    let sunShiftX = params.sunOffsetX, sunShiftY = 0;
+    let extraBirdX = 0, extraBirdY = 0;
+    let wheelBoost = 0;
+
+    switch (params.cameraAnimation) {
+      case 'Gentle Orbit':
+        ayaw = 0.22 * Math.sin(camPhase);
+        apitch = 0.075 * Math.sin(camPhase * 2) - 0.02;
+        ax = 36 * Math.sin(camPhase);
+        ay = 14 * Math.cos(camPhase);
+        break;
+      case 'Steam Ascent':
+        ay = 105 * (0.5 - 0.5 * Math.cos(camPhase));
+        ax = 65 * Math.sin(camPhase);
+        apitch = 0.065 * (0.5 - 0.5 * Math.cos(camPhase));
+        sunShiftY = 0.025 * Math.sin(camPhase);
+        break;
+      case 'Bird Flight':
+        ax = -170 + 230 * (0.5 - 0.5 * Math.cos(camPhase));
+        ay = 105 + 42 * Math.sin(camPhase * 2);
+        ayaw = -0.09 * Math.cos(camPhase);
+        extraBirdX = 160 * Math.sin(camPhase);
+        extraBirdY = 38 * Math.cos(camPhase * 2);
+        break;
+      case 'Sun & Sky Drift':
+        sunShiftX += 0.16 * Math.sin(camPhase);
+        sunShiftY = 0.045 * Math.cos(camPhase);
+        ax = 115 * Math.sin(camPhase);
+        ay = 22 * Math.sin(camPhase * 2);
+        ayaw = 0.055 * Math.sin(camPhase);
+        break;
+      case 'Wellhead & Pipes':
+        ax = 210 + 75 * Math.sin(camPhase);
+        ay = -105 + 32 * Math.cos(camPhase);
+        ayaw = -0.13 * Math.sin(camPhase);
+        apitch = 0.045 * Math.cos(camPhase);
+        wheelBoost = 0.85;
+        break;
+      case 'Valley Panorama':
+        ax = 235 * Math.sin(camPhase);
+        ay = 44 * Math.sin(camPhase * 2);
+        ayaw = 0.11 * Math.cos(camPhase);
+        break;
+      case 'Breathing Earth':
+        ayaw = 0.12 * Math.sin(camPhase);
+        apitch = 0.055 * Math.cos(camPhase);
+        ax = 28 * Math.sin(camPhase * 2);
+        ay = 22 * Math.sin(camPhase);
+        sunShiftX += 0.05 * Math.sin(camPhase);
+        wheelBoost = 0.35;
+        break;
+      case 'Static (No Camera)':
+      default:
+        break;
+    }
+    return { ax, ay, ayaw, apitch, sunShiftX, sunShiftY, extraBirdX, extraBirdY, wheelBoost };
+  }
+
+  function renderAt(seconds) {
+    if (disposed) return;
+    if (resizePending) resize();
+
+    const time = ((seconds % DURATION) + DURATION) % DURATION;
+    phase.value = time / DURATION * TAU;
+
+    const anim = computeAnimationTargets(seconds);
+    const dt = lastRenderSeconds === null ? 1 : Math.min(0.1, Math.abs(seconds - lastRenderSeconds));
+    lastRenderSeconds = seconds;
+    const blend = fixedTime !== null ? 1 : (1 - Math.exp(-3.2 * dt));
+    camState.x = mix(camState.x, anim.ax, blend);
+    camState.y = mix(camState.y, anim.ay, blend);
+    camState.yaw = mix(camState.yaw, anim.ayaw, blend);
+    camState.pitch = mix(camState.pitch, anim.apitch, blend);
+
+    // Sky sun & cloud band drift
+    skyUniforms.uSunShift.value.set(anim.sunShiftX, anim.sunShiftY);
+
+    // Steam plumes
+    const frontRimShift = 208 * 1.02 * Math.cos(0.16) * (params.towerScale - 1);
+    const rearRimShift = 208 * 0.83 * Math.cos(0.16) * (params.towerScale - 1);
+    for (const system of steamSystems) {
+      const turb = params.steamTurbulence;
+      const wScale = params.steamWidth;
+      for (let i = 0; i < system.nodes.length; i++) {
+        const base = system.baseNodes[i], s = base.w, offset = system.offset;
+        const transport = s * TAU * 5 - phase.value * 4 + offset;
+        const weight = T.MathUtils.smoothstep(s, 0, .12);
+        const pressure = (.105 * Math.sin(transport) + .030 * Math.sin(transport * 2 + .6)) * turb;
+        const drift = Math.sin(transport - .8) * base.z * .048 * weight * turb;
+        const yOffset = system.tag === 'frontTower' ? -frontRimShift : system.tag === 'rearTower' ? -rearRimShift : 0;
+        system.nodes[i].set(
+          base.x + drift + Math.sin(phase.value - s * 6 + offset) * s * 2.5 * turb,
+          base.y + yOffset + Math.cos(transport) * base.z * .025 * weight * turb,
+          base.z * wScale * (1 + pressure * weight),
+          s
+        );
       }
     }
-    for(const b of birdGroups){
-      const flockX=42*Math.sin(phase.value-.35),flockY=15*Math.cos(phase.value);
-      b.group.position.copy(P(b.x+flockX+4*Math.sin(phase.value*2+b.i),
-        b.y+flockY+3*Math.sin(phase.value*2+b.i*1.8),-25));
-      b.group.rotation.z=.065*Math.sin(phase.value+b.i*.35);
-      b.group.rotation.y=.09*Math.sin(phase.value+b.i*.5);
+
+    // Birds
+    const bRange = params.birdRange;
+    for (const b of birdGroups) {
+      const flockX = 42 * bRange * Math.sin(phase.value - .35) + anim.extraBirdX;
+      const flockY = 15 * bRange * Math.cos(phase.value) + anim.extraBirdY;
+      b.group.position.copy(P(
+        b.x + flockX + 4 * bRange * Math.sin(phase.value * 2 + b.i),
+        b.y + flockY + 3 * bRange * Math.sin(phase.value * 2 + b.i * 1.8),
+        -25
+      ));
+      b.group.rotation.z = .065 * Math.sin(phase.value + b.i * .35);
+      b.group.rotation.y = .09 * Math.sin(phase.value + b.i * .5);
     }
-    for(const s of sparkles){
-      s.o.material.opacity=.61+.22*Math.sin(phase.value+s.i*2.1);
-      s.o.position.copy(P(s.x+Math.sin(phase.value+s.i)*1.4,s.y+Math.cos(phase.value+s.i)*1.2,-30));
+
+    // Sparkles
+    for (const s of sparkles) {
+      s.o.material.opacity = .61 + .22 * Math.sin(phase.value + s.i * 2.1);
+      s.o.position.copy(P(s.x + Math.sin(phase.value + s.i) * 1.4, s.y + Math.cos(phase.value + s.i) * 1.2, -30));
     }
-    renderer.render(scene,camera);
+
+    // Subtle tree & bush sway + wellhead valves & gauge needle
+    const swayAmt = Math.max(0, params.windSway - 1.0) * 0.012 + (params.cameraAnimation === 'Breathing Earth' ? params.windSway * 0.009 : 0);
+    for (let i = 0; i < trees.length; i++) {
+      trees[i].rotation.z = swayAmt * Math.sin(phase.value + i * 1.1);
+    }
+    for (let i = 0; i < bushes.length; i++) {
+      bushes[i].rotation.z = swayAmt * 0.6 * Math.cos(phase.value + i * 0.8);
+    }
+    const spinScale = params.valveSpin + anim.wheelBoost;
+    upperWheel.rotation.z = 0.45 * spinScale * Math.sin(phase.value);
+    lowerWheel.rotation.z = -0.35 * spinScale * Math.cos(phase.value);
+    gaugePivot.rotation.z = 0.25 * spinScale * Math.sin(phase.value * 2);
+
+    // Camera position from user pan + user angle + smooth animation offsets (zoom never overridden)
+    const tx = centerX + userPanX + camState.x;
+    const ty = (H - centerY) + userPanY + camState.y;
+    const totalYaw = T.MathUtils.clamp(params.cameraYaw + camState.yaw, -0.95, 0.95);
+    const totalPitch = T.MathUtils.clamp(params.cameraPitch + camState.pitch, -0.58, 0.58);
+    const radius = 2300;
+    const cp = Math.cos(totalPitch);
+    camera.position.set(
+      tx + radius * Math.sin(totalYaw) * cp,
+      ty + radius * Math.sin(totalPitch),
+      radius * Math.cos(totalYaw) * cp
+    );
+    camera.lookAt(tx, ty, 0);
+    if (camera.zoom !== params.zoom) {
+      camera.zoom = params.zoom;
+      camera.updateProjectionMatrix();
+    }
+
+    if (params.antialias === 'FXAA' || params.antialias === 'MSAA + FXAA') {
+      ensureFxaaTarget();
+      renderer.setRenderTarget(fxaaTarget);
+      renderer.clear();
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      fxaaUniforms.tDiffuse.value = fxaaTarget.texture;
+      fxaaUniforms.uResolution.value.set(fxaaTarget.width, fxaaTarget.height);
+      renderer.render(fxaaScene, fxaaCamera);
+    } else {
+      renderer.render(scene, camera);
+    }
   }
-  const requestedTime=Number(query.get('t'));
-  const fixedTime=query.has('t')?(Number.isFinite(requestedTime)?requestedTime:0):null;
-  let elapsed=0,previousTime=null;
-  function tick(now){
-    if(disposed)return;
-    const delta=previousTime===null?0:Math.min((now-previousTime)/1000,.1);
-    previousTime=now;
-    if(fixedTime!==null)elapsed=Number.isFinite(fixedTime)?fixedTime:0;
-    else if(!reducedMotion.matches)elapsed+=delta;
+
+  function tick(now) {
+    if (disposed) return;
+    const delta = previousTime === null ? 0 : Math.min((now - previousTime) / 1000, .1);
+    previousTime = now;
+    if (fixedTime !== null) elapsed = Number.isFinite(fixedTime) ? fixedTime : 0;
+    else if (!reducedMotion.matches) elapsed += delta * params.speed;
     renderAt(elapsed);
-    // Reduce fill cost only after sustained slow frames, never on a single hiccup.
-    if(lastFrame&&now-lastFrame>27)slowFrames++;else slowFrames=Math.max(0,slowFrames-2);
-    if(slowFrames>100&&pixelRatio>1){pixelRatio=Math.max(1,pixelRatio-.2);renderer.setPixelRatio(pixelRatio);slowFrames=0;}
-    lastFrame=now;
-    if(fixedTime===null&&!reducedMotion.matches)frameId=requestAnimationFrame(tick);
+    if (!userDprOverride) {
+      if (lastFrame && now - lastFrame > 27) slowFrames++; else slowFrames = Math.max(0, slowFrames - 2);
+      if (slowFrames > 100 && pixelRatio > 1) {
+        pixelRatio = Math.max(1, pixelRatio - .2);
+        params.dpr = Number(pixelRatio.toFixed(2));
+        renderer.setPixelRatio(pixelRatio);
+        if (fxaaTarget) ensureFxaaTarget();
+        syncGuiDisplays();
+        slowFrames = 0;
+      }
+    }
+    lastFrame = now;
+    if (fixedTime === null && !reducedMotion.matches) frameId = requestAnimationFrame(tick);
   }
-  function start(){if(!frameId){previousTime=null;frameId=requestAnimationFrame(tick);}}
-  function onResize(){resizePending=true;if(fixedTime!==null||reducedMotion.matches)renderAt(elapsed);}
-  function onVisibility(){
-    if(document.hidden){cancelAnimationFrame(frameId);frameId=0;previousTime=null;}
-    else if(fixedTime===null&&!reducedMotion.matches)start();
+  function start() { if (!frameId) { previousTime = null; frameId = requestAnimationFrame(tick); } }
+  function onResize() { resizePending = true; if (fixedTime !== null || reducedMotion.matches) renderAt(elapsed); }
+  function onVisibility() {
+    if (document.hidden) { cancelAnimationFrame(frameId); frameId = 0; previousTime = null; }
+    else if (fixedTime === null && !reducedMotion.matches) start();
   }
-  function onMotion(){cancelAnimationFrame(frameId);frameId=0;if(reducedMotion.matches)renderAt(0);else start();}
-  window.addEventListener('resize',onResize);
-  document.addEventListener('visibilitychange',onVisibility);
-  reducedMotion.addEventListener('change',onMotion);
-  canvas.addEventListener('webglcontextlost',event=>{event.preventDefault();cancelAnimationFrame(frameId);frameId=0;});
-  canvas.addEventListener('webglcontextrestored',()=>{resizePending=true;renderAt(elapsed);if(fixedTime===null&&!reducedMotion.matches)start();});
-  function dispose(){
-    if(disposed)return;disposed=true;cancelAnimationFrame(frameId);
-    window.removeEventListener('resize',onResize);document.removeEventListener('visibilitychange',onVisibility);
-    reducedMotion.removeEventListener('change',onMotion);
-    const geometries=new Set(),materials=new Set();scene.traverse(o=>{if(o.geometry)geometries.add(o.geometry);if(o.material)materials.add(o.material);});
-    geometries.forEach(g=>g.dispose());materials.forEach(m=>m.dispose());renderer.dispose();
+  function onMotion() { cancelAnimationFrame(frameId); frameId = 0; if (reducedMotion.matches) renderAt(0); else start(); }
+  function onKeyDown(e) {
+    if (e.key === 'h' || e.key === 'H') {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      uiVisible = !uiVisible;
+      if (gui) gui.domElement.style.display = uiVisible ? '' : 'none';
+    }
   }
-  window.addEventListener('pagehide',event=>{if(!event.persisted)dispose();});
-  // A deterministic frame API makes exact loop-boundary and arbitrary-time capture possible.
-  window.geothermal={renderAt,duration:DURATION,renderer,scene,camera,dispose,
-    birds:birdGroups,steam:steamSystems,pipes:pipeNetwork,
-    composition:{frontTower,rearTower,building,tanks,wellhead,upperWheel,lowerWheel,trees,bushes},
-    pause(){cancelAnimationFrame(frameId);frameId=0;},
-    play(){if(fixedTime===null&&!reducedMotion.matches)start();}};
-  renderAt(fixedTime===null?0:fixedTime);
-  if(fixedTime===null&&!reducedMotion.matches)start();
+  window.addEventListener('resize', onResize);
+  document.addEventListener('visibilitychange', onVisibility);
+  reducedMotion.addEventListener('change', onMotion);
+  window.addEventListener('keydown', onKeyDown);
+
+  function dispose() {
+    if (disposed) return; disposed = true; cancelAnimationFrame(frameId);
+    window.removeEventListener('resize', onResize); document.removeEventListener('visibilitychange', onVisibility);
+    reducedMotion.removeEventListener('change', onMotion);
+    window.removeEventListener('keydown', onKeyDown);
+    if (fxaaTarget) fxaaTarget.dispose();
+    if (gui) gui.destroy();
+    const geometries = new Set(), materials = new Set();
+    scene.traverse(o => { if (o.geometry) geometries.add(o.geometry); if (o.material) materials.add(o.material); });
+    fxaaScene.traverse(o => { if (o.geometry) geometries.add(o.geometry); if (o.material) materials.add(o.material); });
+    geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); renderer.dispose();
+  }
+  window.addEventListener('pagehide', event => { if (!event.persisted) dispose(); });
+
+  window.geothermal = {
+    renderAt, duration: DURATION, renderer, scene, camera, dispose,
+    birds: birdGroups, steam: steamSystems, pipes: pipeNetwork,
+    composition: { frontTower, rearTower, building, tanks, wellhead, upperWheel, lowerWheel, trees, bushes },
+    pause() { cancelAnimationFrame(frameId); frameId = 0; },
+    play() { if (fixedTime === null && !reducedMotion.matches) start(); }
+  };
+
+  renderAt(fixedTime === null ? 0 : fixedTime);
+  if (fixedTime === null && !reducedMotion.matches) start();
+
+  // =========================================================================
+  // Initialize lil-gui with default styling
+  // =========================================================================
+  import('https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js').then(({ default: GUI }) => {
+    if (disposed) return;
+    gui = new GUI({ title: 'Chromatic Geothermal' });
+    if (!uiVisible) gui.domElement.style.display = 'none';
+
+    const fAnim = gui.addFolder('Animation & Camera');
+    fAnim.add(params, 'cameraAnimation', ANIMATION_MODES).name('Camera Animation');
+    fAnim.add(params, 'speed', 0.2, 10, 0.05).name('Speed');
+    fAnim.add(params, 'zoom', 0.25, 8, 0.01).name('Zoom').onChange(v => {
+      camera.zoom = v;
+      camera.updateProjectionMatrix();
+    });
+    fAnim.add(params, 'cameraYaw', -0.75, 0.75, 0.01).name('Camera Yaw');
+    fAnim.add(params, 'cameraPitch', -0.45, 0.45, 0.01).name('Camera Pitch');
+    fAnim.add(params, 'resetView').name('Reset View');
+
+    const fColors = gui.addFolder('Colors & Background');
+    fColors.add(params, 'colorScheme', Object.keys(COLOR_SCHEMES)).name('Color Scheme').onChange(applyColorScheme);
+    fColors.addColor(params, 'bgColor').name('Background Color').onChange(v => applyCustomSlot('bgColor', v));
+    fColors.add(params, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => applyBackgroundAndGreenscreen());
+    fColors.addColor(params, 'metalColor').name('Metal / Accent').onChange(v => applyCustomSlot('metalColor', v));
+    fColors.addColor(params, 'hillColor').name('Hills Color').onChange(v => applyCustomSlot('hillColor', v));
+    fColors.addColor(params, 'foliageColor').name('Foliage Color').onChange(v => applyCustomSlot('foliageColor', v));
+    fColors.addColor(params, 'steamColor').name('Steam & Sun').onChange(v => applyCustomSlot('steamColor', v));
+    fColors.addColor(params, 'waterColor').name('Water Color').onChange(v => applyCustomSlot('waterColor', v));
+
+    const fScene = gui.addFolder('Geometry & Motion');
+    fScene.add(params, 'clickToRandomize').name('Click to Randomize');
+    fScene.add(params, 'towerScale', 0.75, 1.25, 0.01).name('Tower Height').onChange(applyGeometryParams);
+    fScene.add(params, 'foliageScale', 0.70, 1.35, 0.01).name('Foliage Scale').onChange(applyGeometryParams);
+    fScene.add(params, 'steamWidth', 0.60, 1.50, 0.01).name('Steam Width');
+    fScene.add(params, 'steamTurbulence', 0.30, 2.20, 0.05).name('Steam Motion');
+    fScene.add(params, 'birdScale', 0.60, 1.80, 0.01).name('Bird Size').onChange(applyGeometryParams);
+    fScene.add(params, 'birdRange', 0.40, 2.20, 0.05).name('Bird Flight');
+    fScene.add(params, 'windSway', 0.00, 2.50, 0.05).name('Wind Sway').onChange(applyGeometryParams);
+    fScene.add(params, 'sunGlow', 0.50, 1.80, 0.01).name('Sun Glow').onChange(applyGeometryParams);
+    fScene.add(params, 'sunOffsetX', -0.35, 0.60, 0.01).name('Sun Position X');
+    fScene.add(params, 'valveSpin', 0.00, 2.00, 0.05).name('Valve Motion');
+    fScene.add(params, 'randomizeNow').name('Randomize Scene');
+
+    const fRender = gui.addFolder('Display & Quality');
+    fRender.add(params, 'antialias', ['MSAA', 'FXAA', 'MSAA + FXAA', 'None']).name('Antialiasing').onChange(setAntialiasingMode);
+    fRender.add(params, 'dpr', 0.5, 3.0, 0.05).name('Pixel Ratio (DPR)').onChange(v => {
+      userDprOverride = true;
+      pixelRatio = v;
+      renderer.setPixelRatio(pixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      if (params.antialias === 'FXAA' || params.antialias === 'MSAA + FXAA') ensureFxaaTarget();
+    });
+    fRender.add(params, 'resetDefaults').name('Reset All Defaults');
+  }).catch(err => {
+    console.warn('lil-gui failed to load:', err);
+  });
 })();
 </script>
 </body>
