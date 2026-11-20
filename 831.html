@@ -51,10 +51,13 @@ DEALINGS IN THE SOFTWARE. -->
   // Custom materials intentionally compose in display-referred poster colors.
   // The final pass writes those colors once, without a second gamma transform.
   const color = hex => new T.Color(hex).convertLinearToSRGB();
+  const setColor = (targetColor, hex) => targetColor.set(hex).convertLinearToSRGB();
   const scene = new T.Scene();
-  const camera = new T.OrthographicCamera(0, 16, 12, 0, 0.1, 180);
-  camera.position.set(0, 0, 100);
+  const camera = new T.OrthographicCamera(-8, 8, 6, -6, 0.1, 320);
+  camera.position.set(8, 6, 100);
   const phase = { value: 0 };
+  const windStrengthU = { value: 1.0 };
+  const moltenOffsetU = { value: 0.0 };
   const cycle = { receiver: { value: 0 }, main: { value: 0 }, rear: { value: 0 } };
   const V = (x, y, z = 0) => new T.Vector3(x, y, z);
   const layers = {};
@@ -69,6 +72,60 @@ DEALINGS IN THE SOFTWARE. -->
     return ((a ^ a >>> 14) >>> 0) / 4294967296;
   }
   const range = (a, b) => a + (b - a) * random();
+
+  // --- Color Conversion & Harmony Helpers ---
+  function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+  function hexToRgb(hex) {
+    const clean = hex.replace('#', '');
+    const n = parseInt(clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean, 16);
+    return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 };
+  }
+  function rgbToHex(r, g, b) {
+    return '#' + [r, g, b].map(v => Math.round(clamp01(v) * 255).toString(16).padStart(2, '0')).join('');
+  }
+  function mixHex(a, b, t) {
+    const ca = hexToRgb(a), cb = hexToRgb(b);
+    return rgbToHex(ca.r + (cb.r - ca.r) * t, ca.g + (cb.g - ca.g) * t, ca.b + (cb.b - ca.b) * t);
+  }
+  function rgbToHsl(r, g, b) {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+    let h = 0, s = 0;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        case b: h = (r - g) / d + 4; break;
+      }
+      h /= 6;
+    }
+    return { h: h * 360, s, l };
+  }
+  function hslToHex(h, s, l) {
+    h = ((h % 360) + 360) % 360 / 360;
+    s = clamp01(s); l = clamp01(l);
+    if (s === 0) return rgbToHex(l, l, l);
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+    const hue2rgb = t => {
+      if (t < 0) t += 1; if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    };
+    return rgbToHex(hue2rgb(h + 1 / 3), hue2rgb(h), hue2rgb(h - 1 / 3));
+  }
+  function shiftHex(hex, dh = 0, ds = 0, dl = 0) {
+    const { r, g, b } = hexToRgb(hex);
+    const hsl = rgbToHsl(r, g, b);
+    return hslToHex(hsl.h + dh, hsl.s + ds, hsl.l + dl);
+  }
+  function lumaHex(hex) {
+    const { r, g, b } = hexToRgb(hex);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
   const grain = `
     float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
     float noise(vec2 p) {
@@ -90,10 +147,8 @@ DEALINGS IN THE SOFTWARE. -->
       gl_Position=projectionMatrix*viewMatrix*p;
     }
   `;
-  const paintCache = new Map();
-  function paint(a, b = a, gradient = 0.5) {
-    const key = a + b + gradient;
-    if (!paintCache.has(key)) paintCache.set(key, new T.ShaderMaterial({
+  function makePaint(a, b = a, gradient = 0.5) {
+    return new T.ShaderMaterial({
       uniforms: { low: { value: color(a) }, high: { value: color(b) }, gradient: { value: gradient }, phase, warmth: cycle.main },
       vertexShader: vertex, side: T.DoubleSide,
       fragmentShader: `${grain}
@@ -105,8 +160,7 @@ DEALINGS IN THE SOFTWARE. -->
           c+=(noise(vWorld.xy*77.0)-0.5)*0.014;
           gl_FragColor=vec4(c,1.0);
         }`
-    }));
-    return paintCache.get(key);
+    });
   }
   function shapeMesh(shape, mat, z, group = layers.building) {
     const m = new T.Mesh(new T.ShapeGeometry(shape, 64), mat);
@@ -115,409 +169,1373 @@ DEALINGS IN THE SOFTWARE. -->
   function polygon(points, mat, z, group = layers.building) {
     const s = new T.Shape(); s.moveTo(...points[0]);
     for (const p of points.slice(1)) s.lineTo(...p);
-    s.closePath(); return shapeMesh(s, typeof mat === 'string' ? paint(mat) : mat, z, group);
+    s.closePath(); return shapeMesh(s, typeof mat === 'string' ? makePaint(mat) : mat, z, group);
   }
   function rect(x, y, w, h, mat, z, group = layers.building) {
-    return polygon([[x,y],[x+w,y],[x+w,y+h],[x,y+h]],mat,z,group);
+    return polygon([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], mat, z, group);
   }
   function curve(points, radius = 0.22) {
     const ps = points.map(p => V(...p)), path = new T.CurvePath();
     let last = ps[0];
-    for (let i=1; i<ps.length-1; i++) {
-      const p=ps[i], prev=ps[i-1], next=ps[i+1];
-      const r=Math.min(radius,p.distanceTo(prev)*0.46,p.distanceTo(next)*0.46);
-      const a=p.clone().add(prev.clone().sub(p).normalize().multiplyScalar(r));
-      const b=p.clone().add(next.clone().sub(p).normalize().multiplyScalar(r));
-      if (last.distanceTo(a)>0.00001) path.add(new T.LineCurve3(last,a));
-      path.add(new T.QuadraticBezierCurve3(a,p,b)); last=b;
+    for (let i = 1; i < ps.length - 1; i++) {
+      const p = ps[i], prev = ps[i - 1], next = ps[i + 1];
+      const r = Math.min(radius, p.distanceTo(prev) * 0.46, p.distanceTo(next) * 0.46);
+      const a = p.clone().add(prev.clone().sub(p).normalize().multiplyScalar(r));
+      const b = p.clone().add(next.clone().sub(p).normalize().multiplyScalar(r));
+      if (last.distanceTo(a) > 0.00001) path.add(new T.LineCurve3(last, a));
+      path.add(new T.QuadraticBezierCurve3(a, p, b)); last = b;
     }
-    path.add(new T.LineCurve3(last,ps[ps.length-1]));
-    path.arcLengthDivisions=600; path.updateArcLengths(); return path;
+    path.add(new T.LineCurve3(last, ps[ps.length - 1]));
+    path.arcLengthDivisions = 600; path.updateArcLengths(); return path;
   }
   function stroke(points, radius, mat, z, group = layers.building, bend = 0.15) {
-    const path=curve(points.map(p=>[p[0],p[1],p[2]??z]),bend);
-    const mesh=new T.Mesh(new T.TubeGeometry(path,Math.max(12,points.length*12),radius,8,false),typeof mat==='string'?paint(mat):mat);
-    group.add(mesh);return mesh;
+    const path = curve(points.map(p => [p[0], p[1], p[2] ?? z]), bend);
+    const mesh = new T.Mesh(new T.TubeGeometry(path, Math.max(12, points.length * 12), radius, 8, false), typeof mat === 'string' ? makePaint(mat) : mat);
+    group.add(mesh); return mesh;
   }
 
   // An expansive sky and cut-paper hills, with no bitmap assets.
-  const sky = new T.Mesh(new T.PlaneGeometry(200,100),new T.ShaderMaterial({
-    uniforms: { phase }, vertexShader: vertex,
+  const skyUniforms = {
+    phase,
+    skyTop: { value: new T.Color(0.075, 0.716, 0.725) },
+    skyHorizon: { value: new T.Color(0.61, 0.854, 0.55) },
+    skyGlow: { value: new T.Color(0.80, 0.88, 0.48) },
+    sunPos: { value: new T.Vector2(13.9, 7.8) }
+  };
+  const sky = new T.Mesh(new T.PlaneGeometry(600, 400), new T.ShaderMaterial({
+    uniforms: skyUniforms, vertexShader: vertex,
     fragmentShader: `${grain}
-      uniform float phase; varying vec3 vWorld;
+      uniform float phase; uniform vec3 skyTop, skyHorizon, skyGlow; uniform vec2 sunPos; varying vec3 vWorld;
       void main() {
         vec2 p=vWorld.xy;
         float t=1.0-smoothstep(2.1,13.5,p.y);
-        vec3 c=mix(vec3(0.075,0.716,0.725),vec3(0.61,0.854,0.55),t);
-        float glow=exp(-dot((p-vec2(13.9,7.8))*vec2(0.20,0.19),(p-vec2(13.9,7.8))*vec2(0.20,0.19)));
-        c=mix(c,vec3(0.80,0.88,0.48),glow*0.12);
+        vec3 c=mix(skyTop,skyHorizon,t);
+        float glow=exp(-dot((p-sunPos)*vec2(0.20,0.19),(p-sunPos)*vec2(0.20,0.19)));
+        c=mix(c,skyGlow,glow*0.12);
         c+=0.004*(noise(p*0.31+0.20*vec2(cos(phase),sin(phase)))-0.5);
         gl_FragColor=vec4(c,1.0);
       }`
   }));
-  sky.position.set(8,6,-72);layers.sky.add(sky);
-  function hill(start, commands, a, b, z) {
-    const s=new T.Shape();s.moveTo(...start);
-    for(const command of commands) s.bezierCurveTo(...command);
-    s.lineTo(85,-15);s.lineTo(-65,-15);s.closePath();
-    return shapeMesh(s,paint(a,b),z,layers.hills);
+  sky.position.set(8, 6, -72); layers.sky.add(sky);
+
+  const hillMats = [];
+  function hill(start, commands, a, b, z, group = layers.hills, targetList = hillMats) {
+    const s = new T.Shape(); s.moveTo(...start);
+    for (const command of commands) s.bezierCurveTo(...command);
+    s.lineTo(85, -15); s.lineTo(-65, -15); s.closePath();
+    const mat = makePaint(a, b);
+    targetList.push(mat);
+    return shapeMesh(s, mat, z, group);
   }
-  hill([-50,7.2],[[-18,7,-6,9.6,0,9.0],[2.8,8.9,3.8,7.0,5.2,6.25],[7.4,5.2,10.3,9.7,12.65,8.65],[12.9,10.7,15.4,11.2,17.2,9.5],[22,7.8,29,10.8,39,9],[51,8.7,65,9.8,85,8.8]],'#d8df79','#8bd49b',-59);
-  hill([-50,4.6],[[-16,6,-2.5,5.8,0,5.56],[1.15,5.9,2.06,7.33,2.48,7.05],[4.3,6.3,5.8,6.05,7.5,5.35],[9.8,4.8,12.9,5.55,14.25,6.25],[15.4,8.0,16.0,8.15,18.2,7.9],[23,6,31,6.5,43,6.3],[56,6.9,70,6.1,85,6.7]],'#efe178','#e8e77c',-51);
-  hill([-50,3.6],[[-10,4.5,-1.9,5.65,0.4,4.65],[1.8,4.2,2.4,4.08,3.1,4.18],[4.8,4.45,5.7,3.17,7.9,3.65],[10,4.6,12.5,3.5,14,4.25],[15.5,5.12,16.7,4.73,19,4.7],[26,3.7,31,4.7,42,4.4],[56,4.3,69,5.2,85,4.5]],'#8aaa59','#9fbe78',-43);
-  hill([-50,3.0],[[-11,3.6,-2,3.75,0.7,4.02],[3.9,4.3,5.0,2.85,7.0,3.35],[9,3.9,11,3.2,13,3.0],[15.5,3.2,16.5,4.8,18.8,3.9],[26,3.1,34,4.3,42,3.7],[56,3.8,70,4.1,85,3.6]],'#71964d','#8cab65',-36);
-  hill([-50,2.5],[[-12,3.1,-1,2.85,2.5,2.77],[5,2.8,7.5,3.2,9.3,2.92],[12,2.8,13.7,3.24,16,2.9],[21,2.75,29,3.6,39,3.1],[52,2.8,68,3.3,85,2.9]],'#9faf2f','#abbc4b',-30);
-  const sun=new T.Mesh(new T.CircleGeometry(0.52,96),paint('#ffe16b','#ffe778'));
-  sun.position.set(14.02,7.81,-54);layers.sky.add(sun);
+  hill([-50, 7.2], [[-18, 7, -6, 9.6, 0, 9.0], [2.8, 8.9, 3.8, 7.0, 5.2, 6.25], [7.4, 5.2, 10.3, 9.7, 12.65, 8.65], [12.9, 10.7, 15.4, 11.2, 17.2, 9.5], [22, 7.8, 29, 10.8, 39, 9], [51, 8.7, 65, 9.8, 85, 8.8]], '#d8df79', '#8bd49b', -59);
+  hill([-50, 4.6], [[-16, 6, -2.5, 5.8, 0, 5.56], [1.15, 5.9, 2.06, 7.33, 2.48, 7.05], [4.3, 6.3, 5.8, 6.05, 7.5, 5.35], [9.8, 4.8, 12.9, 5.55, 14.25, 6.25], [15.4, 8.0, 16.0, 8.15, 18.2, 7.9], [23, 6, 31, 6.5, 43, 6.3], [56, 6.9, 70, 6.1, 85, 6.7]], '#efe178', '#e8e77c', -51);
+  hill([-50, 3.6], [[-10, 4.5, -1.9, 5.65, 0.4, 4.65], [1.8, 4.2, 2.4, 4.08, 3.1, 4.18], [4.8, 4.45, 5.7, 3.17, 7.9, 3.65], [10, 4.6, 12.5, 3.5, 14, 4.25], [15.5, 5.12, 16.7, 4.73, 19, 4.7], [26, 3.7, 31, 4.7, 42, 4.4], [56, 4.3, 69, 5.2, 85, 4.5]], '#8aaa59', '#9fbe78', -43);
+  hill([-50, 3.0], [[-11, 3.6, -2, 3.75, 0.7, 4.02], [3.9, 4.3, 5.0, 2.85, 7.0, 3.35], [9, 3.9, 11, 3.2, 13, 3.0], [15.5, 3.2, 16.5, 4.8, 18.8, 3.9], [26, 3.1, 34, 4.3, 42, 3.7], [56, 3.8, 70, 4.1, 85, 3.6]], '#71964d', '#8cab65', -36);
+  hill([-50, 2.5], [[-12, 3.1, -1, 2.85, 2.5, 2.77], [5, 2.8, 7.5, 3.2, 9.3, 2.92], [12, 2.8, 13.7, 3.24, 16, 2.9], [21, 2.75, 29, 3.6, 39, 3.1], [52, 2.8, 68, 3.3, 85, 2.9]], '#9faf2f', '#abbc4b', -30);
+
+  const sunMat = makePaint('#ffe16b', '#ffe778');
+  const sunBasePos = { x: 14.02, y: 7.81, z: -54 };
+  const sun = new T.Mesh(new T.CircleGeometry(0.52, 96), sunMat);
+  sun.position.set(sunBasePos.x, sunBasePos.y, sunBasePos.z); layers.sky.add(sun);
 
   // Solar collection. Mirrors share geometry and one synchronized material.
-  const panelGeometry=new T.BufferGeometry();
-  panelGeometry.setAttribute('position',new T.Float32BufferAttribute([-0.49,0,0,0.30,-0.10,0,0.49,-0.48,0,-0.30,-0.38,0],3));
-  panelGeometry.setAttribute('uv',new T.Float32BufferAttribute([0,1,1,1,1,0,0,0],2));
-  panelGeometry.setIndex([0,1,2,0,2,3]);panelGeometry.computeVertexNormals();
-  const panelMat=new T.ShaderMaterial({
-    uniforms:{phase,receiver:cycle.receiver},side:T.DoubleSide,
-    vertexShader:`varying vec2 vUv; varying vec3 vWorld;
+  const panelGeometry = new T.BufferGeometry();
+  panelGeometry.setAttribute('position', new T.Float32BufferAttribute([-0.49, 0, 0, 0.30, -0.10, 0, 0.49, -0.48, 0, -0.30, -0.38, 0], 3));
+  panelGeometry.setAttribute('uv', new T.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
+  panelGeometry.setIndex([0, 1, 2, 0, 2, 3]); panelGeometry.computeVertexNormals();
+  const panelMat = new T.ShaderMaterial({
+    uniforms: {
+      phase, receiver: cycle.receiver,
+      panelLow: { value: new T.Color(0.92, 0.80, 0.39) },
+      panelHigh: { value: new T.Color(1.0, 0.94, 0.63) },
+      panelBorder: { value: new T.Color(0.37, 0.52, 0.34) },
+      panelPulse: { value: new T.Color(0.06, 0.045, 0.005) }
+    },
+    side: T.DoubleSide,
+    vertexShader: `varying vec2 vUv; varying vec3 vWorld;
       void main(){vUv=uv;vec4 p=modelMatrix*instanceMatrix*vec4(position,1);vWorld=p.xyz;gl_Position=projectionMatrix*viewMatrix*p;}`,
-    fragmentShader:`${grain}
-      uniform float phase,receiver;varying vec2 vUv;varying vec3 vWorld;
+    fragmentShader: `${grain}
+      uniform float phase,receiver; uniform vec3 panelLow,panelHigh,panelBorder,panelPulse; varying vec2 vUv; varying vec3 vWorld;
       void main(){
-        vec3 c=mix(vec3(0.92,0.80,0.39),vec3(1.0,0.94,0.63),vUv.y);
+        vec3 c=mix(panelLow,panelHigh,vUv.y);
         float border=step(vUv.x,0.035)+step(0.965,vUv.x)+step(vUv.y,0.045);
-        c=mix(c,vec3(0.37,0.52,0.34),clamp(border,0.0,1.0)*0.85);
-        c+=vec3(0.06,0.045,0.005)*pulse(vWorld.x*0.85-phase-0.5)*receiver;
+        c=mix(c,panelBorder,clamp(border,0.0,1.0)*0.85);
+        c+=panelPulse*pulse(vWorld.x*0.85-phase-0.5)*receiver;
         float seam=1.0-smoothstep(0.012,0.019,abs(vUv.y-0.5));c-=seam*0.09;
         gl_FragColor=vec4(c,1);
       }`
   });
-  const panels=[];
-  for(let row=0;row<3;row++) {
-    const count=13,scale=0.48+row*0.19;
-    for(let i=0;i<count;i++) {
-      const x=-2.15+i*(0.49+row*0.15)+row*0.13;
-      if(x>5.04)continue;
-      const y=3.39+(2-row)*0.22+0.04*Math.sin(i*0.45),z=-22+row*1.4;
-      panels.push({x,y,z,scale});
-      stroke([[x,y-0.24*scale],[x,y-0.67*scale]],0.022*scale,'#547751',z-0.05,layers.collectors);
-      polygon([[x-0.28*scale,y-0.38*scale],[x+0.48*scale,y-0.49*scale],[x+0.48*scale,y-0.56*scale],[x-0.28*scale,y-0.45*scale]],'#5b8157',z-0.02,layers.collectors);
+  const postMat = makePaint('#547751');
+  const bracketMat = makePaint('#5b8157');
+  const panels = [];
+  for (let row = 0; row < 3; row++) {
+    const count = 13, scale = 0.48 + row * 0.19;
+    for (let i = 0; i < count; i++) {
+      const x = -2.15 + i * (0.49 + row * 0.15) + row * 0.13;
+      if (x > 5.04) continue;
+      const y = 3.39 + (2 - row) * 0.22 + 0.04 * Math.sin(i * 0.45), z = -22 + row * 1.4;
+      panels.push({ x, y, z, scale, phaseOffset: i * 0.28 + row * 0.6 });
+      stroke([[x, y - 0.24 * scale], [x, y - 0.67 * scale]], 0.022 * scale, postMat, z - 0.05, layers.collectors);
+      polygon([[x - 0.28 * scale, y - 0.38 * scale], [x + 0.48 * scale, y - 0.49 * scale], [x + 0.48 * scale, y - 0.56 * scale], [x - 0.28 * scale, y - 0.45 * scale]], bracketMat, z - 0.02, layers.collectors);
     }
   }
-  const mirrors=new T.InstancedMesh(panelGeometry,panelMat,panels.length),dummy=new T.Object3D();
-  panels.forEach((p,i)=>{dummy.position.set(p.x,p.y,p.z);dummy.rotation.set(0,0,0);dummy.scale.setScalar(p.scale);dummy.updateMatrix();mirrors.setMatrixAt(i,dummy.matrix);});
-  mirrors.instanceMatrix.needsUpdate=true;layers.collectors.add(mirrors);
+  const mirrors = new T.InstancedMesh(panelGeometry, panelMat, panels.length), dummy = new T.Object3D();
+  function updateMirrors(tiltRad = 0, dynamicAmp = 0, animAngle = 0) {
+    panels.forEach((p, i) => {
+      dummy.position.set(p.x, p.y, p.z);
+      const localTilt = tiltRad + dynamicAmp * Math.sin(animAngle + p.phaseOffset);
+      dummy.rotation.set(localTilt * 0.7, localTilt * 0.5, localTilt * 0.35);
+      dummy.scale.setScalar(p.scale);
+      dummy.updateMatrix();
+      mirrors.setMatrixAt(i, dummy.matrix);
+    });
+    mirrors.instanceMatrix.needsUpdate = true;
+  }
+  updateMirrors(0, 0, 0);
+  layers.collectors.add(mirrors);
 
   // The receiver is a sculptural tapered shaft with a warm, diffused core.
-  polygon([[2.18,3.58],[2.83,3.56],[2.60,6.48],[2.40,6.48]],paint('#858e52','#b2aa5a'),-24,layers.tower);
-  polygon([[2.59,6.48],[2.83,3.56],[2.70,3.60],[2.50,6.48]],paint('#c3b265','#e7cf76'),-23.7,layers.tower);
-  const towerCap=paint('#cd9b39','#e8bd54');
-  rect(2.29,6.50,0.41,0.19,towerCap,-22.4,layers.tower);
-  rect(2.30,7.24,0.40,0.17,towerCap,-22.4,layers.tower);
-  const coreMat=new T.ShaderMaterial({
-    uniforms:{receiver:cycle.receiver},vertexShader:vertex,
-    fragmentShader:`uniform float receiver;varying vec3 vLocal;void main(){vec3 c=mix(vec3(1.0,0.89,0.43),vec3(1.0,0.97,0.72),0.57+receiver*0.23);c-=vec3(0,0.025,0.09)*pow(clamp(abs(vLocal.x-2.5)/0.21,0.0,1.0),3.0);gl_FragColor=vec4(c,1);}`
+  const towerBodyMat = makePaint('#858e52', '#b2aa5a');
+  const towerLitMat = makePaint('#c3b265', '#e7cf76');
+  const towerCapMat = makePaint('#cd9b39', '#e8bd54');
+  polygon([[2.18, 3.58], [2.83, 3.56], [2.60, 6.48], [2.40, 6.48]], towerBodyMat, -24, layers.tower);
+  polygon([[2.59, 6.48], [2.83, 3.56], [2.70, 3.60], [2.50, 6.48]], towerLitMat, -23.7, layers.tower);
+  rect(2.29, 6.50, 0.41, 0.19, towerCapMat, -22.4, layers.tower);
+  rect(2.30, 7.24, 0.40, 0.17, towerCapMat, -22.4, layers.tower);
+
+  const coreMat = new T.ShaderMaterial({
+    uniforms: {
+      receiver: cycle.receiver,
+      coreLow: { value: new T.Color(1.0, 0.89, 0.43) },
+      coreHigh: { value: new T.Color(1.0, 0.97, 0.72) }
+    },
+    vertexShader: vertex,
+    fragmentShader: `uniform float receiver; uniform vec3 coreLow, coreHigh; varying vec3 vLocal;
+      void main(){vec3 c=mix(coreLow,coreHigh,0.57+receiver*0.23);c-=vec3(0,0.025,0.09)*pow(clamp(abs(vLocal.x-2.5)/0.21,0.0,1.0),3.0);gl_FragColor=vec4(c,1);}`
   });
-  const receiverShape=new T.Shape();receiverShape.moveTo(2.30,6.66);receiverShape.lineTo(2.70,6.66);receiverShape.lineTo(2.70,7.22);receiverShape.quadraticCurveTo(2.50,7.34,2.30,7.22);receiverShape.closePath();
-  shapeMesh(receiverShape,coreMat,-22.2,layers.tower);
-  const haloMat=new T.ShaderMaterial({
-    uniforms:{receiver:cycle.receiver},vertexShader:vertex,transparent:true,depthWrite:false,
-    fragmentShader:`uniform float receiver;varying vec2 vUv;void main(){vec2 p=(vUv-0.5)*2.0;float a=exp(-dot(p,p)*4.8)*(0.13+receiver*0.065);a*=1.0-smoothstep(0.72,1.0,length(p));gl_FragColor=vec4(1,0.87,0.33,a);}`
+  const receiverShape = new T.Shape(); receiverShape.moveTo(2.30, 6.66); receiverShape.lineTo(2.70, 6.66); receiverShape.lineTo(2.70, 7.22); receiverShape.quadraticCurveTo(2.50, 7.34, 2.30, 7.22); receiverShape.closePath();
+  shapeMesh(receiverShape, coreMat, -22.2, layers.tower);
+
+  const haloMat = new T.ShaderMaterial({
+    uniforms: { receiver: cycle.receiver, haloColor: { value: new T.Color(1, 0.87, 0.33) } },
+    vertexShader: vertex, transparent: true, depthWrite: false,
+    fragmentShader: `uniform float receiver; uniform vec3 haloColor; varying vec2 vUv;
+      void main(){vec2 p=(vUv-0.5)*2.0;float a=exp(-dot(p,p)*4.8)*(0.13+receiver*0.065);a*=1.0-smoothstep(0.72,1.0,length(p));gl_FragColor=vec4(haloColor,a);}`
   });
-  const halo=new T.Mesh(new T.PlaneGeometry(2.1,2.6),haloMat);halo.position.set(2.5,6.98,-21.5);halo.renderOrder=3;layers.tower.add(halo);
-  const rayMat=new T.ShaderMaterial({
-    uniforms:{receiver:cycle.receiver},vertexShader:vertex,side:T.DoubleSide,transparent:true,depthWrite:false,
-    fragmentShader:`uniform float receiver;varying vec3 vWorld;void main(){float d=distance(vWorld.xy,vec2(2.5,6.96));float a=(0.075+receiver*0.045)*(1.0-smoothstep(0.1,7.0,d));gl_FragColor=vec4(1,0.90,0.42,a);}`
+  const halo = new T.Mesh(new T.PlaneGeometry(2.1, 2.6), haloMat); halo.position.set(2.5, 6.98, -21.5); halo.renderOrder = 3; layers.tower.add(halo);
+
+  const rayMat = new T.ShaderMaterial({
+    uniforms: { receiver: cycle.receiver, rayColor: { value: new T.Color(1, 0.90, 0.42) } },
+    vertexShader: vertex, side: T.DoubleSide, transparent: true, depthWrite: false,
+    fragmentShader: `uniform float receiver; uniform vec3 rayColor; varying vec3 vWorld;
+      void main(){float d=distance(vWorld.xy,vec2(2.5,6.96));float a=(0.075+receiver*0.045)*(1.0-smoothstep(0.1,7.0,d));gl_FragColor=vec4(rayColor,a);}`
   });
-  for(const pts of [ [[2.48,7.01],[-1.3,4.12],[0.10,3.70]], [[2.50,7.00],[5.45,4.0],[7.48,3.85]], [[2.50,7.00],[6.74,4.96],[8.75,4.85]] ]) {
-    const m=polygon(pts,rayMat,-25,layers.tower);m.renderOrder=2;
+  for (const pts of [[[2.48, 7.01], [-1.3, 4.12], [0.10, 3.70]], [[2.50, 7.00], [5.45, 4.0], [7.48, 3.85]], [[2.50, 7.00], [6.74, 4.96], [8.75, 4.85]]]) {
+    const m = polygon(pts, rayMat, -25, layers.tower); m.renderOrder = 2;
   }
 
-  // Tank walls are genuine cylinders. Their broad surface graphics use local
-  // coordinates, so the pigment remains attached to the solid architecture.
-  const tankFragment=`${grain}
-    uniform float phase,height,radius,identity,activation;
+  // Tank walls are genuine cylinders.
+  const tankColors = {
+    creamLight: { value: new T.Color(0.985, 0.892, 0.574) },
+    creamShade: { value: new T.Color(0.459, 0.561, 0.367) },
+    amberLight: { value: new T.Color(0.985, 0.535, 0.055) },
+    amberShade: { value: new T.Color(0.68, 0.342, 0.080) },
+    rustLight: { value: new T.Color(0.79, 0.353, 0.060) },
+    rustShade: { value: new T.Color(0.43, 0.300, 0.115) },
+    amberGlow: { value: new T.Color(0.082, 0.052, 0.004) },
+    rustGlow: { value: new T.Color(0.055, 0.026, 0.002) },
+    bleedGlow: { value: new T.Color(0.025, 0.012, 0.0) }
+  };
+  const tankFragment = `${grain}
+    uniform float phase,height,radius,identity,activation,moltenOffset;
+    uniform vec3 creamLight,creamShade,amberLight,amberShade,rustLight,rustShade,amberGlow,rustGlow,bleedGlow;
     varying vec3 vLocal,vNormal,vWorld;varying vec2 vUv;
     void main(){
       vec3 n=normalize(vNormal);
       float x=vLocal.x/radius,y=vLocal.y/height+0.5;
       float angle=atan(vLocal.z,vLocal.x);
       float shade=smoothstep(-0.50,0.98,n.x);
-      vec3 cream=mix(vec3(0.985,0.892,0.574),vec3(0.459,0.561,0.367),shade*0.88);
+      vec3 cream=mix(creamLight,creamShade,shade*0.88);
       cream+=vec3(0.040,0.035,0.008)*exp(-pow((n.x+0.65)*6.0,2.0));
       cream*=0.97+0.035*y;
-      float boundary=0.325+0.35*exp(-pow((x-0.27-identity*0.10)*1.45,2.0))+0.012*cos(angle*3.0+identity);
+      float boundary=clamp(0.325+moltenOffset+0.35*exp(-pow((x-0.27-identity*0.10)*1.45,2.0))+0.012*cos(angle*3.0+identity),0.04,0.95);
       float orange=1.0-smoothstep(boundary-0.002,boundary+0.002,y);
-      float lower=0.17+0.12*cos(x*1.8+0.7+identity*0.8);
+      float lower=clamp(0.17+moltenOffset*0.6+0.12*cos(x*1.8+0.7+identity*0.8),0.02,0.88);
       float copper=1.0-smoothstep(lower-0.002,lower+0.002,y);
-      vec3 amber=mix(vec3(0.985,0.535,0.055),vec3(0.68,0.342,0.080),shade*0.76);
-      vec3 rust=mix(vec3(0.79,0.353,0.060),vec3(0.43,0.300,0.115),shade*0.82);
+      vec3 amber=mix(amberLight,amberShade,shade*0.76);
+      vec3 rust=mix(rustLight,rustShade,shade*0.82);
       vec2 orbit=vec2(cos(phase),sin(phase));
       float warp=0.065*sin(angle*2.0+phase)+0.035*sin(y*5.5-angle*3.0-phase*2.0);
       float diffusion=noise(vec2(x*1.9,y*3.0)+orbit*0.24+warp);
       float wave=pulse(angle-phase+identity*0.86+warp);
-      amber+=vec3(0.082,0.052,0.004)*wave*activation;
+      amber+=amberGlow*wave*activation;
       amber*=0.965+0.07*diffusion;
-      rust+=vec3(0.055,0.026,0.002)*activation*wave;
+      rust+=rustGlow*activation*wave;
       vec3 heated=mix(amber,rust,copper*0.82);
       vec3 c=mix(cream,heated,orange);
       float bleed=exp(-abs(y-boundary)*14.0)*activation;
-      c+=vec3(0.025,0.012,0.0)*bleed;
+      c+=bleedGlow*bleed;
       c+=(noise(vLocal.xy*118.0)-0.5)*0.018;
       gl_FragColor=vec4(c,1);
     }`;
-  const railMat=paint('#edaa20','#ffca3b'),rimMat=paint('#365c49','#527154');
-  const roofMat=paint('#6f8055','#c6c180');
-  const tanks=[];
-  function tank(x,y,z,r,h,id) {
-    const group=new T.Group();group.position.set(x,y,z);group.rotation.x=0.112;layers.tanks.add(group);
-    const body=new T.Mesh(new T.CylinderGeometry(r,r,h,128,8,true),new T.ShaderMaterial({
-      uniforms:{phase,height:{value:h},radius:{value:r},identity:{value:id},activation:id===0?cycle.main:cycle.rear},
-      vertexShader:vertex,fragmentShader:tankFragment
-    }));group.add(body);
-    for(const [rr,hh,yy,mat] of [[r+0.035,0.072,h/2,rimMat],[r-0.012,0.035,h/2+0.038,roofMat],[r+0.015,0.115,-h/2+0.015,paint('#66754b','#88945b')]]) {
-      const m=new T.Mesh(new T.CylinderGeometry(rr,rr,hh,128),mat);m.position.y=yy;group.add(m);
+  const railMat = makePaint('#edaa20', '#ffca3b');
+  const rimMat = makePaint('#365c49', '#527154');
+  const roofMat = makePaint('#6f8055', '#c6c180');
+  const tankBaseMat = makePaint('#66754b', '#88945b');
+  const probeMat = makePaint('#536b46');
+  const tipMat = makePaint('#ffe283');
+  const tanks = [];
+  function tank(x, y, z, r, h, id) {
+    const group = new T.Group(); group.position.set(x, y, z); group.rotation.x = 0.112; layers.tanks.add(group);
+    const body = new T.Mesh(new T.CylinderGeometry(r, r, h, 128, 8, true), new T.ShaderMaterial({
+      uniforms: { phase, height: { value: h }, radius: { value: r }, identity: { value: id }, activation: id === 0 ? cycle.main : cycle.rear, moltenOffset: moltenOffsetU, ...tankColors },
+      vertexShader: vertex, fragmentShader: tankFragment
+    })); group.add(body);
+    for (const [rr, hh, yy, mat] of [[r + 0.035, 0.072, h / 2, rimMat], [r - 0.012, 0.035, h / 2 + 0.038, roofMat], [r + 0.015, 0.115, -h / 2 + 0.015, tankBaseMat]]) {
+      const m = new T.Mesh(new T.CylinderGeometry(rr, rr, hh, 128), mat); m.position.y = yy; group.add(m);
     }
-    const railRadius=r-0.055,railBase=h/2+0.065;
-    for(const lift of [0.115,0.245]) {
-      const ring=new T.Mesh(new T.TorusGeometry(railRadius,0.012,6,128),railMat);
-      ring.rotation.x=Math.PI/2;ring.position.y=railBase+lift;group.add(ring);
+    const railRadius = r - 0.055, railBase = h / 2 + 0.065;
+    for (const lift of [0.115, 0.245]) {
+      const ring = new T.Mesh(new T.TorusGeometry(railRadius, 0.012, 6, 128), railMat);
+      ring.rotation.x = Math.PI / 2; ring.position.y = railBase + lift; group.add(ring);
     }
-    const n=Math.ceil(TAU*railRadius/0.37);
-    const posts=new T.InstancedMesh(new T.CylinderGeometry(0.011,0.012,0.27,5),railMat,n);
-    for(let i=0;i<n;i++) {
-      const a=i/n*TAU;dummy.position.set(Math.cos(a)*railRadius,railBase+0.125,Math.sin(a)*railRadius);
-      dummy.rotation.set(0,0,0);dummy.scale.setScalar(1);dummy.updateMatrix();posts.setMatrixAt(i,dummy.matrix);
+    const n = Math.ceil(TAU * railRadius / 0.37);
+    const posts = new T.InstancedMesh(new T.CylinderGeometry(0.011, 0.012, 0.27, 5), railMat, n);
+    for (let i = 0; i < n; i++) {
+      const a = i / n * TAU; dummy.position.set(Math.cos(a) * railRadius, railBase + 0.125, Math.sin(a) * railRadius);
+      dummy.rotation.set(0, 0, 0); dummy.scale.setScalar(1); dummy.updateMatrix(); posts.setMatrixAt(i, dummy.matrix);
     }
-    posts.instanceMatrix.needsUpdate=true;group.add(posts);
-    // A squat inspection hatch and a slender temperature probe add scale.
-    const hatch=new T.Mesh(new T.CylinderGeometry(r*0.17,r*0.17,0.07,48),rimMat);
-    hatch.position.set(r*0.08,h/2+0.09,-r*0.15);group.add(hatch);
-    const probe=new T.Mesh(new T.CylinderGeometry(0.009,0.013,0.75,6),paint('#536b46'));
-    probe.position.set(-r*0.17,h/2+0.41,-r*0.23);group.add(probe);
-    const tip=new T.Mesh(new T.CylinderGeometry(0.011,0.011,0.075,6),paint('#ffe283'));
-    tip.position.copy(probe.position);tip.position.y+=0.37;group.add(tip);
-    tanks.push({group,body,radius:r,height:h});return group;
+    posts.instanceMatrix.needsUpdate = true; group.add(posts);
+    const hatch = new T.Mesh(new T.CylinderGeometry(r * 0.17, r * 0.17, 0.07, 48), rimMat);
+    hatch.position.set(r * 0.08, h / 2 + 0.09, -r * 0.15); group.add(hatch);
+    const probe = new T.Mesh(new T.CylinderGeometry(0.009, 0.013, 0.75, 6), probeMat);
+    probe.position.set(-r * 0.17, h / 2 + 0.41, -r * 0.23); group.add(probe);
+    const tip = new T.Mesh(new T.CylinderGeometry(0.011, 0.011, 0.075, 6), tipMat);
+    tip.position.copy(probe.position); tip.position.y += 0.37; group.add(tip);
+    tanks.push({ group, body, radius: r, height: h }); return group;
   }
-  tank(7.39,3.73,-5.0,2.19,2.29,1);
-  tank(11.51,4.18,0,3.06,3.24,0);
+  tank(7.39, 3.73, -5.0, 2.19, 2.29, 1);
+  tank(11.51, 4.18, 0, 3.06, 3.24, 0);
 
-  // Arc-length UV coordinates carry one broad thermal field through each
-  // entire pipe, including every elbow. Connected runs share route offsets.
-  const pipeFragment=`${grain}
-    uniform float phase,length,offset,direction;varying vec2 vUv;varying vec3 vNormal,vWorld;
+  // Pipes
+  const pipeColors = {
+    pipeShadow: { value: new T.Color(0.28, 0.419, 0.31) },
+    pipeMid: { value: new T.Color(0.82, 0.747, 0.455) },
+    pipeHighlight: { value: new T.Color(1.0, 0.939, 0.676) },
+    pipeWave: { value: new T.Color(1.0, 0.756, 0.32) },
+    pipePulseBoost: { value: 1.0 }
+  };
+  const pipeFragment = `${grain}
+    uniform float phase,length,offset,direction,pipePulseBoost;
+    uniform vec3 pipeShadow,pipeMid,pipeHighlight,pipeWave;
+    varying vec2 vUv;varying vec3 vNormal,vWorld;
     void main(){
       vec3 n=normalize(vNormal);
       float l=dot(n,normalize(vec3(-0.55,0.77,0.72)));
-      vec3 c=mix(vec3(0.28,0.419,0.31),vec3(0.82,0.747,0.455),smoothstep(-0.42,0.38,l));
-      c=mix(c,vec3(1.0,0.939,0.676),smoothstep(0.54,0.82,l)*0.91);
+      vec3 c=mix(pipeShadow,pipeMid,smoothstep(-0.42,0.38,l));
+      c=mix(c,pipeHighlight,smoothstep(0.54,0.82,l)*0.91);
       float s=offset+vUv.x*length;
       float wave=pulse(s*0.31-direction*phase-0.9);
       float tail=pulse(s*0.31-direction*phase-0.58);
       float edge=smoothstep(0.0,0.055,vUv.x)*(1.0-smoothstep(0.945,1.0,vUv.x));
-      c=mix(c,vec3(1.0,0.756,0.32),wave*0.15*edge);
-      c+=vec3(0.040,0.026,0.006)*tail*smoothstep(0.40,0.90,l)*edge;
+      c=mix(c,pipeWave,clamp(wave*0.15*pipePulseBoost,0.0,0.85)*edge);
+      c+=pipeHighlight*0.040*pipePulseBoost*tail*smoothstep(0.40,0.90,l)*edge;
       c+=(noise(vWorld.xy*145.0)-0.5)*0.007;
       gl_FragColor=vec4(c,1);
     }`;
-  const pipes=[];
-  function pipe(points,r=0.085,offset=0,direction=1,collars=true) {
-    const path=curve(points,0.28),length=path.getLength();
-    const mat=new T.ShaderMaterial({uniforms:{phase,length:{value:length},offset:{value:offset},direction:{value:direction}},vertexShader:vertex,fragmentShader:pipeFragment});
-    const mesh=new T.Mesh(new T.TubeGeometry(path,Math.max(70,Math.ceil(length*14)),r,12,false),mat);layers.pipes.add(mesh);
-    if(collars) {
-      for(let d=1.15;d<length-0.5;d+=2.25) {
-        const t=d/length,p=path.getPointAt(t),tangent=path.getTangentAt(t);
-        const ring=new T.Mesh(new T.TorusGeometry(r*1.035,0.009,6,16),paint('#8d9460','#d2c283'));
-        ring.position.copy(p);ring.quaternion.setFromUnitVectors(V(0,0,1),tangent.normalize());layers.pipes.add(ring);
+  const collarMat = makePaint('#8d9460', '#d2c283');
+  const supportMat = makePaint('#536b44');
+  const pipes = [];
+  function pipe(points, r = 0.085, offset = 0, direction = 1, collars = true) {
+    const path = curve(points, 0.28), length = path.getLength();
+    const mat = new T.ShaderMaterial({ uniforms: { phase, length: { value: length }, offset: { value: offset }, direction: { value: direction }, ...pipeColors }, vertexShader: vertex, fragmentShader: pipeFragment });
+    const mesh = new T.Mesh(new T.TubeGeometry(path, Math.max(70, Math.ceil(length * 14)), r, 12, false), mat); layers.pipes.add(mesh);
+    if (collars) {
+      for (let d = 1.15; d < length - 0.5; d += 2.25) {
+        const t = d / length, p = path.getPointAt(t), tangent = path.getTangentAt(t);
+        const ring = new T.Mesh(new T.TorusGeometry(r * 1.035, 0.009, 6, 16), collarMat);
+        ring.position.copy(p); ring.quaternion.setFromUnitVectors(V(0, 0, 1), tangent.normalize()); layers.pipes.add(ring);
       }
     }
-    pipes.push({mesh,path,length,offset});return length;
+    pipes.push({ mesh, path, length, offset }); return length;
   }
-  // The two high returns arch over the main roof and descend its left face.
-  const supplyLength=pipe([[4.83,2.43,4.2],[4.83,2.91,4.2],[9.12,2.91,4.2],[9.12,6.48,4.2],[10.92,6.39,3.0],[10.92,6.0,2.4]],0.092,0,1);
-  pipe([[11.17,6.00,2.1],[11.17,6.34,3.35],[9.51,6.44,4.48],[9.51,2.94,4.48],[7.93,2.94,4.48],[7.93,2.43,4.48]],0.105,supplyLength,1);
-  // A lower S-bend and main horizontal manifold tie both reservoirs together.
-  pipe([[5.64,2.44,3.65],[5.64,5.34,3.65],[6.87,5.29,2.5],[6.87,5.02,1.2]],0.075,2.6,1);
-  pipe([[7.10,5.00,1.3],[7.10,5.25,2.8],[5.86,5.35,3.95],[5.86,2.89,3.95],[8.21,2.89,4.65],[8.21,2.43,4.65]],0.083,14.5,1);
-  pipe([[7.72,2.42,4.65],[7.72,3.07,4.65],[8.31,3.07,4.65]],0.092,12.8,-1);
-  // Low supports, quietly visible beneath the long horizontal pipe.
-  for(const x of [6.20,7.50,8.86]) rect(x,2.43,0.075,0.42,'#536b44',4.0,layers.pipes);
-  for(let i=0;i<4;i++) {
-    const x=11.10+i*0.20,y=3.35-i*0.14;
-    pipe([[x,2.43,5.1],[x,y,5.1],[12.26,y,5.1]],0.068-i*0.003,21+i*0.7,-1);
+  const supplyLength = pipe([[4.83, 2.43, 4.2], [4.83, 2.91, 4.2], [9.12, 2.91, 4.2], [9.12, 6.48, 4.2], [10.92, 6.39, 3.0], [10.92, 6.0, 2.4]], 0.092, 0, 1);
+  pipe([[11.17, 6.00, 2.1], [11.17, 6.34, 3.35], [9.51, 6.44, 4.48], [9.51, 2.94, 4.48], [7.93, 2.94, 4.48], [7.93, 2.43, 4.48]], 0.105, supplyLength, 1);
+  pipe([[5.64, 2.44, 3.65], [5.64, 5.34, 3.65], [6.87, 5.29, 2.5], [6.87, 5.02, 1.2]], 0.075, 2.6, 1);
+  pipe([[7.10, 5.00, 1.3], [7.10, 5.25, 2.8], [5.86, 5.35, 3.95], [5.86, 2.89, 3.95], [8.21, 2.89, 4.65], [8.21, 2.43, 4.65]], 0.083, 14.5, 1);
+  pipe([[7.72, 2.42, 4.65], [7.72, 3.07, 4.65], [8.31, 3.07, 4.65]], 0.092, 12.8, -1);
+  for (const x of [6.20, 7.50, 8.86]) rect(x, 2.43, 0.075, 0.42, supportMat, 4.0, layers.pipes);
+  for (let i = 0; i < 4; i++) {
+    const x = 11.10 + i * 0.20, y = 3.35 - i * 0.14;
+    pipe([[x, 2.43, 5.1], [x, y, 5.1], [12.26, y, 5.1]], 0.068 - i * 0.003, 21 + i * 0.7, -1);
   }
 
-  // Service house: sunlit side, shaded facade, recessed louvers, low annex.
-  const buildingCream=paint('#e9cf81','#fae5a0'),buildingGreen=paint('#628c71','#91ad7d');
-  polygon([[11.88,2.44],[12.37,2.44],[12.37,3.61],[11.88,3.56]],buildingCream,6.3);
-  polygon([[12.37,2.44],[13.66,2.44],[13.66,3.55],[12.37,3.61]],buildingGreen,6.31);
-  polygon([[11.88,3.56],[12.37,3.61],[13.66,3.55],[13.16,3.51]],paint('#e4d58a'),6.34);
-  stroke([[11.88,3.56],[12.37,3.61],[13.66,3.55]],0.008,'#ffe6a0',6.36);
-  rect(13.66,2.44,1.88,0.54,paint('#5a7e5e','#84996b'),5.6);
-  rect(13.66,2.91,1.88,0.14,paint('#486e56'),5.65);
-  rect(13.77,2.44,0.075,0.46,'#a7aa69',5.7);
-  rect(15.30,2.44,0.075,0.46,'#a7aa69',5.7);
-  for(const x of [12.98,13.32]) {
-    rect(x,2.58,0.19,0.72,'#3c6653',6.4);
-    for(let i=0;i<16;i++) rect(x+0.018,2.62+i*0.039,0.155,0.009,'#6d9070',6.42);
+  // Service house
+  const buildingCream = makePaint('#e9cf81', '#fae5a0'), buildingGreen = makePaint('#628c71', '#91ad7d');
+  const buildingRoofMat = makePaint('#e4d58a'), buildingEdgeMat = makePaint('#ffe6a0');
+  const annexMat = makePaint('#5a7e5e', '#84996b'), annexTrimMat = makePaint('#486e56'), pillarMat = makePaint('#a7aa69');
+  const louverBgMat = makePaint('#3c6653'), louverSlatMat = makePaint('#6d9070');
+  const doorMat = makePaint('#4e765b'), windowMat = makePaint('#6d865f'), platformMat = makePaint('#8e985a', '#c5b85c');
+  polygon([[11.88, 2.44], [12.37, 2.44], [12.37, 3.61], [11.88, 3.56]], buildingCream, 6.3);
+  polygon([[12.37, 2.44], [13.66, 2.44], [13.66, 3.55], [12.37, 3.61]], buildingGreen, 6.31);
+  polygon([[11.88, 3.56], [12.37, 3.61], [13.66, 3.55], [13.16, 3.51]], buildingRoofMat, 6.34);
+  stroke([[11.88, 3.56], [12.37, 3.61], [13.66, 3.55]], 0.008, buildingEdgeMat, 6.36);
+  rect(13.66, 2.44, 1.88, 0.54, annexMat, 5.6);
+  rect(13.66, 2.91, 1.88, 0.14, annexTrimMat, 5.65);
+  rect(13.77, 2.44, 0.075, 0.46, pillarMat, 5.7);
+  rect(15.30, 2.44, 0.075, 0.46, pillarMat, 5.7);
+  for (const x of [12.98, 13.32]) {
+    rect(x, 2.58, 0.19, 0.72, louverBgMat, 6.4);
+    for (let i = 0; i < 16; i++) rect(x + 0.018, 2.62 + i * 0.039, 0.155, 0.009, louverSlatMat, 6.42);
   }
-  rect(12.57,2.44,0.16,0.25,'#4e765b',6.4);
-  rect(12.03,3.23,0.18,0.11,'#6d865f',6.4);
-  // Gold perimeter rails and small access platforms ground the architecture.
-  function fence(x1,x2,y,z,h=0.23,spacing=0.40) {
-    stroke([[x1,y+h],[x2,y+h]],0.010,railMat,z);
-    stroke([[x1,y+0.075],[x2,y+0.075]],0.008,railMat,z);
-    for(let x=x1;x<=x2+0.005;x+=spacing) stroke([[x,y],[x,y+h]],0.009,railMat,z);
+  rect(12.57, 2.44, 0.16, 0.25, doorMat, 6.4);
+  rect(12.03, 3.23, 0.18, 0.11, windowMat, 6.4);
+  function fence(x1, x2, y, z, h = 0.23, spacing = 0.40) {
+    stroke([[x1, y + h], [x2, y + h]], 0.010, railMat, z);
+    stroke([[x1, y + 0.075], [x2, y + 0.075]], 0.008, railMat, z);
+    for (let x = x1; x <= x2 + 0.005; x += spacing) stroke([[x, y], [x, y + h]], 0.009, railMat, z);
   }
-  rect(5.18,2.42,6.70,0.17,paint('#8e985a','#c5b85c'),4.8);
-  fence(5.20,7.48,2.58,5.0,0.15,0.20);fence(8.39,9.86,2.58,5.0,0.15,0.20);
-  fence(13.69,15.47,3.05,5.7,0.18,0.24);fence(12.82,17.3,2.43,7.0,0.23,0.40);
+  rect(5.18, 2.42, 6.70, 0.17, platformMat, 4.8);
+  fence(5.20, 7.48, 2.58, 5.0, 0.15, 0.20); fence(8.39, 9.86, 2.58, 5.0, 0.15, 0.20);
+  fence(13.69, 15.47, 3.05, 5.7, 0.18, 0.24); fence(12.82, 17.3, 2.43, 7.0, 0.23, 0.40);
 
-  // Broad, uninterrupted agricultural strips extend beyond every viewport.
-  rect(-65,-20,150,22.44,paint('#708521','#96a42c'),-14,layers.fields);
-  rect(-65,2.30,150,0.12,paint('#e6c537','#f6d749'),7.2,layers.fields);
-  rect(-65,1.87,150,0.43,paint('#86921c','#adac26'),7.25,layers.fields);
-  rect(-65,1.68,150,0.19,paint('#a5aa20','#cac02a'),7.3,layers.fields);
-  rect(-65,1.33,150,0.35,paint('#345821','#61782c'),7.35,layers.fields);
-  rect(-65,1.18,150,0.15,paint('#8c8d1c','#b0a824'),7.4,layers.fields);
-  rect(-65,0.66,150,0.52,paint('#304819','#526325'),7.45,layers.fields);
-  hill([-65,0.70],[[-20,0.65,-1,0.70,4,0.71],[10,0.79,15,0.60,21,0.70],[35,0.72,49,0.67,85,0.73]],'#78751d','#a09726',7.5);
-  hill([-65,0.47],[[-15,0.39,-1,0.52,5,0.43],[9,0.51,14,0.49,19,0.43],[34,0.49,51,0.39,85,0.46]],'#223819','#3b4d1b',7.6);
-  hill([-65,0.12],[[-15,0.20,0,0.08,5,0.16],[11,0.10,16,0.21,23,0.08],[38,0.12,55,0.12,85,0.17]],'#172a15','#2b3916',7.7);
+  // Agricultural strips & foreground hills
+  const fieldStripMats = [];
+  const fieldSpecs = [
+    [-20, 22.44, '#708521', '#96a42c', -14],
+    [2.30, 0.12, '#e6c537', '#f6d749', 7.2],
+    [1.87, 0.43, '#86921c', '#adac26', 7.25],
+    [1.68, 0.19, '#a5aa20', '#cac02a', 7.3],
+    [1.33, 0.35, '#345821', '#61782c', 7.35],
+    [1.18, 0.15, '#8c8d1c', '#b0a824', 7.4],
+    [0.66, 0.52, '#304819', '#526325', 7.45]
+  ];
+  for (const [y, h, a, b, z] of fieldSpecs) {
+    const m = makePaint(a, b);
+    fieldStripMats.push(m);
+    rect(-65, y, 150, h, m, z, layers.fields);
+  }
+  const fgHillMats = [];
+  hill([-65, 0.70], [[-20, 0.65, -1, 0.70, 4, 0.71], [10, 0.79, 15, 0.60, 21, 0.70], [35, 0.72, 49, 0.67, 85, 0.73]], '#78751d', '#a09726', 7.5, layers.fields, fgHillMats);
+  hill([-65, 0.47], [[-15, 0.39, -1, 0.52, 5, 0.43], [9, 0.51, 14, 0.49, 19, 0.43], [34, 0.49, 51, 0.39, 85, 0.46]], '#223819', '#3b4d1b', 7.6, layers.fields, fgHillMats);
+  hill([-65, 0.12], [[-15, 0.20, 0, 0.08, 5, 0.16], [11, 0.10, 16, 0.21, 23, 0.08], [38, 0.12, 55, 0.12, 85, 0.17]], '#172a15', '#2b3916', 7.7, layers.fields, fgHillMats);
 
-  // Reeds are merged tapered ribbons. Every vertex carries its root, so only
-  // the upper stem bends; all wind terms are integer harmonics of the loop.
-  const reedPositions=[],reedColors=[],reedRoots=[],reedWeights=[],reedOffsets=[];
-  function ribbon(points,width,hex,root,offset,blade=false) {
-    const c=color(hex),n=points.length;
-    for(let i=0;i<n-1;i++) {
-      const a=points[i],b=points[i+1],dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy)||1;
-      const profile=t=>blade?Math.pow(Math.sin(Math.PI*t),0.85):(1-t*0.88);
-      const wa=width*profile(i/(n-1)),wb=width*profile((i+1)/(n-1));
-      const verts=[[a[0]-dy/len*wa,a[1]+dx/len*wa],[a[0]+dy/len*wa,a[1]-dx/len*wa],[b[0]-dy/len*wb,b[1]+dx/len*wb],[b[0]+dy/len*wb,b[1]-dx/len*wb]];
-      for(const j of [0,1,2,1,3,2]) {
-        const p=verts[j];reedPositions.push(p[0],p[1],9+root[2]);reedColors.push(c.r,c.g,c.b);
-        reedRoots.push(root[0],root[1]);reedWeights.push(Math.max(0,p[1]-root[1]));reedOffsets.push(offset);
-      }
-    }
-  }
-  const reedPalette=['#b85c1d','#c66c1c','#a85a1a','#8c651e','#9b761e','#5a611f','#263a18'];
-  for(let i=0;i<155;i++) {
-    const x=range(-10,36),y=range(-0.85,0.12),h=range(0.75,2.65),lean=range(-0.70,0.58),offset=range(0,TAU);
-    const root=[x,y,range(0,0.8)],stemColor=i%3===0?'#31421a':'#536022';
-    const point=t=>[x+lean*t*t,y+h*t];
-    ribbon([point(0),point(0.35),point(0.70),point(1)],0.006,stemColor,root,offset);
-    const leaves=Math.floor(range(3,6));
-    for(let j=0;j<leaves;j++) {
-      const t=range(0.13,0.82),p=point(t),side=j%2===0?1:-1,l=range(0.30,0.78),rise=range(0.17,0.58);
-      const hex=reedPalette[Math.floor(range(0,reedPalette.length))];
-      const blade=[];
-      for(let k=0;k<=6;k++){const u=k/6;blade.push([p[0]+side*l*0.85*u,p[1]+rise*(1.6*u-0.6*u*u)]);}
-      ribbon(blade,range(0.018,0.038),hex,root,offset,true);
-    }
-    const top=point(0.73),hex=reedPalette[Math.floor(range(0,5))];
-    ribbon([top,[top[0]+lean*0.05,top[1]+h*0.12],[top[0]+lean*0.17,top[1]+h*0.27],[top[0]+lean*0.31,top[1]+h*0.40]],range(0.023,0.047),hex,root,offset,true);
-  }
-  const reedGeometry=new T.BufferGeometry();
-  for(const [name,array,size] of [['position',reedPositions,3],['color',reedColors,3],['root',reedRoots,2],['weight',reedWeights,1],['offset',reedOffsets,1]]) reedGeometry.setAttribute(name,new T.Float32BufferAttribute(array,size));
-  const reedMat=new T.ShaderMaterial({
-    uniforms:{phase},side:T.DoubleSide,vertexColors:true,
-    vertexShader:`uniform float phase;attribute vec2 root;attribute float weight,offset;varying vec3 vColor;varying vec3 vWorld;
-      void main(){vec3 p=position;float wind=sin(phase+offset+root.x*0.31)+0.22*sin(phase*2.0-offset);p.x+=weight*weight*0.016*wind;vColor=color;vWorld=p;gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1);}`,
-    fragmentShader:`${grain} varying vec3 vColor,vWorld;void main(){vec3 c=vColor*(0.94+0.06*noise(vWorld.xy*32.0));gl_FragColor=vec4(c,1);}`
+  // Reeds with slot-mapped recoloring and procedural rebuild capability
+  const originalReedPalette = ['#b85c1d', '#c66c1c', '#a85a1a', '#8c651e', '#9b761e', '#5a611f', '#263a18'];
+  const originalStemColors = ['#31421a', '#536022'];
+  let activeReedPalette = [...originalReedPalette];
+  let activeStemColors = [...originalStemColors];
+  let reedVertexSlots = [];
+  let reedMesh = null;
+  const reedMat = new T.ShaderMaterial({
+    uniforms: { phase, windStrength: windStrengthU }, side: T.DoubleSide, vertexColors: true,
+    vertexShader: `uniform float phase, windStrength; attribute vec2 root; attribute float weight,offset; varying vec3 vColor; varying vec3 vWorld;
+      void main(){vec3 p=position;float wind=(sin(phase+offset+root.x*0.31)+0.22*sin(phase*2.0-offset))*windStrength;p.x+=weight*weight*0.016*wind;vColor=color;vWorld=p;gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1);}`,
+    fragmentShader: `${grain} varying vec3 vColor,vWorld;void main(){vec3 c=vColor*(0.94+0.06*noise(vWorld.xy*32.0));gl_FragColor=vec4(c,1);}`
   });
-  layers.reeds.add(new T.Mesh(reedGeometry,reedMat));
 
-  const birds=[];
-  for(const [x,y,s] of [[12.22,7.46,0.21],[12.79,7.04,0.17]]) {
-    const wing=new T.Shape();wing.moveTo(-1,-0.01);wing.quadraticCurveTo(-0.46,0.26,0,0);
-    wing.quadraticCurveTo(0.54,0.22,0.91,0.76);wing.quadraticCurveTo(0.48,0.29,0.30,-0.08);
-    wing.quadraticCurveTo(0.04,-0.01,-0.19,-0.055);wing.quadraticCurveTo(-0.52,0.07,-1,-0.01);
-    const m=new T.Mesh(new T.ShapeGeometry(wing),paint('#507b58'));m.position.set(x,y,-28);m.scale.setScalar(s);layers.birds.add(m);
-    birds.push({mesh:m,x,y,offset:range(0,TAU)});
+  function buildReeds(reedSeed = 831) {
+    seed = reedSeed;
+    const reedPositions = [], reedColors = [], reedRoots = [], reedWeights = [], reedOffsets = [];
+    reedVertexSlots = [];
+    function ribbon(points, width, slotIdx, root, offset, blade = false) {
+      const hex = slotIdx < 0 ? activeStemColors[-slotIdx - 1] : activeReedPalette[slotIdx];
+      const c = color(hex), n = points.length;
+      for (let i = 0; i < n - 1; i++) {
+        const a = points[i], b = points[i + 1], dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy) || 1;
+        const profile = t => blade ? Math.pow(Math.sin(Math.PI * t), 0.85) : (1 - t * 0.88);
+        const wa = width * profile(i / (n - 1)), wb = width * profile((i + 1) / (n - 1));
+        const verts = [[a[0] - dy / len * wa, a[1] + dx / len * wa], [a[0] + dy / len * wa, a[1] - dx / len * wa], [b[0] - dy / len * wb, b[1] + dx / len * wb], [b[0] + dy / len * wb, b[1] - dx / len * wb]];
+        for (const j of [0, 1, 2, 1, 3, 2]) {
+          const p = verts[j]; reedPositions.push(p[0], p[1], 9 + root[2]); reedColors.push(c.r, c.g, c.b);
+          reedRoots.push(root[0], root[1]); reedWeights.push(Math.max(0, p[1] - root[1])); reedOffsets.push(offset);
+          reedVertexSlots.push(slotIdx);
+        }
+      }
+    }
+    for (let i = 0; i < 155; i++) {
+      const x = range(-10, 36), y = range(-0.85, 0.12), h = range(0.75, 2.65), lean = range(-0.70, 0.58), offset = range(0, TAU);
+      const root = [x, y, range(0, 0.8)], stemSlot = i % 3 === 0 ? -1 : -2;
+      const point = t => [x + lean * t * t, y + h * t];
+      ribbon([point(0), point(0.35), point(0.70), point(1)], 0.006, stemSlot, root, offset);
+      const leaves = Math.floor(range(3, 6));
+      for (let j = 0; j < leaves; j++) {
+        const t = range(0.13, 0.82), p = point(t), side = j % 2 === 0 ? 1 : -1, l = range(0.30, 0.78), rise = range(0.17, 0.58);
+        const slot = Math.floor(range(0, 7));
+        const blade = [];
+        for (let k = 0; k <= 6; k++) { const u = k / 6; blade.push([p[0] + side * l * 0.85 * u, p[1] + rise * (1.6 * u - 0.6 * u * u)]); }
+        ribbon(blade, range(0.018, 0.038), slot, root, offset, true);
+      }
+      const top = point(0.73), topSlot = Math.floor(range(0, 5));
+      ribbon([top, [top[0] + lean * 0.05, top[1] + h * 0.12], [top[0] + lean * 0.17, top[1] + h * 0.27], [top[0] + lean * 0.31, top[1] + h * 0.40]], range(0.023, 0.047), topSlot, root, offset, true);
+    }
+    const geo = new T.BufferGeometry();
+    for (const [name, array, size] of [['position', reedPositions, 3], ['color', reedColors, 3], ['root', reedRoots, 2], ['weight', reedWeights, 1], ['offset', reedOffsets, 1]]) {
+      geo.setAttribute(name, new T.Float32BufferAttribute(array, size));
+    }
+    if (reedMesh) {
+      reedMesh.geometry.dispose();
+      reedMesh.geometry = geo;
+    } else {
+      reedMesh = new T.Mesh(geo, reedMat);
+      layers.reeds.add(reedMesh);
+    }
+  }
+  function recolorReeds() {
+    if (!reedMesh) return;
+    const stemC = activeStemColors.map(h => color(h));
+    const palC = activeReedPalette.map(h => color(h));
+    const attr = reedMesh.geometry.getAttribute('color');
+    const arr = attr.array;
+    for (let i = 0; i < reedVertexSlots.length; i++) {
+      const s = reedVertexSlots[i];
+      const c = s < 0 ? stemC[-s - 1] : palC[s];
+      arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b;
+    }
+    attr.needsUpdate = true;
+  }
+  buildReeds(831);
+
+  const birdMat = makePaint('#507b58');
+  const birds = [];
+  for (const [x, y, s] of [[12.22, 7.46, 0.21], [12.79, 7.04, 0.17]]) {
+    const wing = new T.Shape(); wing.moveTo(-1, -0.01); wing.quadraticCurveTo(-0.46, 0.26, 0, 0);
+    wing.quadraticCurveTo(0.54, 0.22, 0.91, 0.76); wing.quadraticCurveTo(0.48, 0.29, 0.30, -0.08);
+    wing.quadraticCurveTo(0.04, -0.01, -0.19, -0.055); wing.quadraticCurveTo(-0.52, 0.07, -1, -0.01);
+    const m = new T.Mesh(new T.ShapeGeometry(wing), birdMat); m.position.set(x, y, -28); m.scale.setScalar(s); layers.birds.add(m);
+    birds.push({ mesh: m, x, y, baseScale: s, offset: range(0, TAU) });
   }
 
-  // One modest finishing pass: static screen-print grain, very gentle paper
-  // shading, and subpixel heat haze confined to the air above the hot roofs.
-  const target=new T.WebGLRenderTarget(1,1,{depthBuffer:true,stencilBuffer:false,samples:Math.min(renderer.capabilities.maxSamples||0,4)});
-  target.texture.colorSpace=T.NoColorSpace;
-  const finishScene=new T.Scene(),finishCamera=new T.OrthographicCamera(-1,1,1,-1,0,1);
-  const bounds={value:new T.Vector4(0,0,16,12)},resolution={value:new T.Vector2(1,1)};
-  const finishMat=new T.ShaderMaterial({
-    uniforms:{image:{value:target.texture},phase,activation:cycle.main,bounds,resolution},depthTest:false,depthWrite:false,
-    vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0,1);}`,
-    fragmentShader:`${grain}
-      uniform sampler2D image;uniform float phase,activation;uniform vec4 bounds;uniform vec2 resolution;varying vec2 vUv;
+  // Finishing pass with configurable MSAA, optional FXAA, grain, heat haze, and pure #00ff00 greenscreen
+  const capabilitiesMaxSamples = renderer.capabilities.maxSamples || 0;
+  let targetSamples = Math.min(capabilitiesMaxSamples, 4);
+  let target = new T.WebGLRenderTarget(1, 1, { depthBuffer: true, stencilBuffer: false, samples: targetSamples });
+  target.texture.colorSpace = T.NoColorSpace;
+  const finishScene = new T.Scene(), finishCamera = new T.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const bounds = { value: new T.Vector4(0, 0, 16, 12) }, resolution = { value: new T.Vector2(1, 1) };
+  const finishUniforms = {
+    image: { value: target.texture }, phase, activation: cycle.main, bounds, resolution,
+    greenscreen: { value: 0.0 },
+    fxaa: { value: 0.0 },
+    grainAmount: { value: 1.0 },
+    heatHaze: { value: 1.0 }
+  };
+  const finishMat = new T.ShaderMaterial({
+    uniforms: finishUniforms, depthTest: false, depthWrite: false,
+    vertexShader: `varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0,1);}`,
+    fragmentShader: `${grain}
+      uniform sampler2D image; uniform float phase,activation,greenscreen,fxaa,grainAmount,heatHaze;
+      uniform vec4 bounds; uniform vec2 resolution; varying vec2 vUv;
+      float luma(vec3 rgb){return dot(rgb,vec3(0.299,0.587,0.114));}
+      vec3 sampleScene(vec2 uv){
+        vec3 col=texture2D(image,uv).rgb;
+        if(fxaa>0.5){
+          vec2 texel=1.0/resolution;
+          vec3 nw=texture2D(image,uv+vec2(-1.0,-1.0)*texel).rgb;
+          vec3 ne=texture2D(image,uv+vec2( 1.0,-1.0)*texel).rgb;
+          vec3 sw=texture2D(image,uv+vec2(-1.0, 1.0)*texel).rgb;
+          vec3 se=texture2D(image,uv+vec2( 1.0, 1.0)*texel).rgb;
+          float lNW=luma(nw),lNE=luma(ne),lSW=luma(sw),lSE=luma(se),lM=luma(col);
+          float lMin=min(lM,min(min(lNW,lNE),min(lSW,lSE)));
+          float lMax=max(lM,max(max(lNW,lNE),max(lSW,lSE)));
+          vec2 dir=vec2(-((lNW+lNE)-(lSW+lSE)),((lNW+lSW)-(lNE+lSE)));
+          float dirReduce=max((lNW+lNE+lSW+lSE)*(0.25/8.0),1.0/128.0);
+          float rcpDirMin=1.0/(min(abs(dir.x),abs(dir.y))+dirReduce);
+          dir=clamp(dir*rcpDirMin,vec2(-8.0),vec2(8.0))*texel;
+          vec3 rgbA=0.5*(texture2D(image,uv+dir*(1.0/3.0-0.5)).rgb+texture2D(image,uv+dir*(2.0/3.0-0.5)).rgb);
+          vec3 rgbB=rgbA*0.5+0.25*(texture2D(image,uv+dir*-0.5).rgb+texture2D(image,uv+dir*0.5).rgb);
+          float lB=luma(rgbB);
+          col=(lB<lMin||lB>lMax)?rgbA:rgbB;
+        }
+        return col;
+      }
       void main(){
         vec2 p=bounds.xy+vUv*bounds.zw;
         float mainMask=smoothstep(8.4,8.8,p.x)*(1.0-smoothstep(14.2,14.7,p.x))*smoothstep(6.52,6.68,p.y)*(1.0-smoothstep(7.00,7.35,p.y));
         float rearMask=smoothstep(5.2,5.5,p.x)*(1.0-smoothstep(8.2,8.5,p.x))*smoothstep(5.55,5.65,p.y)*(1.0-smoothstep(5.95,6.20,p.y));
-        float shimmer=(mainMask+rearMask*0.5)*(0.4+0.6*activation);
+        float shimmer=(mainMask+rearMask*0.5)*(0.4+0.6*activation)*heatHaze;
         vec2 distortion=vec2(sin(p.y*22.0+p.x*3.0-phase*2.0),cos(p.x*15.0+p.y*3.0+phase))*shimmer*0.85/resolution;
-        vec3 c=texture2D(image,clamp(vUv+distortion,0.0,1.0)).rgb;
+        vec3 c=sampleScene(clamp(vUv+distortion,0.0,1.0));
+        if(greenscreen>0.5 && length(c-vec3(0.0,1.0,0.0))<0.015){
+          gl_FragColor=vec4(0.0,1.0,0.0,1.0);
+          return;
+        }
         float n=hash(gl_FragCoord.xy);
         float fibers=noise(gl_FragCoord.xy*0.46);
-        c+=(n-0.5)*0.038+(fibers-0.5)*0.011;
-        float paper=1.0-0.018*dot(vUv-0.5,vUv-0.5);c*=paper;
+        c+=((n-0.5)*0.038+(fibers-0.5)*0.011)*grainAmount;
+        float paper=1.0-0.018*dot(vUv-0.5,vUv-0.5)*grainAmount;
+        c*=paper;
         gl_FragColor=vec4(c,1);
       }`
   });
-  finishScene.add(new T.Mesh(new T.PlaneGeometry(2,2),finishMat));
-  let width=0,height=0,raf=0,lost=false,elapsed=0,last=performance.now();
+  finishScene.add(new T.Mesh(new T.PlaneGeometry(2, 2), finishMat));
+
+  // --- 30 Preconfigured Color Schemes ---
+  const ORIGINAL_THEME = {
+    background: '#13b7b9',
+    skyHorizon: '#9cda8c',
+    sunGlow: '#ffe16b',
+    hills: '#8aaa59',
+    architecture: '#fae392',
+    accent: '#fb880e',
+    shadows: '#263a18',
+    detail: '#82945e',
+    exact: true
+  };
+
+  function makeHarmonyTheme(baseHue, mode) {
+    let hSky = baseHue, hHills = baseHue, hArch = baseHue, hAccent = baseHue, hDetail = baseHue;
+    let sSky = 0.62, lSky = 0.42;
+    if (mode === 'Monochromatic') {
+      return {
+        background: hslToHex(baseHue, 0.55, 0.34),
+        skyHorizon: hslToHex(baseHue, 0.48, 0.66),
+        sunGlow: hslToHex(baseHue, 0.85, 0.84),
+        hills: hslToHex(baseHue, 0.42, 0.44),
+        architecture: hslToHex(baseHue, 0.35, 0.78),
+        accent: hslToHex(baseHue, 0.78, 0.50),
+        shadows: hslToHex(baseHue, 0.50, 0.14),
+        detail: hslToHex(baseHue, 0.32, 0.56)
+      };
+    } else if (mode === 'Analogous') {
+      hSky = baseHue; hHills = baseHue + 32; hArch = baseHue + 55; hAccent = baseHue + 68; hDetail = baseHue + 20;
+    } else if (mode === 'Complementary') {
+      hSky = baseHue; hHills = baseHue + 18; hArch = baseHue + 170; hAccent = baseHue + 180; hDetail = baseHue + 150;
+    } else if (mode === 'Split-complementary') {
+      hSky = baseHue; hHills = baseHue + 150; hArch = baseHue + 205; hAccent = baseHue + 175; hDetail = baseHue + 135;
+    } else if (mode === 'Triadic') {
+      hSky = baseHue; hHills = baseHue + 120; hArch = baseHue + 240; hAccent = baseHue + 240; hDetail = baseHue + 120;
+    } else if (mode === 'Tetradic') {
+      hSky = baseHue; hHills = baseHue + 90; hArch = baseHue + 180; hAccent = baseHue + 270; hDetail = baseHue + 90;
+    } else if (mode === 'Double split-complementary') {
+      hSky = baseHue - 24; hHills = baseHue + 26; hArch = baseHue + 156; hAccent = baseHue + 204; hDetail = baseHue + 178;
+    }
+    return {
+      background: hslToHex(hSky, sSky, lSky),
+      skyHorizon: hslToHex(hSky + 12, 0.52, 0.70),
+      sunGlow: hslToHex(hAccent, 0.90, 0.76),
+      hills: hslToHex(hHills, 0.46, 0.46),
+      architecture: hslToHex(hArch, 0.52, 0.76),
+      accent: hslToHex(hAccent, 0.85, 0.52),
+      shadows: hslToHex(hHills, 0.45, 0.16),
+      detail: hslToHex(hDetail, 0.38, 0.52)
+    };
+  }
+
+  const COLOR_SCHEMES = {
+    'Original': () => ORIGINAL_THEME,
+    'Monochromatic': (h = 205) => makeHarmonyTheme(h, 'Monochromatic'),
+    'Analogous': (h = 175) => makeHarmonyTheme(h, 'Analogous'),
+    'Complementary': (h = 195) => makeHarmonyTheme(h, 'Complementary'),
+    'Split-complementary': (h = 210) => makeHarmonyTheme(h, 'Split-complementary'),
+    'Triadic': (h = 185) => makeHarmonyTheme(h, 'Triadic'),
+    'Tetradic': (h = 200) => makeHarmonyTheme(h, 'Tetradic'),
+    'Double split-complementary': (h = 190) => makeHarmonyTheme(h, 'Double split-complementary'),
+    'Achromatic (black and white version)': () => ({
+      background: '#111214', skyHorizon: '#35373c', sunGlow: '#f6f6f8',
+      hills: '#5c5f66', architecture: '#e2e3e6', accent: '#27292e',
+      shadows: '#090a0c', detail: '#8a8d94'
+    }),
+    'Achromatic (white and black version)': () => ({
+      background: '#f2f2ef', skyHorizon: '#d6d7d4', sunGlow: '#ffffff',
+      hills: '#8c8e92', architecture: '#2c2e33', accent: '#54575e',
+      shadows: '#121316', detail: '#6e7178'
+    }),
+    'Achromatic + Accent (black and white + red)': () => ({
+      background: '#101013', skyHorizon: '#313238', sunGlow: '#ff3842',
+      hills: '#4d4f57', architecture: '#dcdde0', accent: '#e6192e',
+      shadows: '#09090b', detail: '#8e9098'
+    }),
+    'Achromatic + Accent (white and black + red)': () => ({
+      background: '#f3f3f0', skyHorizon: '#d8d9d6', sunGlow: '#ff2b3a',
+      hills: '#95979c', architecture: '#2a2b30', accent: '#d91628',
+      shadows: '#111215', detail: '#6b6d73'
+    }),
+    'Neutral + accent': () => ({
+      background: '#ebe4d6', skyHorizon: '#d6cbb8', sunGlow: '#f7b267',
+      hills: '#9b907e', architecture: '#f5efe4', accent: '#e05a2b',
+      shadows: '#2f2923', detail: '#7a7062'
+    }),
+    '01. Solar': () => ({
+      background: '#5A64E2', skyHorizon: '#FBA140', sunGlow: '#FBA140',
+      hills: '#476123', architecture: '#FBA140', accent: '#FA4D21',
+      shadows: '#0B1C18', detail: '#274A28'
+    }),
+    '02. Twilight': () => ({
+      background: '#171A75', skyHorizon: '#6A82F2', sunGlow: '#D58BD1',
+      hills: '#1A5CED', architecture: '#D58BD1', accent: '#D85F45',
+      shadows: '#0C3AFD', detail: '#6A82F2'
+    }),
+    '03. Pastel Dream': () => ({
+      background: '#15DAD0', skyHorizon: '#62E9C9', sunGlow: '#F3FBB1',
+      hills: '#62E9C9', architecture: '#F3FBB1', accent: '#724DCB',
+      shadows: '#221659', detail: '#382788'
+    }),
+    '04. Golden Farm': () => ({
+      background: '#40C8C0', skyHorizon: '#8BD690', sunGlow: '#E1D566',
+      hills: '#BAD77A', architecture: '#E1D566', accent: '#7F880E',
+      shadows: '#241E0C', detail: '#8BD690'
+    }),
+    '05. Neon Green': () => ({
+      background: '#0A8BC0', skyHorizon: '#1BA8A3', sunGlow: '#BEDC38',
+      hills: '#78CD69', architecture: '#BEDC38', accent: '#40AB15',
+      shadows: '#128908', detail: '#1BA8A3'
+    }),
+    '06. Aerospace': () => ({
+      background: '#144859', skyHorizon: '#39134B', sunGlow: '#FBD578',
+      hills: '#9529B3', architecture: '#FBD578', accent: '#E4439E',
+      shadows: '#39134B', detail: '#F37695'
+    }),
+    '07. Golden Valley': () => ({
+      background: '#ECE6D5', skyHorizon: '#D8C585', sunGlow: '#EAB825',
+      hills: '#7C8321', architecture: '#ECE6D5', accent: '#EAB825',
+      shadows: '#304319', detail: '#58671F'
+    }),
+    '08. Lavender Countryside': () => ({
+      background: '#93DFF0', skyHorizon: '#D6DDE6', sunGlow: '#D6DDE6',
+      hills: '#816E99', architecture: '#D6DDE6', accent: '#75231E',
+      shadows: '#1A1C39', detail: '#333862'
+    }),
+    '09. Orange Lighthouse': () => ({
+      background: '#0A0A0E', skyHorizon: '#27183F', sunGlow: '#F8801B',
+      hills: '#43318C', architecture: '#F88958', accent: '#E65A32',
+      shadows: '#0A0A0E', detail: '#43318C'
+    }),
+    '10. Pastel Mountain': () => ({
+      background: '#FBE5DF', skyHorizon: '#F7C7B5', sunGlow: '#FBE5DF',
+      hills: '#AE98B4', architecture: '#F7C7B5', accent: '#5E619F',
+      shadows: '#16101C', detail: '#3A3366'
+    }),
+    '11. Amber Desert': () => ({
+      background: '#F6AA1C', skyHorizon: '#BC3908', sunGlow: '#F6AA1C',
+      hills: '#BC3908', architecture: '#F6AA1C', accent: '#941B0C',
+      shadows: '#220901', detail: '#BC3908'
+    }),
+    '12. Tropical Ocean': () => ({
+      background: '#63D1CF', skyHorizon: '#5BC0BE', sunGlow: '#63D1CF',
+      hills: '#4BAD9E', architecture: '#63D1CF', accent: '#0B132B',
+      shadows: '#000000', detail: '#4BAD9E'
+    }),
+    '13. Lavender Moonlight': () => ({
+      background: '#0D001D', skyHorizon: '#120A12', sunGlow: '#D69ADE',
+      hills: '#AA60C8', architecture: '#CFB5C2', accent: '#D69ADE',
+      shadows: '#0D001D', detail: '#C9A3C6'
+    }),
+    '14. Botanical Energy': () => ({
+      background: '#05140A', skyHorizon: '#0A3322', sunGlow: '#D4FFB0',
+      hills: '#00B894', architecture: '#D4FFB0', accent: '#7FFF00',
+      shadows: '#05140A', detail: '#00B894'
+    }),
+    '15. Ember Sunset': () => ({
+      background: '#0E0618', skyHorizon: '#3D1050', sunGlow: '#FFE8CC',
+      hills: '#C7501A', architecture: '#FFE8CC', accent: '#FF8C00',
+      shadows: '#0E0618', detail: '#3D1050'
+    }),
+    '16. Electric Violet': () => ({
+      background: '#090612', skyHorizon: '#1A1250', sunGlow: '#E8E0FF',
+      hills: '#6A3DE8', architecture: '#E8E0FF', accent: '#B38FFF',
+      shadows: '#090612', detail: '#6A3DE8'
+    }),
+    '17. Neon Aurora': () => ({
+      background: '#05020F', skyHorizon: '#1E0A3D', sunGlow: '#E0FBFF',
+      hills: '#00F0FF', architecture: '#E0FBFF', accent: '#D40078',
+      shadows: '#05020F', detail: '#00F0FF'
+    })
+  };
+  const SCHEME_NAMES = Object.keys(COLOR_SCHEMES);
+
+  function setPaintPair(mat, lowHex, highHex = lowHex) {
+    setColor(mat.uniforms.low.value, lowHex);
+    setColor(mat.uniforms.high.value, highHex);
+  }
+
+  function applyOriginalColors() {
+    setColor(skyUniforms.skyTop.value, '#13b7b9');
+    setColor(skyUniforms.skyHorizon.value, '#9cda8c');
+    setColor(skyUniforms.skyGlow.value, '#cce07a');
+    setPaintPair(sunMat, '#ffe16b', '#ffe778');
+
+    const origHills = [['#d8df79', '#8bd49b'], ['#efe178', '#e8e77c'], ['#8aaa59', '#9fbe78'], ['#71964d', '#8cab65'], ['#9faf2f', '#abbc4b']];
+    hillMats.forEach((m, i) => setPaintPair(m, origHills[i][0], origHills[i][1]));
+
+    setColor(panelMat.uniforms.panelLow.value, '#ebd963');
+    setColor(panelMat.uniforms.panelHigh.value, '#fff0a1');
+    setColor(panelMat.uniforms.panelBorder.value, '#5e8557');
+    panelMat.uniforms.panelPulse.value.set(0.06, 0.045, 0.005);
+    setPaintPair(postMat, '#547751');
+    setPaintPair(bracketMat, '#5b8157');
+
+    setPaintPair(towerBodyMat, '#858e52', '#b2aa5a');
+    setPaintPair(towerLitMat, '#c3b265', '#e7cf76');
+    setPaintPair(towerCapMat, '#cd9b39', '#e8bd54');
+    coreMat.uniforms.coreLow.value.set(1.0, 0.89, 0.43);
+    coreMat.uniforms.coreHigh.value.set(1.0, 0.97, 0.72);
+    haloMat.uniforms.haloColor.value.set(1, 0.87, 0.33);
+    rayMat.uniforms.rayColor.value.set(1, 0.90, 0.42);
+
+    tankColors.creamLight.value.set(0.985, 0.892, 0.574);
+    tankColors.creamShade.value.set(0.459, 0.561, 0.367);
+    tankColors.amberLight.value.set(0.985, 0.535, 0.055);
+    tankColors.amberShade.value.set(0.68, 0.342, 0.080);
+    tankColors.rustLight.value.set(0.79, 0.353, 0.060);
+    tankColors.rustShade.value.set(0.43, 0.300, 0.115);
+    tankColors.amberGlow.value.set(0.082, 0.052, 0.004);
+    tankColors.rustGlow.value.set(0.055, 0.026, 0.002);
+    tankColors.bleedGlow.value.set(0.025, 0.012, 0.0);
+
+    setPaintPair(railMat, '#edaa20', '#ffca3b');
+    setPaintPair(rimMat, '#365c49', '#527154');
+    setPaintPair(roofMat, '#6f8055', '#c6c180');
+    setPaintPair(tankBaseMat, '#66754b', '#88945b');
+    setPaintPair(probeMat, '#536b46');
+    setPaintPair(tipMat, '#ffe283');
+
+    pipeColors.pipeShadow.value.set(0.28, 0.419, 0.31);
+    pipeColors.pipeMid.value.set(0.82, 0.747, 0.455);
+    pipeColors.pipeHighlight.value.set(1.0, 0.939, 0.676);
+    pipeColors.pipeWave.value.set(1.0, 0.756, 0.32);
+    setPaintPair(collarMat, '#8d9460', '#d2c283');
+    setPaintPair(supportMat, '#536b44');
+
+    setPaintPair(buildingCream, '#e9cf81', '#fae5a0');
+    setPaintPair(buildingGreen, '#628c71', '#91ad7d');
+    setPaintPair(buildingRoofMat, '#e4d58a');
+    setPaintPair(buildingEdgeMat, '#ffe6a0');
+    setPaintPair(annexMat, '#5a7e5e', '#84996b');
+    setPaintPair(annexTrimMat, '#486e56');
+    setPaintPair(pillarMat, '#a7aa69');
+    setPaintPair(louverBgMat, '#3c6653');
+    setPaintPair(louverSlatMat, '#6d9070');
+    setPaintPair(doorMat, '#4e765b');
+    setPaintPair(windowMat, '#6d865f');
+    setPaintPair(platformMat, '#8e985a', '#c5b85c');
+
+    fieldSpecs.forEach((s, i) => setPaintPair(fieldStripMats[i], s[2], s[3]));
+    const origFg = [['#78751d', '#a09726'], ['#223819', '#3b4d1b'], ['#172a15', '#2b3916']];
+    fgHillMats.forEach((m, i) => setPaintPair(m, origFg[i][0], origFg[i][1]));
+
+    activeReedPalette = [...originalReedPalette];
+    activeStemColors = [...originalStemColors];
+    recolorReeds();
+    setPaintPair(birdMat, '#507b58');
+  }
+
+  function applyThemeColors(t) {
+    if (t.exact) {
+      applyOriginalColors();
+      return;
+    }
+    const { background, skyHorizon, sunGlow, hills, architecture, accent, shadows, detail } = t;
+
+    setColor(skyUniforms.skyTop.value, background);
+    setColor(skyUniforms.skyHorizon.value, skyHorizon);
+    setColor(skyUniforms.skyGlow.value, mixHex(skyHorizon, sunGlow, 0.55));
+    setPaintPair(sunMat, sunGlow, mixHex(sunGlow, '#ffffff', 0.25));
+
+    // 5 background hills stepping smoothly from skyHorizon/sunGlow down toward hills/shadows
+    const h0a = mixHex(skyHorizon, hills, 0.30), h0b = mixHex(skyHorizon, detail, 0.35);
+    const h1a = mixHex(skyHorizon, sunGlow, 0.35), h1b = mixHex(hills, sunGlow, 0.45);
+    const h2a = hills, h2b = mixHex(hills, skyHorizon, 0.22);
+    const h3a = mixHex(hills, shadows, 0.28), h3b = mixHex(hills, shadows, 0.14);
+    const h4a = mixHex(hills, accent, 0.18), h4b = mixHex(hills, sunGlow, 0.25);
+    [ [h0a, h0b], [h1a, h1b], [h2a, h2b], [h3a, h3b], [h4a, h4b] ].forEach(([a, b], i) => setPaintPair(hillMats[i], a, b));
+
+    // Collectors
+    setColor(panelMat.uniforms.panelLow.value, mixHex(architecture, detail, 0.25));
+    setColor(panelMat.uniforms.panelHigh.value, mixHex(architecture, sunGlow, 0.45));
+    setColor(panelMat.uniforms.panelBorder.value, mixHex(shadows, detail, 0.45));
+    setColor(panelMat.uniforms.panelPulse.value, sunGlow);
+    panelMat.uniforms.panelPulse.value.multiplyScalar(0.12);
+    setPaintPair(postMat, mixHex(shadows, detail, 0.4));
+    setPaintPair(bracketMat, mixHex(shadows, detail, 0.55));
+
+    // Tower & receiver
+    setPaintPair(towerBodyMat, mixHex(detail, shadows, 0.2), mixHex(detail, architecture, 0.35));
+    setPaintPair(towerLitMat, mixHex(architecture, detail, 0.35), mixHex(architecture, sunGlow, 0.4));
+    setPaintPair(towerCapMat, mixHex(accent, sunGlow, 0.35), sunGlow);
+    setColor(coreMat.uniforms.coreLow.value, mixHex(accent, sunGlow, 0.5));
+    setColor(coreMat.uniforms.coreHigh.value, mixHex(sunGlow, '#ffffff', 0.35));
+    setColor(haloMat.uniforms.haloColor.value, sunGlow);
+    setColor(rayMat.uniforms.rayColor.value, mixHex(sunGlow, accent, 0.25));
+
+    // Tanks
+    setColor(tankColors.creamLight.value, architecture);
+    setColor(tankColors.creamShade.value, mixHex(detail, shadows, 0.35));
+    setColor(tankColors.amberLight.value, accent);
+    setColor(tankColors.amberShade.value, mixHex(accent, shadows, 0.45));
+    setColor(tankColors.rustLight.value, mixHex(accent, shadows, 0.25));
+    setColor(tankColors.rustShade.value, mixHex(accent, shadows, 0.60));
+    setColor(tankColors.amberGlow.value, sunGlow); tankColors.amberGlow.value.multiplyScalar(0.10);
+    setColor(tankColors.rustGlow.value, accent); tankColors.rustGlow.value.multiplyScalar(0.08);
+    setColor(tankColors.bleedGlow.value, sunGlow); tankColors.bleedGlow.value.multiplyScalar(0.04);
+
+    setPaintPair(railMat, mixHex(accent, sunGlow, 0.45), sunGlow);
+    setPaintPair(rimMat, mixHex(shadows, detail, 0.35), mixHex(detail, shadows, 0.15));
+    setPaintPair(roofMat, detail, architecture);
+    setPaintPair(tankBaseMat, mixHex(detail, shadows, 0.3), detail);
+    setPaintPair(probeMat, mixHex(shadows, detail, 0.35));
+    setPaintPair(tipMat, sunGlow);
+
+    // Pipes
+    setColor(pipeColors.pipeShadow.value, mixHex(shadows, detail, 0.35));
+    setColor(pipeColors.pipeMid.value, mixHex(detail, architecture, 0.55));
+    setColor(pipeColors.pipeHighlight.value, mixHex(architecture, sunGlow, 0.45));
+    setColor(pipeColors.pipeWave.value, mixHex(accent, sunGlow, 0.35));
+    setPaintPair(collarMat, detail, architecture);
+    setPaintPair(supportMat, mixHex(shadows, detail, 0.4));
+
+    // Building
+    setPaintPair(buildingCream, mixHex(architecture, detail, 0.15), architecture);
+    setPaintPair(buildingGreen, mixHex(detail, shadows, 0.25), mixHex(detail, hills, 0.3));
+    setPaintPair(buildingRoofMat, mixHex(architecture, sunGlow, 0.2));
+    setPaintPair(buildingEdgeMat, mixHex(sunGlow, '#ffffff', 0.2));
+    setPaintPair(annexMat, mixHex(detail, shadows, 0.3), detail);
+    setPaintPair(annexTrimMat, mixHex(shadows, detail, 0.3));
+    setPaintPair(pillarMat, mixHex(detail, architecture, 0.4));
+    setPaintPair(louverBgMat, mixHex(shadows, detail, 0.22));
+    setPaintPair(louverSlatMat, mixHex(detail, hills, 0.35));
+    setPaintPair(doorMat, mixHex(shadows, detail, 0.3));
+    setPaintPair(windowMat, mixHex(detail, hills, 0.2));
+    setPaintPair(platformMat, mixHex(detail, hills, 0.25), mixHex(architecture, sunGlow, 0.3));
+
+    // Fields
+    const stripPairs = [
+      [mixHex(hills, shadows, 0.15), hills],
+      [mixHex(accent, sunGlow, 0.4), sunGlow],
+      [mixHex(hills, accent, 0.25), mixHex(hills, sunGlow, 0.3)],
+      [mixHex(hills, sunGlow, 0.2), mixHex(architecture, sunGlow, 0.35)],
+      [mixHex(shadows, hills, 0.3), mixHex(shadows, hills, 0.5)],
+      [mixHex(hills, shadows, 0.15), mixHex(hills, sunGlow, 0.2)],
+      [mixHex(shadows, hills, 0.2), mixHex(shadows, hills, 0.38)]
+    ];
+    stripPairs.forEach(([a, b], i) => setPaintPair(fieldStripMats[i], a, b));
+
+    const fgPairs = [
+      [mixHex(hills, shadows, 0.25), mixHex(hills, accent, 0.25)],
+      [mixHex(shadows, hills, 0.22), mixHex(shadows, hills, 0.42)],
+      [shadows, mixHex(shadows, hills, 0.18)]
+    ];
+    fgPairs.forEach(([a, b], i) => setPaintPair(fgHillMats[i], a, b));
+
+    // Reeds & birds
+    activeStemColors = [shadows, mixHex(shadows, hills, 0.35)];
+    activeReedPalette = [
+      accent,
+      mixHex(accent, sunGlow, 0.22),
+      mixHex(accent, shadows, 0.22),
+      mixHex(detail, accent, 0.45),
+      mixHex(hills, sunGlow, 0.35),
+      mixHex(hills, shadows, 0.35),
+      shadows
+    ];
+    recolorReeds();
+    setPaintPair(birdMat, mixHex(shadows, detail, 0.45));
+  }
+
+  // --- Application State & Settings ---
+  const initialDpr = Math.max(0.5, Math.min(3.0, Math.round(Math.min(window.devicePixelRatio || 1, 2.0) * 20) / 20));
+  const ANIMATION_PRESETS = [
+    'Static Camera',
+    '1. Solar Drift & Orbit',
+    '2. Mirror Field Sweep',
+    '3. Thermal Ascent',
+    '4. Receiver & Tanks Orbit',
+    '5. Sunset Horizon Tide',
+    '6. Wind & Flight',
+    '7. Circuit Inspection',
+    '8. Panorama Parallax'
+  ];
+
+  const state = {
+    clickRandomize: true,
+    // Animation
+    animationPreset: 'Static Camera',
+    animationSpeed: 1.0,
+    playing: true,
+    windStrength: 1.0,
+    thermalPulse: 1.0,
+    birdFlight: 1.0,
+    // Camera / Interaction
+    zoom: 1.0,
+    orbitYaw: 0,
+    orbitPitch: 0,
+    panX: 0,
+    panY: 0,
+    // Colors
+    colorScheme: 'Original',
+    greenscreen: false,
+    backgroundColor: ORIGINAL_THEME.background,
+    skyHorizon: ORIGINAL_THEME.skyHorizon,
+    sunGlow: ORIGINAL_THEME.sunGlow,
+    hills: ORIGINAL_THEME.hills,
+    architecture: ORIGINAL_THEME.architecture,
+    accent: ORIGINAL_THEME.accent,
+    shadows: ORIGINAL_THEME.shadows,
+    detail: ORIGINAL_THEME.detail,
+    // Geometry & FX
+    moltenLevel: 0.0,
+    sunSize: 1.0,
+    mirrorTilt: 0.0,
+    reedScale: 1.0,
+    heatHaze: 1.0,
+    grainAmount: 1.0,
+    // Rendering
+    antialiasing: 'MSAA 4x',
+    dpr: initialDpr
+  };
+
+  function updateClearAndBackground() {
+    if (state.greenscreen) {
+      renderer.setClearColor('#00ff00', 1);
+      document.documentElement.style.background = '#00ff00';
+      document.body.style.background = '#00ff00';
+      sky.visible = false;
+      finishUniforms.greenscreen.value = 1.0;
+    } else {
+      renderer.setClearColor(color(state.backgroundColor), 1);
+      document.documentElement.style.background = state.backgroundColor;
+      document.body.style.background = state.backgroundColor;
+      sky.visible = true;
+      finishUniforms.greenscreen.value = 0.0;
+    }
+  }
+
+  function applyColorScheme(name, harmonySeedHue = null) {
+    state.colorScheme = name;
+    const factory = COLOR_SCHEMES[name] || COLOR_SCHEMES['Original'];
+    const theme = harmonySeedHue !== null ? factory(harmonySeedHue) : factory();
+    state.backgroundColor = theme.background;
+    state.skyHorizon = theme.skyHorizon;
+    state.sunGlow = theme.sunGlow;
+    state.hills = theme.hills;
+    state.architecture = theme.architecture;
+    state.accent = theme.accent;
+    state.shadows = theme.shadows;
+    state.detail = theme.detail;
+    applyThemeColors(theme);
+    updateClearAndBackground();
+  }
+
+  function applyManualColors() {
+    applyThemeColors({
+      background: state.backgroundColor,
+      skyHorizon: state.skyHorizon,
+      sunGlow: state.sunGlow,
+      hills: state.hills,
+      architecture: state.architecture,
+      accent: state.accent,
+      shadows: state.shadows,
+      detail: state.detail,
+      exact: false
+    });
+    updateClearAndBackground();
+  }
+
+  function rebuildRenderTarget() {
+    const mode = state.antialiasing;
+    let samples = 0;
+    if (mode === 'MSAA 2x') samples = Math.min(capabilitiesMaxSamples, 2);
+    else if (mode === 'MSAA 4x' || mode === 'MSAA 4x + FXAA') samples = Math.min(capabilitiesMaxSamples, 4);
+    else if (mode === 'MSAA 8x') samples = Math.min(capabilitiesMaxSamples, 8);
+    finishUniforms.fxaa.value = (mode === 'FXAA' || mode === 'MSAA 4x + FXAA') ? 1.0 : 0.0;
+
+    if (samples !== targetSamples) {
+      targetSamples = samples;
+      const drawingSize = renderer.getDrawingBufferSize(new T.Vector2());
+      const old = target;
+      target = new T.WebGLRenderTarget(Math.max(1, drawingSize.x), Math.max(1, drawingSize.y), {
+        depthBuffer: true, stencilBuffer: false, samples: targetSamples
+      });
+      target.texture.colorSpace = T.NoColorSpace;
+      finishUniforms.image.value = target.texture;
+      old.dispose();
+    }
+  }
+
+  let width = 0, height = 0, viewWidth = 16, viewHeight = 12, baseCenterX = 8, baseCenterY = 6;
+  let raf = 0, lost = false, elapsed = 0, last = performance.now();
   function resize() {
-    width=Math.max(1,window.innerWidth);height=Math.max(1,window.innerHeight);
-    const aspect=width/height;
-    // Wide screens reveal more countryside. Narrow screens widen the vertical
-    // view to retain the receiver, both tanks and the complete pipe circuit.
-    const narrow=aspect<0.85;
-    const viewHeight=narrow?12.2/aspect:aspect<1.2?15.8/aspect:aspect>1.4?Math.max(9.8,12-(aspect-4/3)*2.9):12;
-    const viewWidth=viewHeight*aspect,left=(narrow?9.15:7.95)-viewWidth*0.5;
-    const bottom=aspect<1.2?2.44-viewHeight*(narrow?0.29:0.21):0.20+(12-viewHeight)*0.03;
-    layers.tower.position.x=narrow?1.55:0;
-    camera.left=left;camera.right=left+viewWidth;camera.bottom=bottom;camera.top=bottom+viewHeight;camera.updateProjectionMatrix();
-    bounds.value.set(left,bottom,viewWidth,viewHeight);
-    const dpr=Math.min(window.devicePixelRatio||1,1.75,Math.sqrt(4800000/(width*height)));
-    renderer.setPixelRatio(dpr);renderer.setSize(width,height,false);
-    const drawingSize=renderer.getDrawingBufferSize(new T.Vector2());target.setSize(drawingSize.x,drawingSize.y);resolution.value.copy(drawingSize);
+    width = Math.max(1, window.innerWidth); height = Math.max(1, window.innerHeight);
+    const aspect = width / height;
+    const narrow = aspect < 0.85;
+    viewHeight = narrow ? 12.2 / aspect : aspect < 1.2 ? 15.8 / aspect : aspect > 1.4 ? Math.max(9.8, 12 - (aspect - 4 / 3) * 2.9) : 12;
+    viewWidth = viewHeight * aspect;
+    const left = (narrow ? 9.15 : 7.95) - viewWidth * 0.5;
+    const bottom = aspect < 1.2 ? 2.44 - viewHeight * (narrow ? 0.29 : 0.21) : 0.20 + (12 - viewHeight) * 0.03;
+    baseCenterX = left + viewWidth * 0.5;
+    baseCenterY = bottom + viewHeight * 0.5;
+    layers.tower.position.x = narrow ? 1.55 : 0;
+
+    camera.left = -viewWidth * 0.5;
+    camera.right = viewWidth * 0.5;
+    camera.bottom = -viewHeight * 0.5;
+    camera.top = viewHeight * 0.5;
+    camera.zoom = state.zoom;
+    camera.updateProjectionMatrix();
+
+    renderer.setPixelRatio(state.dpr);
+    renderer.setSize(width, height, false);
+    const drawingSize = renderer.getDrawingBufferSize(new T.Vector2());
+    target.setSize(drawingSize.x, drawingSize.y);
+    resolution.value.copy(drawingSize);
   }
-  function envelope(a,center,power=3) { return Math.pow(0.5+0.5*Math.cos(a-center),power); }
+
+  function envelope(a, center, power = 3) { return Math.pow(0.5 + 0.5 * Math.cos(a - center), power); }
+
+  // Smoothly blended camera animation offset state (never touches state.zoom!)
+  const camAnim = { yaw: 0, pitch: 0, panX: 0, panY: 0, targetX: 0, targetY: 0 };
+  let lastDt = 0.016;
+
+  function computeAnimationGoals(seconds) {
+    const a = (((seconds % DURATION) + DURATION) % DURATION) / DURATION * TAU;
+    const slowA = seconds / (DURATION * 2) * TAU; // 36s seamless orbit cycle
+    const extraSlow = seconds / (DURATION * 3) * TAU; // 54s cycle
+    let goalYaw = 0, goalPitch = 0, goalPanX = 0, goalPanY = 0;
+    let sunDx = 0, sunDy = 0, mirrorDynamicAmp = 0, birdAmp = 1.0, windBoost = 1.0;
+
+    switch (state.animationPreset) {
+      case 'Static Camera':
+        break;
+      case '1. Solar Drift & Orbit':
+        goalYaw = 9.5 * Math.sin(slowA);
+        goalPitch = 3.8 * Math.sin(slowA * 2.0 + 0.4);
+        sunDx = -1.8 * Math.sin(slowA);
+        sunDy = 0.65 * Math.cos(slowA);
+        mirrorDynamicAmp = 0.045;
+        birdAmp = 1.5;
+        break;
+      case '2. Mirror Field Sweep':
+        goalPanX = 2.6 * Math.sin(slowA);
+        goalYaw = 5.0 * Math.cos(slowA);
+        mirrorDynamicAmp = 0.075;
+        sunDx = 0.9 * Math.sin(slowA);
+        break;
+      case '3. Thermal Ascent':
+        goalPanY = 1.45 * (0.5 - 0.5 * Math.cos(slowA)) - 0.55;
+        goalPitch = 5.5 * Math.sin(slowA);
+        goalYaw = 4.2 * Math.sin(extraSlow);
+        birdAmp = 1.35;
+        break;
+      case '4. Receiver & Tanks Orbit':
+        goalYaw = 12.0 * Math.sin(slowA);
+        goalPitch = 5.0 * Math.cos(slowA);
+        goalPanX = -0.6;
+        goalPanY = -0.35;
+        birdAmp = 1.25;
+        break;
+      case '5. Sunset Horizon Tide':
+        sunDy = -1.15 * (0.5 - 0.5 * Math.cos(slowA));
+        sunDx = -1.4 * Math.sin(slowA);
+        goalPanX = 1.4 * Math.sin(extraSlow);
+        goalYaw = 6.5 * Math.sin(extraSlow);
+        goalPitch = 2.2 * Math.sin(slowA);
+        break;
+      case '6. Wind & Flight':
+        goalPanX = 0.85 * Math.sin(slowA);
+        goalPanY = 0.45 * Math.sin(slowA * 2.0);
+        goalYaw = 4.5 * Math.cos(slowA);
+        windBoost = 1.85;
+        birdAmp = 2.6;
+        break;
+      case '7. Circuit Inspection':
+        goalPanX = 2.2 * Math.sin(slowA);
+        goalPanY = 0.9 * Math.sin(slowA * 2.0 - 0.5);
+        goalYaw = 8.0 * Math.sin(slowA + 0.6);
+        goalPitch = 3.5 * Math.cos(slowA);
+        mirrorDynamicAmp = 0.04;
+        break;
+      case '8. Panorama Parallax':
+        goalYaw = 15.0 * Math.sin(extraSlow);
+        goalPitch = 4.5 * Math.sin(slowA);
+        goalPanX = 1.1 * Math.cos(extraSlow);
+        sunDx = 0.9 * Math.cos(extraSlow);
+        birdAmp = 1.4;
+        break;
+    }
+    return { a, slowA, goalYaw, goalPitch, goalPanX, goalPanY, sunDx, sunDy, mirrorDynamicAmp, birdAmp, windBoost };
+  }
+
   function renderAt(seconds) {
-    const a=(((seconds%DURATION)+DURATION)%DURATION)/DURATION*TAU;
-    phase.value=a;
-    cycle.receiver.value=envelope(a,TAU*3.0/DURATION);
-    cycle.main.value=envelope(a,TAU*8.7/DURATION,2);
-    cycle.rear.value=envelope(a,TAU*12.0/DURATION,2);
-    for(const b of birds) {
-      b.mesh.position.x=b.x+0.055*Math.sin(a+b.offset);
-      b.mesh.position.y=b.y+0.022*Math.cos(a+b.offset);
-      b.mesh.rotation.z=0.028*Math.sin(a*2+b.offset);
+    const g = computeAnimationGoals(seconds);
+    const a = g.a;
+    phase.value = a;
+    windStrengthU.value = state.windStrength * g.windBoost;
+    moltenOffsetU.value = state.moltenLevel;
+    pipeColors.pipePulseBoost.value = state.thermalPulse;
+    finishUniforms.heatHaze.value = state.heatHaze;
+    finishUniforms.grainAmount.value = state.grainAmount;
+
+    cycle.receiver.value = envelope(a, TAU * 3.0 / DURATION) * state.thermalPulse;
+    cycle.main.value = envelope(a, TAU * 8.7 / DURATION, 2) * state.thermalPulse;
+    cycle.rear.value = envelope(a, TAU * 12.0 / DURATION, 2) * state.thermalPulse;
+
+    // Sun & Sky glow
+    sun.position.set(sunBasePos.x + g.sunDx, sunBasePos.y + g.sunDy, sunBasePos.z);
+    sun.scale.setScalar(state.sunSize);
+    skyUniforms.sunPos.value.set(sun.position.x - 0.12, sun.position.y);
+
+    // Mirrors
+    updateMirrors(state.mirrorTilt * Math.PI / 180, g.mirrorDynamicAmp, g.slowA);
+
+    // Reeds scale
+    layers.reeds.scale.y = state.reedScale;
+
+    // Birds
+    const bf = state.birdFlight * g.birdAmp;
+    for (let i = 0; i < birds.length; i++) {
+      const b = birds[i];
+      const swayX = (0.055 + 0.25 * Math.max(0, bf - 1.0)) * Math.sin(a + b.offset) * Math.max(0.2, bf);
+      const swayY = (0.022 + 0.08 * Math.max(0, bf - 1.0)) * Math.cos(a + b.offset + i * 0.5) * Math.max(0.2, bf);
+      b.mesh.position.x = b.x + swayX;
+      b.mesh.position.y = b.y + swayY;
+      b.mesh.rotation.z = 0.028 * Math.sin(a * 2 + b.offset) * Math.max(0.3, Math.min(2.2, bf));
     }
+
+    // Smoothly blend camera animation offsets (userZoom, user pan, and user orbit angles remain independent)
+    const blend = 1 - Math.exp(-3.5 * Math.min(lastDt, 0.1));
+    camAnim.yaw += (g.goalYaw - camAnim.yaw) * blend;
+    camAnim.pitch += (g.goalPitch - camAnim.pitch) * blend;
+    camAnim.panX += (g.goalPanX - camAnim.panX) * blend;
+    camAnim.panY += (g.goalPanY - camAnim.panY) * blend;
+
+    const totalYaw = (state.orbitYaw + camAnim.yaw) * Math.PI / 180;
+    const totalPitch = (state.orbitPitch + camAnim.pitch) * Math.PI / 180;
+    const targetX = baseCenterX - state.panX + camAnim.panX;
+    const targetY = baseCenterY - state.panY + camAnim.panY;
+    const targetZ = -12;
+    const dist = 112;
+
+    const cosP = Math.cos(totalPitch);
+    camera.position.set(
+      targetX + dist * Math.sin(totalYaw) * cosP,
+      targetY + dist * Math.sin(totalPitch),
+      targetZ + dist * Math.cos(totalYaw) * cosP
+    );
+    camera.lookAt(targetX, targetY, targetZ);
+    camera.zoom = state.zoom;
+    camera.updateProjectionMatrix();
+
+    // Update heat haze bounds to follow pan & zoom
+    const halfW = (viewWidth * 0.5) / state.zoom;
+    const halfH = (viewHeight * 0.5) / state.zoom;
+    bounds.value.set(targetX - halfW, targetY - halfH, halfW * 2, halfH * 2);
+
     renderer.info.reset();
-    renderer.setRenderTarget(target);renderer.render(scene,camera);
-    renderer.setRenderTarget(null);renderer.render(finishScene,finishCamera);
+    renderer.setRenderTarget(target); renderer.render(scene, camera);
+    renderer.setRenderTarget(null); renderer.render(finishScene, finishCamera);
   }
-  // Deterministic, nonvisual capture access: ?time=0, ?time=9, ?time=18.
-  const params=new URLSearchParams(location.search),capture=params.has('time')?Number(params.get('time')):null;
-  const fixed=capture!==null&&Number.isFinite(capture)?capture:null;
-  const reduced=window.matchMedia('(prefers-reduced-motion: reduce)');
-  let needsRender=true;
+
+  // Deterministic capture access: ?time=0, ?time=9, ?time=18
+  const params = new URLSearchParams(location.search), capture = params.has('time') ? Number(params.get('time')) : null;
+  const fixed = capture !== null && Number.isFinite(capture) ? capture : null;
+  let needsRender = true;
   function frame(now) {
-    if(!lost&&!document.hidden) {
-      if(fixed===null&&!reduced.matches)elapsed+=Math.min((now-last)/1000,0.1);
-      if(needsRender||(fixed===null&&!reduced.matches)) {renderAt(fixed??elapsed);needsRender=false;}
+    const dt = Math.min((now - last) / 1000, 0.1);
+    lastDt = dt > 0 ? dt : 0.016;
+    if (!lost && !document.hidden) {
+      if (fixed === null && state.playing) elapsed += dt * state.animationSpeed;
+      if (needsRender || (fixed === null && state.playing)) {
+        renderAt(fixed ?? elapsed);
+        needsRender = false;
+      }
     }
-    last=now;raf=requestAnimationFrame(frame);
+    last = now; raf = requestAnimationFrame(frame);
   }
-  window.__thermalCircuit={renderAt,scene,camera,renderer,tanks,pipes,duration:DURATION,
-    get phase(){return phase.value;},get state(){return {receiver:cycle.receiver.value,main:cycle.main.value,rear:cycle.rear.value};},
-    get stats(){return {drawCalls:renderer.info.render.calls,triangles:renderer.info.render.triangles,collectors:panels.length,reeds:155};}};
-  canvas.addEventListener('webglcontextlost',event=>{event.preventDefault();lost=true;});
-  canvas.addEventListener('webglcontextrestored',()=>{lost=false;last=performance.now();resize();needsRender=true;});
-  document.addEventListener('visibilitychange',()=>{last=performance.now();needsRender=true;});
-  window.addEventListener('resize',()=>{resize();needsRender=true;},{passive:true});
-  reduced.addEventListener('change',()=>{needsRender=true;});
-  window.addEventListener('pagehide',()=>{cancelAnimationFrame(raf);},{once:true});
-  window.addEventListener('pageshow',event=>{if(event.persisted){last=performance.now();raf=requestAnimationFrame(frame);}},{passive:true});
-  resize();renderAt(fixed??0);needsRender=false;raf=requestAnimationFrame(frame);
+
+  // --- Pointer Interactions: Drag to Pan, Wheel to Zoom, Right/Alt-Drag to Orbit Angle, Click to Randomize ---
+  let guiInstance = null;
+  function refreshGUI() {
+    if (!guiInstance) return;
+    guiInstance.controllersRecursive().forEach(c => c.updateDisplay());
+  }
+
+  function randomizeScene() {
+    // 1. Random color scheme + subtle hue variation for harmonies
+    const scheme = SCHEME_NAMES[Math.floor(Math.random() * SCHEME_NAMES.length)];
+    const randomHue = Math.floor(Math.random() * 360);
+    applyColorScheme(scheme, randomHue);
+
+    // 2. Re-roll geometric parameters
+    const newReedSeed = Math.floor(Math.random() * 100000) + 1;
+    buildReeds(newReedSeed);
+    state.moltenLevel = Math.round((-0.18 + Math.random() * 0.36) * 100) / 100;
+    state.sunSize = Math.round((0.7 + Math.random() * 1.15) * 20) / 20;
+    state.mirrorTilt = Math.round((-8 + Math.random() * 16) * 2) / 2;
+    state.reedScale = Math.round((0.75 + Math.random() * 0.55) * 20) / 20;
+    state.heatHaze = Math.round((0.5 + Math.random() * 1.3) * 20) / 20;
+    state.grainAmount = Math.round((0.4 + Math.random() * 1.2) * 20) / 20;
+
+    // 3. Re-roll motion parameters
+    state.animationSpeed = Math.round((0.5 + Math.random() * 1.8) * 10) / 10;
+    state.windStrength = Math.round((0.4 + Math.random() * 1.8) * 20) / 20;
+    state.thermalPulse = Math.round((0.6 + Math.random() * 1.4) * 20) / 20;
+    state.birdFlight = Math.round((0.5 + Math.random() * 1.8) * 20) / 20;
+
+    refreshGUI();
+    needsRender = true;
+  }
+
+  const pointer = { active: false, mode: 'pan', id: -1, startX: 0, startY: 0, lastX: 0, lastY: 0, moved: 0 };
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('pointerdown', e => {
+    if (pointer.active) return;
+    pointer.active = true;
+    pointer.id = e.pointerId;
+    pointer.startX = pointer.lastX = e.clientX;
+    pointer.startY = pointer.lastY = e.clientY;
+    pointer.moved = 0;
+    pointer.mode = (e.button === 2 || e.button === 1 || e.shiftKey || e.altKey) ? 'orbit' : 'pan';
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (!pointer.active || e.pointerId !== pointer.id) return;
+    const dx = e.clientX - pointer.lastX;
+    const dy = e.clientY - pointer.lastY;
+    pointer.lastX = e.clientX;
+    pointer.lastY = e.clientY;
+    pointer.moved += Math.hypot(dx, dy);
+
+    if (pointer.mode === 'pan') {
+      state.panX += (dx / Math.max(1, width)) * (viewWidth / state.zoom);
+      state.panY -= (dy / Math.max(1, height)) * (viewHeight / state.zoom);
+      state.panX = Math.max(-25, Math.min(25, state.panX));
+      state.panY = Math.max(-18, Math.min(18, state.panY));
+    } else {
+      state.orbitYaw = Math.max(-35, Math.min(35, state.orbitYaw - dx * 0.14));
+      state.orbitPitch = Math.max(-22, Math.min(22, state.orbitPitch + dy * 0.14));
+    }
+    refreshGUI();
+    needsRender = true;
+  });
+  function endPointer(e) {
+    if (!pointer.active || e.pointerId !== pointer.id) return;
+    const wasClick = pointer.moved < 5 && e.button === 0 && !e.shiftKey && !e.altKey;
+    pointer.active = false;
+    pointer.id = -1;
+    if (wasClick && state.clickRandomize) {
+      randomizeScene();
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const oldZoom = state.zoom;
+    const factor = Math.exp(-e.deltaY * 0.0012);
+    const newZoom = Math.max(0.25, Math.min(8.0, oldZoom * factor));
+    const ndcX = (e.clientX / Math.max(1, width)) * 2 - 1;
+    const ndcY = 1 - (e.clientY / Math.max(1, height)) * 2;
+    state.panX += ndcX * (viewWidth * 0.5) * (1 / newZoom - 1 / oldZoom);
+    state.panY += ndcY * (viewHeight * 0.5) * (1 / newZoom - 1 / oldZoom);
+    state.zoom = Math.round(newZoom * 1000) / 1000;
+    refreshGUI();
+    needsRender = true;
+  }, { passive: false });
+
+  // Keyboard shortcut: H to hide/show all UI
+  let uiVisible = true;
+  window.addEventListener('keydown', e => {
+    if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+    if (e.key === 'h' || e.key === 'H') {
+      uiVisible = !uiVisible;
+      if (guiInstance) {
+        if (uiVisible) guiInstance.show();
+        else guiInstance.hide();
+      }
+    }
+  });
+
+  // Mount lil-gui asynchronously so rendering starts immediately
+  import('https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js').then(mod => {
+    const GUI = mod.default || mod.GUI;
+    const gui = new GUI({ title: 'Thermal Circuit Controls' });
+    guiInstance = gui;
+    if (!uiVisible) gui.hide();
+
+    gui.add(state, 'clickRandomize').name('Click Scene Randomize');
+    gui.add({ randomize: () => randomizeScene() }, 'randomize').name('Randomize Now');
+
+    const animFolder = gui.addFolder('Animation');
+    animFolder.add(state, 'animationPreset', ANIMATION_PRESETS).name('Animation').onChange(() => { needsRender = true; });
+    animFolder.add(state, 'animationSpeed', 0.2, 10.0, 0.1).name('Speed (0.2x-10x)');
+    animFolder.add(state, 'playing').name('Playing').onChange(() => { last = performance.now(); needsRender = true; });
+    animFolder.add(state, 'windStrength', 0.0, 3.0, 0.05).name('Wind Strength').onChange(() => { needsRender = true; });
+    animFolder.add(state, 'thermalPulse', 0.0, 2.5, 0.05).name('Thermal Pulse').onChange(() => { needsRender = true; });
+    animFolder.add(state, 'birdFlight', 0.0, 3.0, 0.05).name('Bird Flight').onChange(() => { needsRender = true; });
+
+    const camFolder = gui.addFolder('Camera & Orbit');
+    camFolder.add(state, 'zoom', 0.25, 8.0, 0.05).name('Zoom').onChange(() => { needsRender = true; });
+    camFolder.add(state, 'orbitYaw', -35, 35, 0.5).name('Camera Angle (Yaw)').onChange(() => { needsRender = true; });
+    camFolder.add(state, 'orbitPitch', -22, 22, 0.5).name('Camera Tilt (Pitch)').onChange(() => { needsRender = true; });
+    camFolder.add(state, 'panX', -25, 25, 0.1).name('Drag X').onChange(() => { needsRender = true; });
+    camFolder.add(state, 'panY', -18, 18, 0.1).name('Drag Y').onChange(() => { needsRender = true; });
+    camFolder.add({
+      reset: () => {
+        state.zoom = 1.0; state.orbitYaw = 0; state.orbitPitch = 0; state.panX = 0; state.panY = 0;
+        refreshGUI(); needsRender = true;
+      }
+    }, 'reset').name('Reset View');
+
+    const colorFolder = gui.addFolder('Colors');
+    colorFolder.add(state, 'colorScheme', SCHEME_NAMES).name('Color Scheme').onChange(name => {
+      applyColorScheme(name); refreshGUI(); needsRender = true;
+    });
+    colorFolder.add(state, 'greenscreen').name('Greenscreen (#00ff00)').onChange(() => {
+      updateClearAndBackground(); needsRender = true;
+    });
+    colorFolder.addColor(state, 'backgroundColor').name('Background Color').onChange(() => {
+      setColor(skyUniforms.skyTop.value, state.backgroundColor);
+      updateClearAndBackground();
+      needsRender = true;
+    });
+    colorFolder.addColor(state, 'skyHorizon').name('Sky Horizon').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'sunGlow').name('Sun & Glow').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'hills').name('Hills & Fields').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'architecture').name('Architecture').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'accent').name('Molten & Accent').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'shadows').name('Shadows & Foliage').onChange(() => { applyManualColors(); needsRender = true; });
+    colorFolder.addColor(state, 'detail').name('Pipes & Tower').onChange(() => { applyManualColors(); needsRender = true; });
+
+    const geoFolder = gui.addFolder('Geometry & Effects');
+    geoFolder.add(state, 'moltenLevel', -0.25, 0.25, 0.01).name('Molten Level').onChange(() => { needsRender = true; });
+    geoFolder.add(state, 'sunSize', 0.5, 2.5, 0.05).name('Sun Size').onChange(() => { needsRender = true; });
+    geoFolder.add(state, 'mirrorTilt', -12, 12, 0.5).name('Mirror Tilt').onChange(() => { needsRender = true; });
+    geoFolder.add(state, 'reedScale', 0.5, 1.6, 0.05).name('Reed Height').onChange(() => { needsRender = true; });
+    geoFolder.add(state, 'heatHaze', 0.0, 2.5, 0.05).name('Heat Haze').onChange(() => { needsRender = true; });
+    geoFolder.add(state, 'grainAmount', 0.0, 2.5, 0.05).name('Paper Grain').onChange(() => { needsRender = true; });
+
+    const renderFolder = gui.addFolder('Rendering');
+    renderFolder.add(state, 'antialiasing', ['Off', 'MSAA 2x', 'MSAA 4x', 'MSAA 8x', 'FXAA', 'MSAA 4x + FXAA']).name('Antialiasing').onChange(() => {
+      rebuildRenderTarget(); needsRender = true;
+    });
+    renderFolder.add(state, 'dpr', 0.5, 3.0, 0.05).name('Pixel Ratio (DPR)').onChange(() => {
+      resize(); needsRender = true;
+    });
+
+    camFolder.close();
+    geoFolder.close();
+    renderFolder.close();
+  }).catch(err => console.warn('lil-gui failed to load:', err));
+
+  window.__thermalCircuit = {
+    renderAt, scene, camera, renderer, tanks, pipes, duration: DURATION,
+    get phase() { return phase.value; },
+    get state() { return { receiver: cycle.receiver.value, main: cycle.main.value, rear: cycle.rear.value }; },
+    get stats() { return { drawCalls: renderer.info.render.calls, triangles: renderer.info.render.triangles, collectors: panels.length, reeds: 155 }; }
+  };
+  canvas.addEventListener('webglcontextlost', event => { event.preventDefault(); lost = true; });
+  canvas.addEventListener('webglcontextrestored', () => { lost = false; last = performance.now(); resize(); needsRender = true; });
+  document.addEventListener('visibilitychange', () => { last = performance.now(); needsRender = true; });
+  window.addEventListener('resize', () => { resize(); needsRender = true; }, { passive: true });
+  window.addEventListener('pagehide', () => { cancelAnimationFrame(raf); }, { once: true });
+  window.addEventListener('pageshow', event => { if (event.persisted) { last = performance.now(); raf = requestAnimationFrame(frame); } }, { passive: true });
+
+  applyColorScheme('Original');
+  resize();
+  renderAt(fixed ?? 0);
+  needsRender = false;
+  raf = requestAnimationFrame(frame);
 })();
 </script>
 </body>
